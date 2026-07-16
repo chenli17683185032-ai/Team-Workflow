@@ -14,6 +14,8 @@
 
 </div>
 
+更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 项目概览
 
 Team Workflow Console 将原本分散的账号、空间和运行配置收敛到一个仅监听本机回环地址的网页控制台。应用通过 SQLite 保存业务状态，通过 Windows Data Protection API (DPAPI) 加密敏感值，并用全局串行队列执行完整工作流。
