@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 ACCOUNT_STATUSES = frozenset(
     {
         "available",
@@ -42,6 +42,7 @@ ICLOUD_MAILBOX_STATUSES = frozenset(
     {"unchecked", "ready", "disabled", "session_invalid", "imap_invalid"}
 )
 ICLOUD_ALIAS_STATES = frozenset({"active", "inactive"})
+ICLOUD_ALIAS_ROLES = frozenset({"team_owner", "rotating_child"})
 WORKFLOW_STEPS = (
     "old_login",
     "new_login",
@@ -490,12 +491,73 @@ _SCHEMA_V5_STATEMENTS = (
     "CREATE INDEX ix_icloud_aliases_state ON icloud_aliases(state, created_at, id)",
 )
 
+_SCHEMA_V6_STATEMENTS = (
+    "ALTER TABLE icloud_aliases RENAME TO icloud_aliases_v5",
+    """
+    CREATE TABLE icloud_aliases (
+        id TEXT PRIMARY KEY,
+        mailbox_id TEXT NOT NULL REFERENCES icloud_mailboxes(id) ON DELETE RESTRICT,
+        account_id TEXT UNIQUE REFERENCES accounts(id) ON DELETE RESTRICT,
+        parent_owner_alias_id TEXT REFERENCES icloud_aliases(id) ON DELETE RESTRICT,
+        email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        remote_blob BLOB NOT NULL,
+        remote_purpose TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'inactive')),
+        role TEXT NOT NULL CHECK (role IN ('team_owner', 'rotating_child')),
+        proxy_blob BLOB,
+        proxy_purpose TEXT,
+        used_at TEXT,
+        label TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+            (role = 'team_owner'
+             AND account_id IS NULL
+             AND parent_owner_alias_id IS NULL
+             AND used_at IS NULL)
+            OR
+            (role = 'rotating_child' AND account_id IS NOT NULL)
+        ),
+        CHECK (
+            (proxy_blob IS NULL AND proxy_purpose IS NULL)
+            OR
+            (role = 'team_owner' AND proxy_blob IS NOT NULL AND proxy_purpose IS NOT NULL)
+        )
+    )
+    """,
+    """
+    INSERT INTO icloud_aliases(
+        id, mailbox_id, account_id, parent_owner_alias_id, email,
+        remote_blob, remote_purpose, state, role, proxy_blob, proxy_purpose,
+        used_at, label, created_at, updated_at
+    )
+    SELECT alias.id, alias.mailbox_id, alias.account_id, NULL, alias.email,
+           alias.remote_blob, alias.remote_purpose, alias.state,
+           'rotating_child', NULL, NULL,
+           CASE
+               WHEN account.status IN ('exited_pending', 'retired') THEN alias.updated_at
+               ELSE NULL
+           END,
+           alias.label, alias.created_at, alias.updated_at
+    FROM icloud_aliases_v5 AS alias
+    JOIN accounts AS account ON account.id = alias.account_id
+    """,
+    "DROP TABLE icloud_aliases_v5",
+    "CREATE INDEX ix_icloud_aliases_mailbox ON icloud_aliases(mailbox_id, created_at, id)",
+    "CREATE INDEX ix_icloud_aliases_state ON icloud_aliases(state, created_at, id)",
+    "CREATE INDEX ix_icloud_aliases_parent ON icloud_aliases(parent_owner_alias_id, created_at, id)",
+    "CREATE INDEX ix_icloud_aliases_role_used ON icloud_aliases(role, used_at, created_at, id)",
+    "ALTER TABLE workspaces ADD COLUMN owner_alias_id TEXT REFERENCES icloud_aliases(id) ON DELETE RESTRICT",
+    "CREATE UNIQUE INDEX ux_workspaces_owner_alias ON workspaces(owner_alias_id) WHERE owner_alias_id IS NOT NULL",
+)
+
 _SCHEMA_MIGRATIONS = {
     1: _SCHEMA_STATEMENTS,
     2: _SCHEMA_V2_STATEMENTS,
     3: _SCHEMA_V3_STATEMENTS,
     4: _SCHEMA_V4_STATEMENTS,
     5: _SCHEMA_V5_STATEMENTS,
+    6: _SCHEMA_V6_STATEMENTS,
 }
 
 
@@ -765,6 +827,9 @@ class Database:
             "forwarding_email": str(row["forwarding_email"]),
             "status": str(row["status"]),
             "alias_count": int(row["alias_count"]),
+            "owner_count": int(row["owner_count"]),
+            "child_count": int(row["child_count"]),
+            "used_count": int(row["used_count"]),
             "session_configured": True,
             "imap_configured": True,
             "proxy_configured": bool(row["proxy_configured"]),
@@ -786,7 +851,17 @@ class Database:
         return """
             SELECT mailbox.*,
                    (SELECT COUNT(*) FROM icloud_aliases AS alias
-                    WHERE alias.mailbox_id = mailbox.id) AS alias_count
+                    WHERE alias.mailbox_id = mailbox.id) AS alias_count,
+                   (SELECT COUNT(*) FROM icloud_aliases AS alias
+                    WHERE alias.mailbox_id = mailbox.id
+                      AND alias.role = 'team_owner') AS owner_count,
+                   (SELECT COUNT(*) FROM icloud_aliases AS alias
+                    WHERE alias.mailbox_id = mailbox.id
+                      AND alias.role = 'rotating_child') AS child_count,
+                   (SELECT COUNT(*) FROM icloud_aliases AS alias
+                    WHERE alias.mailbox_id = mailbox.id
+                      AND alias.role = 'rotating_child'
+                      AND alias.used_at IS NOT NULL) AS used_count
             FROM icloud_mailboxes AS mailbox
         """
 
@@ -1045,6 +1120,9 @@ class Database:
         email: str,
         remote_metadata: Mapping[str, Any],
         label: str,
+        role: str = "rotating_child",
+        parent_owner_alias_id: str | None = None,
+        owner_proxy: str = "",
     ) -> dict[str, Any]:
         alias_email = _normalize_email_address(email, "alias_email")
         clean_label = _required_text(label, "label")
@@ -1054,17 +1132,76 @@ class Database:
             remote_metadata.get("anonymousId") or ""
         ).strip():
             raise ValidationError("iCloud alias remote metadata is incomplete")
+        clean_role = str(role or "").strip()
+        if clean_role not in ICLOUD_ALIAS_ROLES:
+            raise ValidationError("iCloud alias role is invalid")
+        clean_parent_id = str(parent_owner_alias_id or "").strip() or None
+        clean_owner_proxy = self._coerce_icloud_owner_proxy(owner_proxy)
+        if clean_role == "team_owner":
+            if clean_parent_id is not None:
+                raise ValidationError("iCloud Team owner cannot have a parent owner")
+        elif clean_owner_proxy:
+            raise ValidationError("only an iCloud Team owner can store a child proxy")
+        with self._write_transaction() as connection:
+            alias_id, account_id = self._create_icloud_alias_tx(
+                connection,
+                mailbox_id=str(mailbox_id),
+                alias_email=alias_email,
+                remote_metadata=dict(remote_metadata),
+                clean_label=clean_label,
+                clean_role=clean_role,
+                clean_parent_id=clean_parent_id,
+                clean_owner_proxy=clean_owner_proxy,
+            )
+        return {
+            "alias": self.get_icloud_alias(alias_id),
+            "account": None if account_id is None else self.get_account(account_id),
+        }
+
+    def _create_icloud_alias_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        mailbox_id: str,
+        alias_email: str,
+        remote_metadata: Mapping[str, Any],
+        clean_label: str,
+        clean_role: str,
+        clean_parent_id: str | None,
+        clean_owner_proxy: str,
+    ) -> tuple[str, str | None]:
         alias_id = _identifier(None)
-        account_id = _identifier(None)
+        account_id = None if clean_role == "team_owner" else _identifier(None)
         remote_purpose = f"icloud-alias:{alias_id}:remote"
         remote_blob = self._require_secret_store().encrypt(
             _json_bytes(remote_metadata), remote_purpose
         )
+        owner_proxy_purpose = (
+            f"icloud-owner:{alias_id}:proxy" if clean_owner_proxy else None
+        )
+        owner_proxy_blob = (
+            None
+            if not clean_owner_proxy
+            else self._require_secret_store().encrypt(
+                clean_owner_proxy.encode("utf-8"), owner_proxy_purpose
+            )
+        )
+        remote_state = (
+            "inactive" if remote_metadata.get("isActive") is False else "active"
+        )
         timestamp = _now()
-        with self._write_transaction() as connection:
-            mailbox, secrets = self._icloud_mailbox_secret_tx(connection, mailbox_id)
-            if str(mailbox["status"]) != "ready":
-                raise InventoryDisabledError("iCloud mailbox is not ready")
+        mailbox, secrets = self._icloud_mailbox_secret_tx(connection, mailbox_id)
+        if str(mailbox["status"]) != "ready":
+            raise InventoryDisabledError("iCloud mailbox is not ready")
+        child_proxy = ""
+        if clean_parent_id is not None:
+            owner = self._icloud_owner_alias_tx(
+                connection, clean_parent_id, mailbox_id=mailbox_id
+            )
+            child_proxy = self._icloud_owner_proxy_tx(connection, owner)
+        elif clean_role == "rotating_child":
+            child_proxy = str(secrets.get("proxy") or "").strip()
+        if account_id is not None:
             credential_blob = self._require_secret_store().encrypt(
                 _json_bytes(
                     {
@@ -1076,11 +1213,10 @@ class Database:
                 ),
                 f"account:{account_id}:credentials",
             )
-            proxy_blob = None
-            proxy = str(secrets.get("proxy") or "").strip()
-            if proxy:
-                proxy_blob = self._require_secret_store().encrypt(
-                    proxy.encode("utf-8"), f"account:{account_id}:proxy"
+            account_proxy_blob = None
+            if child_proxy:
+                account_proxy_blob = self._require_secret_store().encrypt(
+                    child_proxy.encode("utf-8"), f"account:{account_id}:proxy"
                 )
             connection.execute(
                 """
@@ -1096,57 +1232,437 @@ class Database:
                     sqlite3.Binary(credential_blob),
                     timestamp,
                     timestamp,
-                    None if proxy_blob is None else sqlite3.Binary(proxy_blob),
+                    (
+                        None
+                        if account_proxy_blob is None
+                        else sqlite3.Binary(account_proxy_blob)
+                    ),
                 ),
+            )
+        connection.execute(
+            """
+            INSERT INTO icloud_aliases(
+                id, mailbox_id, account_id, parent_owner_alias_id, email,
+                remote_blob, remote_purpose, state, role,
+                proxy_blob, proxy_purpose, used_at,
+                label, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                alias_id,
+                mailbox_id,
+                account_id,
+                clean_parent_id,
+                alias_email,
+                sqlite3.Binary(remote_blob),
+                remote_purpose,
+                remote_state,
+                clean_role,
+                (
+                    None
+                    if owner_proxy_blob is None
+                    else sqlite3.Binary(owner_proxy_blob)
+                ),
+                owner_proxy_purpose,
+                clean_label,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return alias_id, account_id
+
+    def import_icloud_aliases(
+        self,
+        mailbox_id: str,
+        items: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        selected_emails: set[str] = set()
+        for raw in items:
+            if not isinstance(raw, Mapping):
+                raise ValidationError("iCloud alias import item is invalid")
+            remote = raw.get("remote_metadata")
+            if not isinstance(remote, Mapping) or not str(
+                remote.get("anonymousId") or ""
+            ).strip():
+                raise ValidationError("iCloud alias remote metadata is incomplete")
+            email = _normalize_email_address(
+                raw.get("email") or remote.get("hme"), "alias_email"
+            )
+            if email in selected_emails:
+                raise ValidationError("iCloud alias import contains duplicate emails")
+            selected_emails.add(email)
+            role = str(raw.get("role") or "").strip()
+            if role not in ICLOUD_ALIAS_ROLES:
+                raise ValidationError("iCloud alias role is invalid")
+            label = str(raw.get("label") or remote.get("label") or email).strip()
+            if not label or len(label) > 160:
+                raise ValidationError("iCloud alias label is invalid")
+            parent_owner_email = (
+                _normalize_email_address(
+                    raw.get("parent_owner_email"), "parent_owner_email"
+                )
+                if raw.get("parent_owner_email")
+                else None
+            )
+            owner_proxy = self._coerce_icloud_owner_proxy(raw.get("owner_proxy"))
+            if role == "team_owner":
+                if parent_owner_email is not None:
+                    raise ValidationError("iCloud Team owner cannot have a parent owner")
+            elif parent_owner_email is None:
+                raise ValidationError("iCloud child requires a parent Team owner")
+            elif owner_proxy:
+                raise ValidationError("only an iCloud Team owner can store a child proxy")
+            normalized.append(
+                {
+                    "email": email,
+                    "remote": dict(remote),
+                    "role": role,
+                    "label": label,
+                    "parent_owner_email": parent_owner_email,
+                    "owner_proxy": owner_proxy,
+                }
+            )
+        if not normalized:
+            raise ValidationError("select at least one iCloud alias to import")
+        if len(normalized) > 100:
+            raise ValidationError("too many iCloud aliases selected")
+
+        imported_ids: list[str] = []
+        owner_ids_by_email: dict[str, str] = {}
+        with self._write_transaction() as connection:
+            mailbox, _secrets = self._icloud_mailbox_secret_tx(connection, mailbox_id)
+            if str(mailbox["status"]) != "ready":
+                raise InventoryDisabledError("iCloud mailbox is not ready")
+
+            for item in normalized:
+                if item["role"] != "team_owner":
+                    continue
+                alias_id = self._upsert_imported_icloud_alias_tx(
+                    connection,
+                    mailbox_id=str(mailbox_id),
+                    item=item,
+                    parent_owner_alias_id=None,
+                )
+                owner_ids_by_email[str(item["email"])] = alias_id
+                imported_ids.append(alias_id)
+
+            referenced_owner_emails = {
+                str(item["parent_owner_email"])
+                for item in normalized
+                if item["role"] == "rotating_child"
+            }
+            for owner_email in referenced_owner_emails - set(owner_ids_by_email):
+                owner = connection.execute(
+                    """
+                    SELECT * FROM icloud_aliases
+                    WHERE mailbox_id = ? AND email = ? COLLATE NOCASE
+                    """,
+                    (mailbox_id, owner_email),
+                ).fetchone()
+                if owner is None or str(owner["role"]) != "team_owner":
+                    raise StateConflictError(
+                        "selected iCloud child references an unimported Team owner"
+                    )
+                owner_ids_by_email[owner_email] = str(owner["id"])
+
+            for item in normalized:
+                if item["role"] != "rotating_child":
+                    continue
+                parent_id = owner_ids_by_email[str(item["parent_owner_email"])]
+                alias_id = self._upsert_imported_icloud_alias_tx(
+                    connection,
+                    mailbox_id=str(mailbox_id),
+                    item=item,
+                    parent_owner_alias_id=parent_id,
+                )
+                imported_ids.append(alias_id)
+        return [self.get_icloud_alias(alias_id) for alias_id in imported_ids]
+
+    def _upsert_imported_icloud_alias_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        mailbox_id: str,
+        item: Mapping[str, Any],
+        parent_owner_alias_id: str | None,
+    ) -> str:
+        email = str(item["email"])
+        role = str(item["role"])
+        existing = connection.execute(
+            "SELECT * FROM icloud_aliases WHERE email = ? COLLATE NOCASE",
+            (email,),
+        ).fetchone()
+        if existing is None:
+            alias_id, _account_id = self._create_icloud_alias_tx(
+                connection,
+                mailbox_id=mailbox_id,
+                alias_email=email,
+                remote_metadata=item["remote"],
+                clean_label=str(item["label"]),
+                clean_role=role,
+                clean_parent_id=parent_owner_alias_id,
+                clean_owner_proxy=str(item["owner_proxy"]),
+            )
+            return alias_id
+        if str(existing["mailbox_id"]) != mailbox_id:
+            raise ConflictError("iCloud alias belongs to another mailbox")
+        if str(existing["role"]) != role:
+            raise StateConflictError("iCloud alias is already imported with another role")
+        existing_parent = (
+            None
+            if existing["parent_owner_alias_id"] is None
+            else str(existing["parent_owner_alias_id"])
+        )
+        if role == "rotating_child" and existing_parent not in {
+            None,
+            parent_owner_alias_id,
+        }:
+            raise StateConflictError("iCloud child already belongs to another Team owner")
+        alias_id = str(existing["id"])
+        expected_purpose = f"icloud-alias:{alias_id}:remote"
+        if str(existing["remote_purpose"]) != expected_purpose:
+            raise DatabaseError("iCloud alias metadata purpose is invalid")
+        remote_blob = self._require_secret_store().encrypt(
+            _json_bytes(item["remote"]), expected_purpose
+        )
+        remote_state = (
+            "inactive" if item["remote"].get("isActive") is False else "active"
+        )
+        proxy_blob = existing["proxy_blob"]
+        proxy_purpose = existing["proxy_purpose"]
+        owner_proxy = str(item["owner_proxy"])
+        if role == "team_owner" and owner_proxy:
+            proxy_purpose = f"icloud-owner:{alias_id}:proxy"
+            proxy_blob = self._require_secret_store().encrypt(
+                owner_proxy.encode("utf-8"), proxy_purpose
+            )
+        connection.execute(
+            """
+            UPDATE icloud_aliases
+            SET parent_owner_alias_id = COALESCE(parent_owner_alias_id, ?),
+                remote_blob = ?, state = ?, label = ?,
+                proxy_blob = ?, proxy_purpose = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                parent_owner_alias_id,
+                sqlite3.Binary(remote_blob),
+                remote_state,
+                str(item["label"]),
+                None if proxy_blob is None else sqlite3.Binary(bytes(proxy_blob)),
+                proxy_purpose,
+                _now(),
+                alias_id,
+            ),
+        )
+        if (
+            role == "rotating_child"
+            and existing_parent is None
+            and parent_owner_alias_id is not None
+            and existing["account_id"] is not None
+        ):
+            owner = self._icloud_owner_alias_tx(
+                connection, parent_owner_alias_id, mailbox_id=mailbox_id
+            )
+            owner_proxy_value = self._icloud_owner_proxy_tx(connection, owner)
+            account_proxy_blob = (
+                None
+                if not owner_proxy_value
+                else self._require_secret_store().encrypt(
+                    owner_proxy_value.encode("utf-8"),
+                    f"account:{existing['account_id']}:proxy",
+                )
             )
             connection.execute(
-                """
-                INSERT INTO icloud_aliases(
-                    id, mailbox_id, account_id, email, remote_blob, remote_purpose,
-                    state, label, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
-                """,
+                "UPDATE accounts SET proxy_blob = ?, updated_at = ? WHERE id = ?",
                 (
-                    alias_id,
-                    mailbox_id,
-                    account_id,
-                    alias_email,
-                    sqlite3.Binary(remote_blob),
-                    remote_purpose,
-                    clean_label,
-                    timestamp,
-                    timestamp,
+                    None
+                    if account_proxy_blob is None
+                    else sqlite3.Binary(account_proxy_blob),
+                    _now(),
+                    existing["account_id"],
                 ),
             )
-        return {
-            "alias": self.get_icloud_alias(alias_id),
-            "account": self.get_account(account_id),
-        }
+        return alias_id
+
+    @staticmethod
+    def _coerce_icloud_owner_proxy(value: Any) -> str:
+        proxy = str(value or "").strip()
+        if not proxy:
+            return ""
+        from .registrar import validate_proxy_url
+
+        try:
+            proxy = validate_proxy_url(proxy)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        if urllib.parse.urlsplit(proxy).scheme.casefold() not in {
+            "http",
+            "socks5",
+            "socks5h",
+        }:
+            raise ValidationError("iCloud Team owner proxy must be HTTP or SOCKS5")
+        return proxy
+
+    @staticmethod
+    def _icloud_owner_alias_tx(
+        connection: sqlite3.Connection,
+        alias_id: str,
+        *,
+        mailbox_id: str | None = None,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM icloud_aliases WHERE id = ?", (alias_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("iCloud Team owner not found")
+        if str(row["role"]) != "team_owner":
+            raise StateConflictError("iCloud alias is not a Team owner")
+        if str(row["state"]) != "active":
+            raise StateConflictError("iCloud Team owner is inactive")
+        if mailbox_id is not None and str(row["mailbox_id"]) != str(mailbox_id):
+            raise StateConflictError("iCloud child and Team owner use different mailboxes")
+        return row
+
+    def _icloud_owner_proxy_tx(
+        self, connection: sqlite3.Connection, owner: sqlite3.Row
+    ) -> str:
+        del connection
+        if owner["proxy_blob"] is None:
+            return ""
+        alias_id = str(owner["id"])
+        expected_purpose = f"icloud-owner:{alias_id}:proxy"
+        if str(owner["proxy_purpose"] or "") != expected_purpose:
+            raise DatabaseError("iCloud Team owner proxy purpose is invalid")
+        try:
+            return self._require_secret_store().decrypt(
+                bytes(owner["proxy_blob"]), expected_purpose
+            ).decode("utf-8")
+        except Exception as exc:
+            raise DatabaseError("iCloud Team owner proxy is invalid") from exc
+
+    def set_icloud_owner_proxy(self, alias_id: str, proxy: str) -> dict[str, Any]:
+        clean_proxy = self._coerce_icloud_owner_proxy(proxy)
+        purpose = f"icloud-owner:{alias_id}:proxy"
+        blob = (
+            None
+            if not clean_proxy
+            else self._require_secret_store().encrypt(
+                clean_proxy.encode("utf-8"), purpose
+            )
+        )
+        with self._write_transaction() as connection:
+            self._icloud_owner_alias_tx(connection, alias_id)
+            connection.execute(
+                """
+                UPDATE icloud_aliases
+                SET proxy_blob = ?, proxy_purpose = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    None if blob is None else sqlite3.Binary(blob),
+                    None if blob is None else purpose,
+                    _now(),
+                    alias_id,
+                ),
+            )
+        return self.get_icloud_alias(alias_id)
+
+    def get_icloud_owner_proxy(self, alias_id: str) -> str | None:
+        with self._read_connection() as connection:
+            owner = self._icloud_owner_alias_tx(connection, alias_id)
+            proxy = self._icloud_owner_proxy_tx(connection, owner)
+        return proxy or None
 
     @staticmethod
     def _icloud_alias_view(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
             "mailbox_id": str(row["mailbox_id"]),
-            "account_id": str(row["account_id"]),
+            "account_id": (
+                None if row["account_id"] is None else str(row["account_id"])
+            ),
+            "parent_owner_alias_id": (
+                None
+                if row["parent_owner_alias_id"] is None
+                else str(row["parent_owner_alias_id"])
+            ),
+            "owner_email": (
+                str(row["email"])
+                if str(row["role"]) == "team_owner"
+                else None if row["owner_email"] is None else str(row["owner_email"])
+            ),
             "email": str(row["email"]),
             "state": str(row["state"]),
+            "role": str(row["role"]),
             "label": str(row["label"]),
-            "account_status": str(row["account_status"]),
+            "proxy_configured": (
+                row["proxy_blob"] is not None
+                if str(row["role"]) == "team_owner"
+                else row["account_proxy_blob"] is not None
+            ),
+            "account_status": (
+                None if row["account_status"] is None else str(row["account_status"])
+            ),
+            "used_at": None if row["used_at"] is None else str(row["used_at"]),
+            "workspace_id": (
+                None if row["workspace_id"] is None else str(row["workspace_id"])
+            ),
+            "workspace_name": (
+                None if row["workspace_name"] is None else str(row["workspace_name"])
+            ),
+            "current_child_email": (
+                None
+                if row["current_child_email"] is None
+                else str(row["current_child_email"])
+            ),
+            "next_child_email": (
+                None
+                if row["next_child_email"] is None
+                else str(row["next_child_email"])
+            ),
+            "used_child_count": int(row["used_child_count"]),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
         }
 
+    @staticmethod
+    def _icloud_alias_select() -> str:
+        return """
+            SELECT alias.*, account.status AS account_status,
+                   account.proxy_blob AS account_proxy_blob,
+                   owner.email AS owner_email,
+                   workspace.id AS workspace_id,
+                   workspace.name AS workspace_name,
+                   current_account.email AS current_child_email,
+                   next_account.email AS next_child_email,
+                   (SELECT COUNT(*) FROM icloud_aliases AS used
+                    WHERE used.parent_owner_alias_id = CASE
+                              WHEN alias.role = 'team_owner' THEN alias.id
+                              ELSE alias.parent_owner_alias_id
+                          END
+                      AND used.role = 'rotating_child'
+                      AND used.used_at IS NOT NULL) AS used_child_count
+            FROM icloud_aliases AS alias
+            LEFT JOIN accounts AS account ON account.id = alias.account_id
+            LEFT JOIN icloud_aliases AS owner
+              ON owner.id = alias.parent_owner_alias_id
+            LEFT JOIN workspaces AS workspace
+              ON workspace.owner_alias_id = CASE
+                    WHEN alias.role = 'team_owner' THEN alias.id
+                    ELSE alias.parent_owner_alias_id
+                 END
+            LEFT JOIN accounts AS current_account
+              ON current_account.id = workspace.current_account_id
+            LEFT JOIN accounts AS next_account
+              ON next_account.id = workspace.next_account_id
+        """
+
     def get_icloud_alias(self, alias_id: str) -> dict[str, Any]:
         with self._read_connection() as connection:
             row = connection.execute(
-                """
-                SELECT alias.*, account.status AS account_status
-                FROM icloud_aliases AS alias
-                JOIN accounts AS account ON account.id = alias.account_id
-                WHERE alias.id = ?
-                """,
-                (alias_id,),
+                self._icloud_alias_select() + " WHERE alias.id = ?", (alias_id,)
             ).fetchone()
         if row is None:
             raise NotFoundError("iCloud alias not found")
@@ -1155,14 +1671,23 @@ class Database:
     def list_icloud_aliases(self, mailbox_id: str) -> list[dict[str, Any]]:
         with self._read_connection() as connection:
             rows = connection.execute(
-                """
-                SELECT alias.*, account.status AS account_status
-                FROM icloud_aliases AS alias
-                JOIN accounts AS account ON account.id = alias.account_id
+                self._icloud_alias_select()
+                + """
                 WHERE alias.mailbox_id = ?
                 ORDER BY alias.created_at DESC, alias.id DESC
                 """,
                 (mailbox_id,),
+            ).fetchall()
+        return [self._icloud_alias_view(row) for row in rows]
+
+    def list_icloud_team_owners(self) -> list[dict[str, Any]]:
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                self._icloud_alias_select()
+                + """
+                WHERE alias.role = 'team_owner'
+                ORDER BY alias.email COLLATE NOCASE, alias.id
+                """
             ).fetchall()
         return [self._icloud_alias_view(row) for row in rows]
 
@@ -2110,6 +2635,11 @@ class Database:
 
     @staticmethod
     def _account_view(row: sqlite3.Row) -> dict[str, Any]:
+        columns = set(row.keys())
+
+        def optional(column: str) -> Any:
+            return row[column] if column in columns else None
+
         return {
             "id": str(row["id"]),
             "email": str(row["email"]),
@@ -2120,16 +2650,54 @@ class Database:
             "updated_at": str(row["updated_at"]),
             "credentials_configured": True,
             "proxy_configured": row["proxy_blob"] is not None,
+            "icloud_alias_id": (
+                None
+                if optional("icloud_alias_id") is None
+                else str(optional("icloud_alias_id"))
+            ),
+            "icloud_role": (
+                None
+                if optional("icloud_role") is None
+                else str(optional("icloud_role"))
+            ),
+            "icloud_owner_alias_id": (
+                None
+                if optional("icloud_owner_alias_id") is None
+                else str(optional("icloud_owner_alias_id"))
+            ),
+            "icloud_owner_email": (
+                None
+                if optional("icloud_owner_email") is None
+                else str(optional("icloud_owner_email"))
+            ),
+            "icloud_used_at": (
+                None
+                if optional("icloud_used_at") is None
+                else str(optional("icloud_used_at"))
+            ),
         }
+
+    @staticmethod
+    def _account_select() -> str:
+        return """
+            SELECT account.id, account.email, account.primary_email,
+                   account.status, account.source, account.created_at,
+                   account.updated_at, account.proxy_blob,
+                   alias.id AS icloud_alias_id,
+                   alias.role AS icloud_role,
+                   alias.parent_owner_alias_id AS icloud_owner_alias_id,
+                   owner.email AS icloud_owner_email,
+                   alias.used_at AS icloud_used_at
+            FROM accounts AS account
+            LEFT JOIN icloud_aliases AS alias ON alias.account_id = account.id
+            LEFT JOIN icloud_aliases AS owner
+              ON owner.id = alias.parent_owner_alias_id
+        """
 
     def get_account(self, account_id: str) -> dict[str, Any]:
         with self._read_connection() as connection:
             row = connection.execute(
-                """
-                SELECT id, email, primary_email, status, source, created_at, updated_at,
-                       proxy_blob
-                FROM accounts WHERE id = ?
-                """,
+                self._account_select() + " WHERE account.id = ?",
                 (account_id,),
             ).fetchone()
         if row is None:
@@ -2139,11 +2707,7 @@ class Database:
     def list_accounts(self) -> list[dict[str, Any]]:
         with self._read_connection() as connection:
             rows = connection.execute(
-                """
-                SELECT id, email, primary_email, status, source, created_at, updated_at,
-                       proxy_blob
-                FROM accounts ORDER BY email COLLATE NOCASE
-                """
+                self._account_select() + " ORDER BY account.email COLLATE NOCASE"
             ).fetchall()
         return [self._account_view(row) for row in rows]
 
@@ -2448,10 +3012,19 @@ class Database:
         }
         with self._write_transaction() as connection:
             row = connection.execute(
-                "SELECT status FROM accounts WHERE id = ?", (account_id,)
+                """
+                SELECT account.status, alias.role AS icloud_role,
+                       alias.used_at AS icloud_used_at
+                FROM accounts AS account
+                LEFT JOIN icloud_aliases AS alias ON alias.account_id = account.id
+                WHERE account.id = ?
+                """,
+                (account_id,),
             ).fetchone()
             if row is None:
                 raise NotFoundError("account not found")
+            if row["icloud_used_at"] is not None and new_status != "retired":
+                raise StateConflictError("used iCloud child cannot be re-enabled")
             current = str(row["status"])
             if current == new_status:
                 return self.get_account(account_id)
@@ -2475,6 +3048,14 @@ class Database:
             "next_account_id": (
                 None if row["next_account_id"] is None else str(row["next_account_id"])
             ),
+            "owner_alias_id": (
+                None if row["owner_alias_id"] is None else str(row["owner_alias_id"])
+            ),
+            "owner_email": (
+                None if row["owner_email"] is None else str(row["owner_email"])
+            ),
+            "owner_proxy_configured": bool(row["owner_proxy_configured"]),
+            "used_child_count": int(row["used_child_count"]),
             "status": str(row["status"]),
             "last_run_id": None if row["last_run_id"] is None else str(row["last_run_id"]),
             "rotation_count": int(row["rotation_count"]),
@@ -2482,6 +3063,20 @@ class Database:
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
         }
+
+    @staticmethod
+    def _workspace_select() -> str:
+        return """
+            SELECT workspace.*, owner.email AS owner_email,
+                   CASE WHEN owner.proxy_blob IS NULL THEN 0 ELSE 1 END
+                     AS owner_proxy_configured,
+                   (SELECT COUNT(*) FROM icloud_aliases AS used
+                    WHERE used.parent_owner_alias_id = workspace.owner_alias_id
+                      AND used.role = 'rotating_child'
+                      AND used.used_at IS NOT NULL) AS used_child_count
+            FROM workspaces AS workspace
+            LEFT JOIN icloud_aliases AS owner ON owner.id = workspace.owner_alias_id
+        """
 
     def _account_statuses(
         self, connection: sqlite3.Connection, account_ids: set[str]
@@ -2523,7 +3118,11 @@ class Database:
         if clean_account_id:
             linked = connection.execute(
                 """
-                SELECT alias.state AS alias_state, mailbox.status AS mailbox_status
+                SELECT alias.state AS alias_state, alias.role AS alias_role,
+                       alias.used_at AS alias_used_at,
+                       alias.parent_owner_alias_id,
+                       alias.mailbox_id,
+                       mailbox.status AS mailbox_status
                 FROM icloud_aliases AS alias
                 JOIN icloud_mailboxes AS mailbox ON mailbox.id = alias.mailbox_id
                 WHERE alias.account_id = ?
@@ -2535,12 +3134,67 @@ class Database:
                 or str(linked["mailbox_status"]) != "ready"
             ):
                 raise InventoryDisabledError("iCloud account mailbox is not ready")
+            if linked is not None and (
+                str(linked["alias_role"]) != "rotating_child"
+                or linked["alias_used_at"] is not None
+            ):
+                raise InventoryDisabledError("iCloud child account is already used")
             return clean_account_id
         if required:
             raise ValidationError(
                 f"{role}_account_id or {role}_inventory_id is required"
             )
         return None
+
+    def _validate_workspace_icloud_group_tx(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        owner_alias_id: str | None,
+        account_ids: set[str],
+    ) -> str | None:
+        clean_owner_id = str(owner_alias_id or "").strip() or None
+        owner = (
+            None
+            if clean_owner_id is None
+            else self._icloud_owner_alias_tx(connection, clean_owner_id)
+        )
+        if not account_ids:
+            return clean_owner_id
+        placeholders = ",".join("?" for _ in account_ids)
+        rows = connection.execute(
+            f"""
+            SELECT account.id, alias.id AS alias_id, alias.mailbox_id,
+                   alias.parent_owner_alias_id, alias.role, alias.used_at
+            FROM accounts AS account
+            LEFT JOIN icloud_aliases AS alias ON alias.account_id = account.id
+            WHERE account.id IN ({placeholders})
+            """,
+            tuple(account_ids),
+        ).fetchall()
+        if len(rows) != len(account_ids):
+            raise NotFoundError("account not found")
+        for row in rows:
+            if row["alias_id"] is None:
+                if owner is not None:
+                    raise StateConflictError(
+                        "Team owner workspace accounts must be iCloud children"
+                    )
+                continue
+            if str(row["role"]) != "rotating_child" or row["used_at"] is not None:
+                raise StateConflictError("workspace account is not an active iCloud child")
+            parent_id = (
+                None
+                if row["parent_owner_alias_id"] is None
+                else str(row["parent_owner_alias_id"])
+            )
+            if parent_id is not None and clean_owner_id is None:
+                raise StateConflictError("iCloud child workspace requires its Team owner")
+            if clean_owner_id is not None and parent_id != clean_owner_id:
+                raise StateConflictError("iCloud child belongs to another Team owner")
+            if owner is not None and str(row["mailbox_id"]) != str(owner["mailbox_id"]):
+                raise StateConflictError("iCloud child and Team owner use different mailboxes")
+        return clean_owner_id
 
     def create_workspace(
         self,
@@ -2551,6 +3205,7 @@ class Database:
         next_account_id: str | None = None,
         current_inventory_id: str | None = None,
         next_inventory_id: str | None = None,
+        owner_alias_id: str | None = None,
         workspace_id: str | None = None,
     ) -> dict[str, Any]:
         workspace_id = _identifier(workspace_id)
@@ -2577,6 +3232,11 @@ class Database:
             account_ids = {str(current_account_id)}
             if next_account_id:
                 account_ids.add(next_account_id)
+            owner_alias_id = self._validate_workspace_icloud_group_tx(
+                connection,
+                owner_alias_id=owner_alias_id,
+                account_ids=account_ids,
+            )
             statuses = self._account_statuses(connection, account_ids)
             unavailable = [key for key, value in statuses.items() if value != "available"]
             if unavailable:
@@ -2585,8 +3245,8 @@ class Database:
                 """
                 INSERT INTO workspaces(
                     id, name, workspace_uid, current_account_id, next_account_id,
-                    status, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    owner_alias_id, status, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     workspace_id,
@@ -2594,6 +3254,7 @@ class Database:
                     workspace_uid,
                     current_account_id,
                     next_account_id,
+                    owner_alias_id,
                     "ready" if next_account_id else "needs_account",
                     timestamp,
                     timestamp,
@@ -2613,7 +3274,7 @@ class Database:
     def get_workspace(self, workspace_id: str) -> dict[str, Any]:
         with self._read_connection() as connection:
             row = connection.execute(
-                "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+                self._workspace_select() + " WHERE workspace.id = ?", (workspace_id,)
             ).fetchone()
         if row is None:
             raise NotFoundError("workspace not found")
@@ -2622,7 +3283,8 @@ class Database:
     def list_workspaces(self) -> list[dict[str, Any]]:
         with self._read_connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM workspaces ORDER BY name COLLATE NOCASE, id"
+                self._workspace_select()
+                + " ORDER BY workspace.name COLLATE NOCASE, workspace.id"
             ).fetchall()
         return [self._workspace_view(row) for row in rows]
 
@@ -2634,6 +3296,7 @@ class Database:
         next_account_id: str | None = None,
         current_inventory_id: str | None = None,
         next_inventory_id: str | None = None,
+        owner_alias_id: str | None = None,
         expected_version: int,
         name: str | None = None,
     ) -> dict[str, Any]:
@@ -2679,6 +3342,11 @@ class Database:
             new_ids = {current_account_id}
             if next_account_id:
                 new_ids.add(next_account_id)
+            owner_alias_id = self._validate_workspace_icloud_group_tx(
+                connection,
+                owner_alias_id=owner_alias_id,
+                account_ids=new_ids,
+            )
             statuses = self._account_statuses(connection, new_ids)
             for account_id in new_ids - old_ids:
                 if statuses[account_id] != "available":
@@ -2687,7 +3355,8 @@ class Database:
             cursor = connection.execute(
                 """
                 UPDATE workspaces SET
-                    name = ?, current_account_id = ?, next_account_id = ?, status = ?,
+                    name = ?, current_account_id = ?, next_account_id = ?,
+                    owner_alias_id = ?, status = ?,
                     version = version + 1, updated_at = ?
                 WHERE id = ? AND version = ?
                 """,
@@ -2695,6 +3364,7 @@ class Database:
                     _required_text(name, "name") if name is not None else workspace["name"],
                     current_account_id,
                     next_account_id,
+                    owner_alias_id,
                     "ready" if next_account_id else "needs_account",
                     timestamp,
                     workspace_id,
@@ -2733,6 +3403,7 @@ class Database:
         next_account_id: str | None | object = _UNSET,
         current_inventory_id: str | None = None,
         next_inventory_id: str | None = None,
+        owner_alias_id: str | None | object = _UNSET,
     ) -> dict[str, Any]:
         workspace = self.get_workspace(workspace_id)
         if int(workspace["version"]) != int(expected_version):
@@ -2751,11 +3422,17 @@ class Database:
             if next_account_id is _UNSET
             else next_account_id
         )
+        effective_owner = (
+            workspace["owner_alias_id"]
+            if owner_alias_id is _UNSET
+            else owner_alias_id
+        )
         bindings_changed = (
             current_inventory_id is not None
             or next_inventory_id is not None
             or effective_current != workspace["current_account_id"]
             or effective_next != workspace["next_account_id"]
+            or effective_owner != workspace["owner_alias_id"]
         )
         if bindings_changed:
             return self.update_workspace_bindings(
@@ -2766,6 +3443,9 @@ class Database:
                 next_account_id=(None if effective_next is None else str(effective_next)),
                 current_inventory_id=current_inventory_id,
                 next_inventory_id=next_inventory_id,
+                owner_alias_id=(
+                    None if effective_owner is None else str(effective_owner)
+                ),
                 expected_version=expected_version,
                 name=effective_name,
             )
@@ -2783,6 +3463,91 @@ class Database:
             if cursor.rowcount != 1:
                 raise StaleVersionError("workspace version is stale")
         return self.get_workspace(workspace_id)
+
+    def prepare_icloud_workspace_handoff(
+        self,
+        workspace_id: str,
+        *,
+        expected_version: int,
+        email: str,
+        remote_metadata: Mapping[str, Any],
+        label: str,
+    ) -> dict[str, Any]:
+        alias_email = _normalize_email_address(email, "alias_email")
+        clean_label = _required_text(label, "label")
+        if len(clean_label) > 160:
+            raise ValidationError("label is too long")
+        if not isinstance(remote_metadata, Mapping) or not str(
+            remote_metadata.get("anonymousId") or ""
+        ).strip():
+            raise ValidationError("iCloud alias remote metadata is incomplete")
+        with self._write_transaction() as connection:
+            workspace = connection.execute(
+                "SELECT * FROM workspaces WHERE id = ?", (workspace_id,)
+            ).fetchone()
+            if workspace is None:
+                raise NotFoundError("workspace not found")
+            if int(workspace["version"]) != int(expected_version):
+                raise StaleVersionError("workspace version is stale")
+            if workspace["status"] in {"queued", "running"}:
+                raise WorkspaceActiveError("active workspace cannot prepare another child")
+            if workspace["next_account_id"] is not None:
+                raise StateConflictError("workspace already has a prepared next child")
+            owner_alias_id = str(workspace["owner_alias_id"] or "").strip()
+            if not owner_alias_id:
+                raise StateConflictError("workspace has no iCloud Team owner")
+            owner = self._icloud_owner_alias_tx(connection, owner_alias_id)
+            if not self._icloud_owner_proxy_tx(connection, owner):
+                raise StateConflictError("iCloud Team owner S5 is not configured")
+            current = connection.execute(
+                """
+                SELECT alias.* FROM icloud_aliases AS alias
+                WHERE alias.account_id = ?
+                """,
+                (workspace["current_account_id"],),
+            ).fetchone()
+            if (
+                current is None
+                or str(current["role"]) != "rotating_child"
+                or str(current["parent_owner_alias_id"] or "") != owner_alias_id
+                or current["used_at"] is not None
+                or str(current["state"]) != "active"
+            ):
+                raise StateConflictError(
+                    "workspace current child does not match its iCloud Team owner"
+                )
+            alias_id, account_id = self._create_icloud_alias_tx(
+                connection,
+                mailbox_id=str(owner["mailbox_id"]),
+                alias_email=alias_email,
+                remote_metadata=dict(remote_metadata),
+                clean_label=clean_label,
+                clean_role="rotating_child",
+                clean_parent_id=owner_alias_id,
+                clean_owner_proxy="",
+            )
+            if account_id is None:
+                raise StateConflictError("new iCloud child account was not created")
+            cursor = connection.execute(
+                """
+                UPDATE workspaces
+                SET next_account_id = ?, status = 'ready',
+                    version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ? AND next_account_id IS NULL
+                """,
+                (account_id, _now(), workspace_id, int(expected_version)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleVersionError("workspace version is stale")
+            connection.execute(
+                "UPDATE accounts SET status = 'bound_next', updated_at = ? WHERE id = ?",
+                (_now(), account_id),
+            )
+        return {
+            "workspace": self.get_workspace(workspace_id),
+            "alias": self.get_icloud_alias(alias_id),
+            "account": self.get_account(account_id),
+        }
 
     @staticmethod
     def _run_view(row: sqlite3.Row) -> dict[str, Any]:
@@ -3397,10 +4162,57 @@ class Database:
                 or accounts[str(run["next_account_id"])] != "bound_next"
             ):
                 raise StateConflictError("account roles no longer match the run snapshot")
-            connection.execute(
-                "UPDATE accounts SET status = 'exited_pending', updated_at = ? WHERE id = ?",
-                (timestamp, run["current_account_id"]),
+            owner_alias_id = (
+                None
+                if workspace["owner_alias_id"] is None
+                else str(workspace["owner_alias_id"])
             )
+            if owner_alias_id is not None:
+                self._icloud_owner_alias_tx(connection, owner_alias_id)
+                child_rows = connection.execute(
+                    """
+                    SELECT account_id, parent_owner_alias_id, role, used_at
+                    FROM icloud_aliases
+                    WHERE account_id IN (?, ?)
+                    """,
+                    (run["current_account_id"], run["next_account_id"]),
+                ).fetchall()
+                if len(child_rows) != 2 or any(
+                    str(child["role"]) != "rotating_child"
+                    or str(child["parent_owner_alias_id"] or "") != owner_alias_id
+                    or child["used_at"] is not None
+                    for child in child_rows
+                ):
+                    raise StateConflictError(
+                        "workspace child accounts no longer match their Team owner"
+                    )
+            connection.execute(
+                "UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?",
+                (
+                    "retired" if owner_alias_id is not None else "exited_pending",
+                    timestamp,
+                    run["current_account_id"],
+                ),
+            )
+            if owner_alias_id is not None:
+                cursor = connection.execute(
+                    """
+                    UPDATE icloud_aliases
+                    SET used_at = ?, updated_at = ?
+                    WHERE account_id = ?
+                      AND role = 'rotating_child'
+                      AND parent_owner_alias_id = ?
+                      AND used_at IS NULL
+                    """,
+                    (
+                        timestamp,
+                        timestamp,
+                        run["current_account_id"],
+                        owner_alias_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflictError("old iCloud child could not enter the used pool")
             self._set_allocation_state_tx(
                 connection, str(run["current_account_id"]), "retired", timestamp
             )
@@ -3417,10 +4229,14 @@ class Database:
             promoted_alias_number = _alias_number(
                 str(promoted["email"]), str(promoted["primary_email"])
             )
-            replacement = self._claim_replacement_account_tx(
-                connection,
-                preferred_primary_email=str(promoted["primary_email"]),
-                after_alias_number=promoted_alias_number,
+            replacement = (
+                None
+                if owner_alias_id is not None
+                else self._claim_replacement_account_tx(
+                    connection,
+                    preferred_primary_email=str(promoted["primary_email"]),
+                    after_alias_number=promoted_alias_number,
+                )
             )
             replacement_id = None if replacement is None else str(replacement["id"])
             if replacement_id is not None:
@@ -4423,12 +5239,21 @@ class Database:
                                 raise RestoreValidationError(
                                     "restore candidate iCloud mailbox secrets are invalid"
                                 )
-                        for row in connection.execute(
+                        alias_query = (
                             """
-                            SELECT id, remote_blob, remote_purpose
+                            SELECT id, remote_blob, remote_purpose,
+                                   proxy_blob, proxy_purpose
                             FROM icloud_aliases
                             """
-                        ):
+                            if schema_version >= 6
+                            else
+                            """
+                            SELECT id, remote_blob, remote_purpose,
+                                   NULL AS proxy_blob, NULL AS proxy_purpose
+                            FROM icloud_aliases
+                            """
+                        )
+                        for row in connection.execute(alias_query):
                             purpose = f"icloud-alias:{row['id']}:remote"
                             if str(row["remote_purpose"]) != purpose:
                                 raise RestoreValidationError(
@@ -4441,6 +5266,18 @@ class Database:
                                 raise RestoreValidationError(
                                     "restore candidate iCloud alias metadata is invalid"
                                 )
+                            if row["proxy_blob"] is not None:
+                                proxy_purpose = f"icloud-owner:{row['id']}:proxy"
+                                if str(row["proxy_purpose"] or "") != proxy_purpose:
+                                    raise RestoreValidationError(
+                                        "restore candidate iCloud owner proxy purpose is invalid"
+                                    )
+                                owner_proxy = self._require_secret_store().decrypt(
+                                    bytes(row["proxy_blob"]), proxy_purpose
+                                ).decode("utf-8")
+                                from .registrar import validate_proxy_url
+
+                                validate_proxy_url(owner_proxy)
                     run_query = (
                         "SELECT id, checkpoint_blob, proxy_blob, "
                         "account_proxy_snapshot_blob FROM runs"

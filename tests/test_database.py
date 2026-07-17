@@ -291,7 +291,7 @@ class DatabaseTests(unittest.TestCase):
         self.database.initialize()
         diagnostics = self.database.diagnostics()
 
-        self.assertEqual(diagnostics["schema_version"], 5)
+        self.assertEqual(diagnostics["schema_version"], database_module.SCHEMA_VERSION)
         self.assertEqual(diagnostics["journal_mode"], "wal")
         self.assertTrue(diagnostics["foreign_keys"])
         self.assertEqual(diagnostics["busy_timeout_ms"], 5000)
@@ -508,6 +508,261 @@ class DatabaseTests(unittest.TestCase):
                 workspace_uid="blocked-icloud-profile",
                 current_account_id=spare["id"],
             )
+
+    def test_icloud_team_owner_children_and_used_pool_form_a_closed_handoff(self):
+        profile = self.database.create_icloud_mailbox(
+            name="Shared Apple pool",
+            forwarding_email="forward-team@example.com",
+            secrets=self.icloud_secret("shared-team"),
+            status="ready",
+        )
+        owner_proxy = (
+            "socks5h://team-owner-a:owner-proxy-secret@proxy.invalid:1080"
+        )
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "owner-a@icloud.com",
+                    "role": "team_owner",
+                    "owner_proxy": owner_proxy,
+                    "remote_metadata": {
+                        "hme": "owner-a@icloud.com",
+                        "anonymousId": "owner-a-remote-secret",
+                        "isActive": True,
+                        "label": "Team owner A",
+                    },
+                },
+                {
+                    "email": "current-a@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "owner-a@icloud.com",
+                    "remote_metadata": {
+                        "hme": "current-a@icloud.com",
+                        "anonymousId": "current-a-remote-secret",
+                        "isActive": True,
+                        "label": "Current child A",
+                    },
+                },
+            ],
+        )
+        owner = next(item for item in imported if item["role"] == "team_owner")
+        current_alias = next(
+            item for item in imported if item["role"] == "rotating_child"
+        )
+        self.assertIsNone(owner["account_id"])
+        self.assertTrue(owner["proxy_configured"])
+        self.assertEqual(current_alias["parent_owner_alias_id"], owner["id"])
+        self.assertEqual(
+            self.database.get_account_proxy(current_alias["account_id"]), owner_proxy
+        )
+
+        workspace = self.database.create_workspace(
+            name="Team owner A workspace",
+            workspace_uid="team-owner-a-workspace",
+            owner_alias_id=owner["id"],
+            current_account_id=current_alias["account_id"],
+        )
+        self.assertEqual(workspace["status"], "needs_account")
+        self.assertIsNone(workspace["next_account_id"])
+
+        prepared = self.database.prepare_icloud_workspace_handoff(
+            workspace["id"],
+            expected_version=workspace["version"],
+            email="fresh-a@icloud.com",
+            remote_metadata={
+                "hme": "fresh-a@icloud.com",
+                "anonymousId": "fresh-a-remote-secret",
+                "isActive": True,
+            },
+            label="Team owner A handoff 1",
+        )
+        fresh_alias = prepared["alias"]
+        self.assertEqual(prepared["workspace"]["status"], "ready")
+        self.assertEqual(
+            prepared["workspace"]["next_account_id"], fresh_alias["account_id"]
+        )
+        self.assertEqual(fresh_alias["parent_owner_alias_id"], owner["id"])
+        self.assertEqual(
+            self.database.get_account_proxy(fresh_alias["account_id"]), owner_proxy
+        )
+
+        run = self.database.enqueue_workspace(workspace["id"])
+        self.database.claim_next_queue_item()
+        self.database.complete_run_and_rotate(run["id"])
+        rotated = self.database.get_workspace(workspace["id"])
+        used = self.database.get_icloud_alias(current_alias["id"])
+
+        self.assertEqual(rotated["current_account_id"], fresh_alias["account_id"])
+        self.assertIsNone(rotated["next_account_id"])
+        self.assertEqual(rotated["status"], "needs_account")
+        self.assertEqual(rotated["used_child_count"], 1)
+        self.assertIsNotNone(used["used_at"])
+        self.assertEqual(used["state"], "active")
+        self.assertEqual(
+            self.database.get_account(current_alias["account_id"])["status"],
+            "retired",
+        )
+        with self.assertRaises(StateConflictError):
+            self.database.transition_account_status(
+                current_alias["account_id"], "available"
+            )
+
+    def test_icloud_team_owner_workspace_rejects_another_owners_child(self):
+        profile = self.database.create_icloud_mailbox(
+            name="Shared Apple pool",
+            forwarding_email="forward-reject@example.com",
+            secrets=self.icloud_secret("shared-reject"),
+            status="ready",
+        )
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "owner-one@icloud.com",
+                    "role": "team_owner",
+                    "remote_metadata": {
+                        "hme": "owner-one@icloud.com",
+                        "anonymousId": "owner-one-id",
+                    },
+                },
+                {
+                    "email": "owner-two@icloud.com",
+                    "role": "team_owner",
+                    "remote_metadata": {
+                        "hme": "owner-two@icloud.com",
+                        "anonymousId": "owner-two-id",
+                    },
+                },
+                {
+                    "email": "child-two@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "owner-two@icloud.com",
+                    "remote_metadata": {
+                        "hme": "child-two@icloud.com",
+                        "anonymousId": "child-two-id",
+                    },
+                },
+            ],
+        )
+        owner_one = next(
+            item for item in imported if item["email"] == "owner-one@icloud.com"
+        )
+        child_two = next(
+            item for item in imported if item["email"] == "child-two@icloud.com"
+        )
+
+        with self.assertRaises(StateConflictError):
+            self.database.create_workspace(
+                name="Mismatched team",
+                workspace_uid="mismatched-team",
+                owner_alias_id=owner_one["id"],
+                current_account_id=child_two["account_id"],
+            )
+
+    def test_v5_icloud_aliases_upgrade_to_unassigned_rotating_children(self):
+        legacy_path = Path(self.temporary_directory.name) / "v5-upgrade.db"
+        store = TestSecretStore()
+        with mock.patch.object(database_module, "SCHEMA_VERSION", 5):
+            Database(legacy_path, secret_store=store)
+            mailbox_id = "legacy-v5-mailbox"
+            account_id = "legacy-v5-account"
+            alias_id = "legacy-v5-alias"
+            remote_purpose = f"icloud-alias:{alias_id}:remote"
+            remote_blob = store.encrypt(
+                json.dumps(
+                    {"anonymousId": "legacy-child-remote"},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode(),
+                remote_purpose,
+            )
+            mailbox_purpose = f"icloud-mailbox:{mailbox_id}:secrets"
+            mailbox_blob = store.encrypt(
+                json.dumps(
+                    self.icloud_secret("legacy-v5"),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode(),
+                mailbox_purpose,
+            )
+            account_purpose = f"account:{account_id}:credentials"
+            account_blob = store.encrypt(
+                json.dumps(
+                    {"provider": "icloud_hme_imap"},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode(),
+                account_purpose,
+            )
+            timestamp = database_module._now()
+            connection = sqlite3.connect(legacy_path)
+            try:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute(
+                    """
+                    INSERT INTO icloud_mailboxes(
+                        id, name, forwarding_email, secret_blob, secret_purpose,
+                        proxy_configured, status, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, 1, 'ready', ?, ?)
+                    """,
+                    (
+                        mailbox_id,
+                        "Legacy Apple pool",
+                        "legacy-forward@example.com",
+                        sqlite3.Binary(mailbox_blob),
+                        mailbox_purpose,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO accounts(
+                        id, email, primary_email, credential_blob, status, source,
+                        created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, 'available', 'icloud_hme', ?, ?)
+                    """,
+                    (
+                        account_id,
+                        "legacy-child@icloud.com",
+                        "legacy-forward@example.com",
+                        sqlite3.Binary(account_blob),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO icloud_aliases(
+                        id, mailbox_id, account_id, email, remote_blob,
+                        remote_purpose, state, label, created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                    """,
+                    (
+                        alias_id,
+                        mailbox_id,
+                        account_id,
+                        "legacy-child@icloud.com",
+                        sqlite3.Binary(remote_blob),
+                        remote_purpose,
+                        "Legacy child",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+        upgraded = Database(legacy_path, secret_store=store)
+        alias = upgraded.get_icloud_alias(alias_id)
+
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 6)
+        self.assertEqual(alias["role"], "rotating_child")
+        self.assertIsNone(alias["parent_owner_alias_id"])
+        self.assertIsNone(alias["used_at"])
+        self.assertEqual(alias["account_id"], account_id)
 
     def test_account_credentials_are_encrypted_and_email_is_case_insensitive_unique(self):
         account = self.create_account("one")
@@ -1343,10 +1598,14 @@ class DatabaseTests(unittest.TestCase):
             connection.close()
 
         upgraded = Database(legacy_path, secret_store=TestSecretStore())
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 5)
+        self.assertEqual(
+            upgraded.diagnostics()["schema_version"], database_module.SCHEMA_VERSION
+        )
         self.assertEqual(upgraded.get_meta("instance_id"), "legacy-instance")
         upgraded.initialize()
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 5)
+        self.assertEqual(
+            upgraded.diagnostics()["schema_version"], database_module.SCHEMA_VERSION
+        )
 
     def test_inventory_import_search_and_credentials_are_encrypted(self):
         records = [
@@ -1758,9 +2017,12 @@ class DatabaseTests(unittest.TestCase):
         restored = self.database.restore_verified_backup(candidate, validation)
 
         self.assertEqual(validation.schema_version, 1)
-        self.assertEqual(restored["schema_version"], 5)
+        self.assertEqual(restored["schema_version"], database_module.SCHEMA_VERSION)
         self.assertEqual(self.database.get_meta("instance_id"), "snapshot-v1-instance")
-        self.assertEqual(self.database.diagnostics()["schema_version"], 5)
+        self.assertEqual(
+            self.database.diagnostics()["schema_version"],
+            database_module.SCHEMA_VERSION,
+        )
 
 
 if __name__ == "__main__":

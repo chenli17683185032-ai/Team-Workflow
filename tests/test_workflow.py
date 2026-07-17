@@ -1233,7 +1233,10 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertIsInstance(checkpoint.get("_registrar_provider_state"), dict)
             self.assertFalse((config.output_dir / ".registrar").exists())
-            self.assertEqual(created, {Path(result["cpa_path"]).relative_to(root)})
+            self.assertEqual(
+                created,
+                {Path(result["cpa_path"]).resolve().relative_to(root.resolve())},
+            )
             self.assertFalse(
                 any(
                     "state" in path.name.casefold()

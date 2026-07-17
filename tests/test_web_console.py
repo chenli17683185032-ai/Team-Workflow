@@ -498,6 +498,212 @@ class WebConsoleTests(unittest.TestCase):
             "session_invalid",
         )
 
+    def test_icloud_existing_alias_import_and_on_demand_handoff_are_owner_scoped(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        remote_aliases = [
+            {
+                "hme": "owner-one@icloud.com",
+                "anonymousId": "remote-owner-one-secret",
+                "isActive": True,
+                "label": "Owner one",
+            },
+            {
+                "hme": "owner-two@icloud.com",
+                "anonymousId": "remote-owner-two-secret",
+                "isActive": True,
+                "label": "Owner two",
+            },
+            {
+                "hme": "current-one@icloud.com",
+                "anonymousId": "remote-current-one-secret",
+                "isActive": True,
+                "label": "Current one",
+            },
+            {
+                "hme": "current-two@icloud.com",
+                "anonymousId": "remote-current-two-secret",
+                "isActive": True,
+                "label": "Current two",
+            },
+            {
+                "hme": "obsolete@icloud.com",
+                "anonymousId": "remote-obsolete-secret",
+                "isActive": True,
+                "label": "Obsolete",
+            },
+        ]
+        generated = []
+
+        class OwnerScopedClient:
+            def list_aliases(self):
+                return list(remote_aliases)
+
+            def create_alias(self, *, label, note):
+                item = {
+                    "hme": "fresh-handoff@icloud.com",
+                    "anonymousId": "remote-fresh-handoff-secret",
+                    "isActive": True,
+                    "label": label,
+                    "note": note,
+                }
+                generated.append(item)
+                return item
+
+            def deactivate_alias(self, anonymous_id):
+                raise AssertionError(f"unexpected compensation for {anonymous_id}")
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: OwnerScopedClient()
+        )
+        app = create_app(self.controller, testing=True)
+        owner_one_proxy = (
+            "socks5h://owner-one:owner-one-secret@proxy-one.invalid:1080"
+        )
+        owner_two_proxy = (
+            "socks5h://owner-two:owner-two-secret@proxy-two.invalid:1080"
+        )
+        with TestClient(app) as client:
+            preview = client.get(
+                f"/api/icloud-mailboxes/{profile['id']}/remote-aliases",
+                headers=self.origin_headers,
+            )
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertEqual(len(preview.json()), 5)
+            self.assertNotIn("anonymousId", preview.text)
+
+            imported_response = client.post(
+                f"/api/icloud-mailboxes/{profile['id']}/aliases/import",
+                json={
+                    "items": [
+                        {
+                            "email": "owner-one@icloud.com",
+                            "role": "team_owner",
+                            "owner_proxy": owner_one_proxy,
+                        },
+                        {
+                            "email": "owner-two@icloud.com",
+                            "role": "team_owner",
+                            "owner_proxy": owner_two_proxy,
+                        },
+                        {
+                            "email": "current-one@icloud.com",
+                            "role": "rotating_child",
+                            "parent_owner_email": "owner-one@icloud.com",
+                        },
+                        {
+                            "email": "current-two@icloud.com",
+                            "role": "rotating_child",
+                            "parent_owner_email": "owner-two@icloud.com",
+                        },
+                    ]
+                },
+                headers=self.origin_headers,
+            )
+            self.assertEqual(imported_response.status_code, 201, imported_response.text)
+            imported = imported_response.json()
+            self.assertEqual(len(imported), 4)
+            self.assertNotIn("obsolete@icloud.com", imported_response.text)
+            owner_one = next(
+                item for item in imported if item["email"] == "owner-one@icloud.com"
+            )
+            owner_two = next(
+                item for item in imported if item["email"] == "owner-two@icloud.com"
+            )
+            current_one = next(
+                item for item in imported if item["email"] == "current-one@icloud.com"
+            )
+            current_two = next(
+                item for item in imported if item["email"] == "current-two@icloud.com"
+            )
+
+            created_workspace = client.post(
+                "/api/workspaces",
+                json={
+                    "name": "Owner one team",
+                    "workspace_uid": "owner-one-team-uid",
+                    "owner_alias_id": owner_one["id"],
+                    "current_account_id": current_one["account_id"],
+                },
+                headers=self.origin_headers,
+            )
+            self.assertEqual(created_workspace.status_code, 201, created_workspace.text)
+            workspace = created_workspace.json()
+            self.assertEqual(workspace["status"], "needs_account")
+
+            handoff = client.post(
+                f"/api/workspaces/{workspace['id']}/replace-icloud-child",
+                json={"version": workspace["version"]},
+                headers=self.origin_headers,
+            )
+            self.assertEqual(handoff.status_code, 202, handoff.text)
+            handoff_payload = handoff.json()
+            self.assertTrue(handoff_payload["created"])
+            self.assertEqual(handoff_payload["run"]["state"], "queued")
+
+            second_workspace_response = client.post(
+                "/api/workspaces",
+                json={
+                    "name": "Owner two team",
+                    "workspace_uid": "owner-two-team-uid",
+                    "owner_alias_id": owner_two["id"],
+                    "current_account_id": current_two["account_id"],
+                },
+                headers=self.origin_headers,
+            )
+            self.assertEqual(
+                second_workspace_response.status_code,
+                201,
+                second_workspace_response.text,
+            )
+            second_workspace = second_workspace_response.json()
+            compensated = []
+
+            class MalformedCreateClient:
+                def create_alias(self, *, label, note):
+                    del label, note
+                    return {"anonymousId": "malformed-remote-secret"}
+
+                def deactivate_alias(self, anonymous_id):
+                    compensated.append(anonymous_id)
+
+            self.controller.hme_client_factory = (
+                lambda _session, **_kwargs: MalformedCreateClient()
+            )
+            malformed = client.post(
+                f"/api/workspaces/{second_workspace['id']}/replace-icloud-child",
+                json={"version": second_workspace["version"]},
+                headers=self.origin_headers,
+            )
+            self.assertEqual(malformed.status_code, 409, malformed.text)
+            self.assertNotIn("malformed-remote-secret", malformed.text)
+
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(compensated, ["malformed-remote-secret"])
+        self.assertEqual(len(self.database.list_icloud_aliases(profile["id"])), 5)
+        fresh = self.database.get_icloud_alias(handoff_payload["alias"]["id"])
+        self.assertEqual(fresh["parent_owner_alias_id"], owner_one["id"])
+        self.assertEqual(
+            self.database.get_account_proxy(fresh["account_id"]), owner_one_proxy
+        )
+        self.assertEqual(
+            self.database.get_account_proxy(current_two["account_id"]), owner_two_proxy
+        )
+        serialized = json.dumps(
+            {"preview": preview.json(), "imported": imported, "handoff": handoff_payload}
+        )
+        for secret in (
+            "remote-owner-one-secret",
+            "remote-owner-two-secret",
+            "remote-current-one-secret",
+            "remote-current-two-secret",
+            "remote-obsolete-secret",
+            "remote-fresh-handoff-secret",
+            "owner-one-secret",
+            "owner-two-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+
     def test_large_inventory_is_absent_from_bootstrap_and_sse_reset(self):
         before = len(json.dumps(self.controller.bootstrap(), sort_keys=True))
         records = [
@@ -883,6 +1089,25 @@ class WebConsoleTests(unittest.TestCase):
         self.assertIn("event: reset", frame)
         self.assertIn('"workspaces"', frame)
 
+    def test_sse_stops_when_server_shutdown_is_requested(self):
+        class ConnectedRequest:
+            async def is_disconnected(self):
+                return False
+
+        self.controller.set_shutdown_probe(lambda: True)
+
+        async def frames():
+            stream = _event_stream(self.controller, ConnectedRequest())
+            try:
+                first = await anext(stream)
+                with self.assertRaises(StopAsyncIteration):
+                    await anext(stream)
+                return first
+            finally:
+                await stream.aclose()
+
+        self.assertIn("event: reset", asyncio.run(frames()))
+
     def test_settings_empty_secret_preserves_and_explicit_clear_removes(self):
         self.database.set_secret_setting("sub2api_password", "secret-canary")
         self.database.set_secret_setting("sub2api_api_key", "api-key-canary")
@@ -1006,6 +1231,7 @@ class WebConsoleTests(unittest.TestCase):
         with TestClient(app) as client:
             index = client.get("/")
             script = client.get("/static/app.js")
+            style = client.get("/static/app.css")
             traversal = client.get("/static/../../workflow.example.json")
             old_load = client.post(
                 "/api/config/load",
@@ -1020,6 +1246,7 @@ class WebConsoleTests(unittest.TestCase):
 
         self.assertEqual(index.status_code, 200)
         self.assertEqual(script.status_code, 200)
+        self.assertEqual(style.status_code, 200)
         self.assertIn("refreshRequestToken", script.text)
         self.assertIn("invalid_request_token", script.text)
         self.assertIn("Content-Security-Policy", index.headers)
@@ -1029,7 +1256,13 @@ class WebConsoleTests(unittest.TestCase):
         self.assertIn('name="sub2api_api_key"', index.text)
         self.assertIn('name="sub2api_totp_secret"', index.text)
         self.assertIn('<select name="sub2api_group_id">', index.text)
+        self.assertIn('id="icloud-sync-form"', index.text)
+        self.assertIn('id="icloud-owner-proxy-form"', index.text)
         self.assertIn('/api/sub2api/groups', script.text)
+        self.assertIn('form.id === "icloud-sync-form"', script.text)
+        self.assertIn('form.id === "icloud-owner-proxy-form"', script.text)
+        self.assertIn('#icloud-sync-dialog', style.text)
+        self.assertIn('width: min(1240px, calc(100vw - 48px))', style.text)
         self.assertIn("const ACCOUNT_PAGE_SIZE = 50", script.text)
         self.assertIn("const MOBILE_ACCOUNT_PAGE_SIZE = 20", script.text)
         self.assertIn(traversal.status_code, {400, 404})
@@ -1265,6 +1498,13 @@ class WebConsoleTests(unittest.TestCase):
             controller_type.call_args.kwargs["legacy_config_path"],
             expected,
         )
+        config = server_type.call_args.args[0]
+        self.assertEqual(config.timeout_graceful_shutdown, 10.0)
+        probe = controller_type.return_value.set_shutdown_probe.call_args.args[0]
+        server_type.return_value.should_exit = False
+        self.assertFalse(probe())
+        server_type.return_value.should_exit = True
+        self.assertTrue(probe())
 
 
 if __name__ == "__main__":

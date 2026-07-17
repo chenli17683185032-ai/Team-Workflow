@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, status
@@ -246,6 +246,7 @@ class WorkspaceCreateRequest(StrictModel):
     current_inventory_id: str | None = None
     next_account_id: str | None = None
     next_inventory_id: str | None = None
+    owner_alias_id: str | None = None
 
 
 class WorkspaceUpdateRequest(StrictModel):
@@ -256,6 +257,8 @@ class WorkspaceUpdateRequest(StrictModel):
     next_account_id: str | None = None
     next_inventory_id: str | None = None
     clear_next_account: bool = False
+    owner_alias_id: str | None = None
+    clear_owner_alias: bool = False
 
 
 class AccountImportRequest(StrictModel):
@@ -312,6 +315,25 @@ class ICloudMailboxUpdateRequest(StrictModel):
 class ICloudAliasBatchRequest(StrictModel):
     count: int = Field(default=1, ge=1, le=20)
     label_prefix: str = Field(default="Team Workflow", min_length=1, max_length=100)
+
+
+class ICloudAliasImportItem(StrictModel):
+    email: str = Field(min_length=3, max_length=320)
+    role: Literal["team_owner", "rotating_child"]
+    parent_owner_email: str | None = Field(default=None, min_length=3, max_length=320)
+    owner_proxy: str = Field(default="", max_length=4096)
+
+
+class ICloudAliasImportRequest(StrictModel):
+    items: list[ICloudAliasImportItem] = Field(min_length=1, max_length=100)
+
+
+class ICloudOwnerProxyRequest(StrictModel):
+    proxy: str = Field(default="", max_length=4096)
+
+
+class ICloudWorkspaceHandoffRequest(StrictModel):
+    version: int = Field(ge=1)
 
 
 class ICloudMailboxStatusRequest(StrictModel):
@@ -420,6 +442,15 @@ class WebConsoleController:
         self._started = False
         self._migration_status = "initializing"
         self._migration_error: str | None = None
+        self._shutdown_probe: Callable[[], bool] = lambda: False
+
+    def set_shutdown_probe(self, probe: Callable[[], bool]) -> None:
+        if not callable(probe):
+            raise TypeError("shutdown probe must be callable")
+        self._shutdown_probe = probe
+
+    def shutdown_requested(self) -> bool:
+        return bool(self._shutdown_probe())
 
     def startup(self) -> dict[str, Any]:
         with self._lifecycle_lock:
@@ -643,6 +674,7 @@ class WebConsoleController:
             current_inventory_id=current_inventory_id,
             next_account_id=next_account_id,
             next_inventory_id=next_inventory_id,
+            owner_alias_id=_optional_text(payload.get("owner_alias_id")),
         )
         self.task_queue.notify_change()
         return _safe_payload(workspace)
@@ -673,6 +705,14 @@ class WebConsoleController:
             )
             kwargs["next_account_id"] = next_account_id
             kwargs["next_inventory_id"] = next_inventory_id
+        if bool(payload.get("clear_owner_alias")):
+            if payload.get("owner_alias_id"):
+                raise FieldInputError(
+                    {"clear_owner_alias": "cannot clear and select a Team owner together"}
+                )
+            kwargs["owner_alias_id"] = None
+        elif "owner_alias_id" in payload:
+            kwargs["owner_alias_id"] = _optional_text(payload.get("owner_alias_id"))
         workspace = self.database.update_workspace(str(workspace_id), **kwargs)
         self.task_queue.notify_change()
         return _safe_payload(workspace)
@@ -858,6 +898,244 @@ class WebConsoleController:
     def list_icloud_aliases(self, mailbox_id: str) -> list[dict[str, Any]]:
         self.database.get_icloud_mailbox(str(mailbox_id))
         return _safe_payload(self.database.list_icloud_aliases(str(mailbox_id)))
+
+    def list_icloud_team_owners(self) -> list[dict[str, Any]]:
+        return _safe_payload(self.database.list_icloud_team_owners())
+
+    @staticmethod
+    def _normalize_remote_icloud_aliases(
+        aliases: Any,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(aliases, list):
+            raise StateConflictError("iCloud HME alias list is invalid")
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for value in aliases:
+            if not isinstance(value, Mapping):
+                continue
+            email = str(value.get("hme") or value.get("email") or "").strip().casefold()
+            anonymous_id = str(value.get("anonymousId") or "").strip()
+            if (
+                email.count("@") != 1
+                or any(character.isspace() for character in email)
+                or not anonymous_id
+                or email in seen
+            ):
+                continue
+            seen.add(email)
+            normalized.append(
+                {
+                    "email": email,
+                    "label": str(value.get("label") or "").strip(),
+                    "note": str(value.get("note") or "").strip(),
+                    "active": value.get("isActive") is not False,
+                    "remote_metadata": dict(value),
+                }
+            )
+        return normalized
+
+    def preview_remote_icloud_aliases(self, mailbox_id: str) -> list[dict[str, Any]]:
+        mailbox_id = str(mailbox_id)
+        mailbox = self.database.get_icloud_mailbox(mailbox_id)
+        if mailbox["status"] != "ready":
+            raise StateConflictError("iCloud mailbox must pass detection before sync")
+        if not self._icloud_operation_lock.acquire(blocking=False):
+            raise StateConflictError("another iCloud mailbox operation is running")
+        try:
+            _secret, client = self._icloud_client(mailbox_id)
+            try:
+                remote = self._normalize_remote_icloud_aliases(client.list_aliases())
+            except HmeSessionError as exc:
+                self.database.set_icloud_mailbox_status(
+                    mailbox_id,
+                    "session_invalid",
+                    failure_code="session_rejected",
+                    failure_message="iCloud HME session was rejected",
+                )
+                raise StateConflictError("iCloud HME session was rejected") from exc
+            except HmeError as exc:
+                raise StateConflictError("iCloud HME alias sync failed") from exc
+            imported = {
+                str(alias["email"]).casefold(): alias
+                for alias in self.database.list_icloud_aliases(mailbox_id)
+            }
+            return _safe_payload(
+                [
+                    {
+                        "email": item["email"],
+                        "label": item["label"],
+                        "note": item["note"],
+                        "active": item["active"],
+                        "imported": item["email"] in imported,
+                        "imported_role": (
+                            imported[item["email"]]["role"]
+                            if item["email"] in imported
+                            else None
+                        ),
+                        "parent_owner_alias_id": (
+                            imported[item["email"]]["parent_owner_alias_id"]
+                            if item["email"] in imported
+                            else None
+                        ),
+                    }
+                    for item in remote
+                ]
+            )
+        finally:
+            self._icloud_operation_lock.release()
+
+    def import_existing_icloud_aliases(
+        self, mailbox_id: str, payload: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        mailbox_id = str(mailbox_id)
+        selected = payload.get("items")
+        if not isinstance(selected, list) or not selected:
+            raise FieldInputError({"items": "select at least one iCloud alias"})
+        requested: dict[str, Mapping[str, Any]] = {}
+        for value in selected:
+            if not isinstance(value, Mapping):
+                raise FieldInputError({"items": "iCloud alias selection is invalid"})
+            email = str(value.get("email") or "").strip().casefold()
+            if not email or email in requested:
+                raise FieldInputError({"items": "iCloud alias selection has duplicates"})
+            requested[email] = value
+        mailbox = self.database.get_icloud_mailbox(mailbox_id)
+        if mailbox["status"] != "ready":
+            raise StateConflictError("iCloud mailbox must pass detection before import")
+        if not self._icloud_operation_lock.acquire(blocking=False):
+            raise StateConflictError("another iCloud mailbox operation is running")
+        try:
+            _secret, client = self._icloud_client(mailbox_id)
+            try:
+                remote_items = self._normalize_remote_icloud_aliases(
+                    client.list_aliases()
+                )
+            except HmeSessionError as exc:
+                self.database.set_icloud_mailbox_status(
+                    mailbox_id,
+                    "session_invalid",
+                    failure_code="session_rejected",
+                    failure_message="iCloud HME session was rejected",
+                )
+                raise StateConflictError("iCloud HME session was rejected") from exc
+            except HmeError as exc:
+                raise StateConflictError("iCloud HME alias import failed") from exc
+            remote_by_email = {item["email"]: item for item in remote_items}
+            missing = sorted(set(requested) - set(remote_by_email))
+            if missing:
+                raise FieldInputError(
+                    {"items": "selected iCloud alias no longer exists remotely"}
+                )
+            inactive = sorted(
+                email for email in requested if not remote_by_email[email]["active"]
+            )
+            if inactive:
+                raise FieldInputError(
+                    {"items": "inactive iCloud aliases cannot be imported as active Team accounts"}
+                )
+            imported = self.database.import_icloud_aliases(
+                mailbox_id,
+                [
+                    {
+                        **dict(requested[email]),
+                        "remote_metadata": remote_by_email[email]["remote_metadata"],
+                        "label": remote_by_email[email]["label"] or email,
+                    }
+                    for email in requested
+                ],
+            )
+            self.task_queue.notify_change()
+            return _safe_payload(imported)
+        finally:
+            self._icloud_operation_lock.release()
+
+    def set_icloud_owner_proxy(self, alias_id: str, proxy: str) -> dict[str, Any]:
+        updated = self.database.set_icloud_owner_proxy(str(alias_id), str(proxy or ""))
+        self.task_queue.notify_change()
+        return _safe_payload(updated)
+
+    def replace_icloud_workspace_child(
+        self, workspace_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        workspace_id = str(workspace_id)
+        expected_version = int(payload.get("version") or 0)
+        workspace = self.database.get_workspace(workspace_id)
+        if int(workspace["version"]) != expected_version:
+            raise StaleVersionError("workspace version is stale")
+        if workspace["owner_alias_id"] is None:
+            raise StateConflictError("workspace has no iCloud Team owner")
+        if workspace["next_account_id"] is not None:
+            run = self.task_queue.enqueue([workspace_id])[0]
+            return _safe_payload(
+                {"created": False, "workspace": workspace, "run": run}
+            )
+        owner = self.database.get_icloud_alias(workspace["owner_alias_id"])
+        if owner["role"] != "team_owner" or owner["state"] != "active":
+            raise StateConflictError("workspace iCloud Team owner is unavailable")
+        if not owner["proxy_configured"]:
+            raise StateConflictError("iCloud Team owner S5 is not configured")
+        mailbox = self.database.get_icloud_mailbox(owner["mailbox_id"])
+        if mailbox["status"] != "ready":
+            raise StateConflictError("iCloud mailbox must pass detection before handoff")
+        if not self._icloud_operation_lock.acquire(blocking=False):
+            raise StateConflictError("another iCloud mailbox operation is running")
+        remote: Mapping[str, Any] | None = None
+        client: Any = None
+        try:
+            _secret, client = self._icloud_client(owner["mailbox_id"])
+            label = (
+                f"{workspace['name']} child "
+                f"{int(workspace['rotation_count']) + 1}"
+            )
+            try:
+                remote = client.create_alias(
+                    label=label,
+                    note=f"Team Workflow workspace {workspace_id}",
+                )
+            except HmeSessionError as exc:
+                self.database.set_icloud_mailbox_status(
+                    owner["mailbox_id"],
+                    "session_invalid",
+                    failure_code="session_rejected",
+                    failure_message="iCloud HME session was rejected",
+                )
+                raise StateConflictError("iCloud HME session was rejected") from exc
+            except HmeError as exc:
+                raise StateConflictError("iCloud child generation failed") from exc
+            try:
+                if not isinstance(remote, Mapping):
+                    raise StateConflictError("iCloud child generation response is invalid")
+                email = str(remote.get("hme") or "").strip().casefold()
+                if not email:
+                    raise StateConflictError("iCloud child generation returned no email")
+                prepared = self.database.prepare_icloud_workspace_handoff(
+                    workspace_id,
+                    expected_version=expected_version,
+                    email=email,
+                    remote_metadata=remote,
+                    label=label,
+                )
+            except DatabaseError:
+                anonymous_id = (
+                    str(remote.get("anonymousId") or "").strip()
+                    if isinstance(remote, Mapping)
+                    else ""
+                )
+                if anonymous_id and client is not None:
+                    try:
+                        client.deactivate_alias(anonymous_id)
+                    except HmeError:
+                        pass
+                raise
+        finally:
+            self._icloud_operation_lock.release()
+        try:
+            run = self.task_queue.enqueue([workspace_id])[0]
+        finally:
+            self.task_queue.notify_change()
+        return _safe_payload(
+            {"created": True, **prepared, "run": run}
+        )
 
     def _icloud_client(self, mailbox_id: str) -> tuple[dict[str, Any], Any]:
         mailbox = self.database.get_icloud_mailbox(mailbox_id)
@@ -1081,9 +1359,19 @@ class WebConsoleController:
         alias = self.database.get_icloud_alias(str(alias_id))
         if alias["state"] == state_value:
             return _safe_payload(alias)
-        account = self.database.get_account(alias["account_id"])
-        if account["status"] in {"bound_current", "bound_next"}:
+        account = (
+            None
+            if alias["account_id"] is None
+            else self.database.get_account(alias["account_id"])
+        )
+        if account is not None and account["status"] in {"bound_current", "bound_next"}:
             raise StateConflictError("a bound iCloud alias cannot change remote state")
+        if (
+            alias["role"] == "team_owner"
+            and alias["workspace_id"] is not None
+            and state_value == "inactive"
+        ):
+            raise StateConflictError("a bound iCloud Team owner cannot be deactivated")
         mailbox = self.database.get_icloud_mailbox(alias["mailbox_id"])
         if mailbox["status"] != "ready":
             raise StateConflictError("iCloud mailbox is not ready")
@@ -1108,9 +1396,17 @@ class WebConsoleController:
         except HmeError as exc:
             raise StateConflictError("iCloud alias state update failed") from exc
         updated = self.database.set_icloud_alias_state(str(alias_id), state_value)
-        if state_value == "inactive" and account["status"] == "available":
+        if (
+            account is not None
+            and state_value == "inactive"
+            and account["status"] == "available"
+        ):
             self.database.transition_account_status(account["id"], "disabled")
-        elif state_value == "active" and account["status"] == "disabled":
+        elif (
+            account is not None
+            and state_value == "active"
+            and account["status"] == "disabled"
+        ):
             self.database.transition_account_status(account["id"], "available")
         self.task_queue.notify_change()
         return _safe_payload(self.database.get_icloud_alias(str(alias_id)))
@@ -1585,6 +1881,19 @@ def create_app(
     async def retry_workspace(workspace_id: str):
         return await _call_controller(controller.retry_workspace, workspace_id)
 
+    @app.post(
+        "/api/workspaces/{workspace_id}/replace-icloud-child",
+        status_code=202,
+    )
+    async def replace_icloud_workspace_child(
+        workspace_id: str, request: ICloudWorkspaceHandoffRequest
+    ):
+        return await _call_controller(
+            controller.replace_icloud_workspace_child,
+            workspace_id,
+            request.model_dump(),
+        )
+
     @app.get("/api/accounts")
     async def list_accounts():
         return await _call_controller(controller.list_accounts)
@@ -1657,6 +1966,10 @@ def create_app(
     async def list_icloud_mailboxes():
         return await _call_controller(controller.list_icloud_mailboxes)
 
+    @app.get("/api/icloud-team-owners")
+    async def list_icloud_team_owners():
+        return await _call_controller(controller.list_icloud_team_owners)
+
     @app.post("/api/icloud-mailboxes", status_code=status.HTTP_201_CREATED)
     async def create_icloud_mailbox(request: ICloudMailboxCreateRequest):
         return await _call_controller(
@@ -1676,6 +1989,25 @@ def create_app(
     @app.post("/api/icloud-mailboxes/{mailbox_id}/check")
     async def check_icloud_mailbox(mailbox_id: str):
         return await _call_controller(controller.check_icloud_mailbox, mailbox_id)
+
+    @app.get("/api/icloud-mailboxes/{mailbox_id}/remote-aliases")
+    async def preview_remote_icloud_aliases(mailbox_id: str):
+        return await _call_controller(
+            controller.preview_remote_icloud_aliases, mailbox_id
+        )
+
+    @app.post(
+        "/api/icloud-mailboxes/{mailbox_id}/aliases/import",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def import_existing_icloud_aliases(
+        mailbox_id: str, request: ICloudAliasImportRequest
+    ):
+        return await _call_controller(
+            controller.import_existing_icloud_aliases,
+            mailbox_id,
+            request.model_dump(),
+        )
 
     @app.post(
         "/api/icloud-mailboxes/{mailbox_id}/aliases",
@@ -1712,6 +2044,16 @@ def create_app(
             controller.update_icloud_alias_state,
             alias_id,
             request.state,
+        )
+
+    @app.put("/api/icloud-team-owners/{alias_id}/proxy")
+    async def set_icloud_owner_proxy(
+        alias_id: str, request: ICloudOwnerProxyRequest
+    ):
+        return await _call_controller(
+            controller.set_icloud_owner_proxy,
+            alias_id,
+            request.proxy,
         )
 
     @app.get("/api/queue")
@@ -1859,7 +2201,9 @@ async def _event_stream(controller: WebConsoleController, request: Request):
     existing = controller.database.list_run_events(after_seq=0, limit=2000)
     current_seq = int(existing[-1]["seq"]) if existing else 0
     yield _sse("reset", controller.event_reset(), current_seq)
-    while not await request.is_disconnected():
+    while True:
+        if controller.shutdown_requested() or await request.is_disconnected():
+            return
         found = await asyncio.to_thread(
             controller.database.list_run_events,
             after_seq=current_seq,
@@ -1873,6 +2217,8 @@ async def _event_stream(controller: WebConsoleController, request: Request):
             revision,
             1.0,
         )
+        if controller.shutdown_requested():
+            return
         if next_revision != revision:
             revision = next_revision
             yield _sse("reset", controller.event_reset(), current_seq)
@@ -1952,8 +2298,10 @@ def serve_web_console(
                 workers=1,
                 log_level="warning",
                 access_log=False,
+                timeout_graceful_shutdown=10.0,
             )
         )
+        controller.set_shutdown_probe(lambda: bool(server.should_exit))
         try:
             server.run()
         except KeyboardInterrupt:

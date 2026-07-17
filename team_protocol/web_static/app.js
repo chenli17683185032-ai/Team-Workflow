@@ -38,7 +38,9 @@ const ACCOUNT_STATUS = {
   available: ["可用", "success"],
   bound_current: ["当前绑定", "accent"],
   bound_next: ["下一账号", "info"],
+  protected: ["长期保留", "success"],
   exited_pending: ["退出待处理", "warning"],
+  used: ["已用完", "neutral"],
   retired: ["已退役", "neutral"],
   disabled: ["已停用", "danger"],
 };
@@ -153,6 +155,8 @@ const state = {
   icloudMailboxesLoading: false,
   icloudMailboxesError: "",
   icloudAliases: [],
+  icloudTeamOwners: [],
+  remoteIcloudAliases: [],
   activeIcloudMailboxId: "",
   activeRunId: null,
   activeRun: null,
@@ -584,7 +588,11 @@ function renderWorkspaceTable() {
       row.append(labeledCell("选择", check, "selection-cell"));
 
       const rotationCount = Number(firstValue(workspace, ["rotation_count"], 0));
-      row.append(labeledCell("空间", primarySecondary(workspaceName(workspace), `轮换 ${numberFormatter.format(rotationCount)} 次`)));
+      const ownerEmail = safeString(firstValue(workspace, ["owner_email"]));
+      const workspaceDetail = ownerEmail
+        ? `母号 ${ownerEmail} · 已用完 ${numberFormatter.format(Number(workspace.used_child_count || 0))} · 接力 ${numberFormatter.format(rotationCount)} 次`
+        : `轮换 ${numberFormatter.format(rotationCount)} 次`;
+      row.append(labeledCell("空间", primarySecondary(workspaceName(workspace), workspaceDetail)));
 
       const uid = workspaceUid(workspace);
       const uidNode = element("span", {className: "cell-code", text: shortId(uid), attrs: {title: uid}});
@@ -605,7 +613,11 @@ function renderWorkspaceTable() {
 
       const actions = element("div", {className: "row-actions"});
       actions.append(actionButton("编辑", "edit-workspace", {workspaceId: id}));
-      if (status === "ready" && next !== "未分配") {
+      if (workspace.owner_alias_id && status === "needs_account" && next === "未分配") {
+        actions.append(actionButton("更换子号", "replace-icloud-child", {workspaceId: id}));
+      } else if (workspace.owner_alias_id && status === "ready" && next !== "未分配") {
+        actions.append(actionButton("开始接力", "replace-icloud-child", {workspaceId: id}));
+      } else if (!workspace.owner_alias_id && status === "ready" && next !== "未分配") {
         actions.append(actionButton("额度用完", "advance-workspace", {workspaceId: id}));
       }
       if (status === "failed") actions.append(actionButton("重试", "retry-workspace", {workspaceId: id}));
@@ -659,23 +671,30 @@ function accountBinding(account) {
 function renderAccountMetrics() {
   let available = 0;
   let pending = 0;
+  let used = 0;
   let bound = 0;
   for (const account of state.accounts) {
     const status = safeString(firstValue(account, ["status", "state"]));
     if (status === "available") available += 1;
     if (status === "exited_pending") pending += 1;
+    if (account.icloud_used_at) used += 1;
     if (status === "bound_current" || status === "bound_next") bound += 1;
   }
   byId("account-metric-total").textContent = numberFormatter.format(state.accounts.length);
   byId("account-metric-available").textContent = numberFormatter.format(available);
   byId("account-metric-pending").textContent = numberFormatter.format(pending);
+  byId("account-metric-used").textContent = numberFormatter.format(used);
   byId("account-metric-bound").textContent = numberFormatter.format(bound);
+}
+
+function accountDisplayStatus(account) {
+  return account?.icloud_used_at ? "used" : safeString(firstValue(account, ["status", "state"], "available"));
 }
 
 function filteredAccounts() {
   const search = state.filters.accountSearch.trim().toLocaleLowerCase("zh-CN");
   return state.accounts.filter((account) => {
-    const status = safeString(firstValue(account, ["status", "state"]));
+    const status = accountDisplayStatus(account);
     const statusMatch = state.filters.accountStatus === "all" || status === state.filters.accountStatus;
     const haystack = `${accountEmail(account)} ${safeString(account.primary_email)} ${accountBindingLabel(account)}`.toLocaleLowerCase("zh-CN");
     return statusMatch && (!search || haystack.includes(search));
@@ -702,7 +721,8 @@ function renderAccountTable() {
     const fragment = document.createDocumentFragment();
     for (const account of pageAccounts) {
       const id = accountId(account);
-      const status = safeString(firstValue(account, ["status", "state"], "available"));
+      const rawStatus = safeString(firstValue(account, ["status", "state"], "available"));
+      const status = accountDisplayStatus(account);
       const row = element("tr", {dataset: {accountId: id}});
       const email = accountEmail(account);
       row.append(labeledCell("邮箱", element("span", {className: "cell-primary", text: email, attrs: {title: email}})));
@@ -711,12 +731,15 @@ function renderAccountTable() {
       row.append(labeledCell("代理", statusBadge(account.proxy_configured ? "configured" : "inherited", PROXY_STATUS)));
       row.append(labeledCell("绑定空间", accountBindingLabel(account)));
       const source = safeString(firstValue(account, ["source"], "import"));
-      row.append(labeledCell("来源", source === "icloud_hme" ? "iCloud HME" : source));
+      const sourceLabel = source === "icloud_hme"
+        ? `iCloud HME${account.icloud_owner_email ? ` · ${safeString(account.icloud_owner_email)}` : ""}`
+        : source;
+      row.append(labeledCell("来源", sourceLabel));
       row.append(labeledCell("更新时间", formatDate(firstValue(account, ["updated_at", "created_at"]))));
       const actions = element("div", {className: "row-actions"});
-      actions.append(actionButton("代理", "open-account-proxy", {accountId: id}));
+      if (status !== "used") actions.append(actionButton("代理", "open-account-proxy", {accountId: id}));
       const binding = accountBinding(account);
-      if (binding && ["bound_current", "bound_next"].includes(status)) {
+      if (binding && ["bound_current", "bound_next"].includes(rawStatus)) {
         actions.append(actionButton("不可用", "invalidate-bound-account", {
           accountId: id,
           failureType: "alias_disabled",
@@ -725,13 +748,13 @@ function renderAccountTable() {
           accountId: id,
           failureType: "mailbox_credentials_invalid",
         }, "text-action text-action--danger"));
-      } else if (status === "exited_pending" || status === "disabled") {
+      } else if (rawStatus === "exited_pending" || rawStatus === "disabled") {
         actions.append(actionButton("重新启用", "set-account-status", {accountId: id, status: "available"}));
       }
-      if (!binding && (status === "exited_pending" || status === "available")) {
+      if (!binding && (rawStatus === "exited_pending" || rawStatus === "available")) {
         actions.append(actionButton("退役", "set-account-status", {accountId: id, status: "retired"}, "text-action text-action--danger"));
       }
-      if (!binding && status === "available") {
+      if (!binding && rawStatus === "available") {
         actions.append(actionButton("停用", "set-account-status", {accountId: id, status: "disabled"}));
       }
       if (!actions.children.length) actions.append(element("span", {className: "empty-value", text: "-"}));
@@ -818,6 +841,16 @@ function findIcloudMailbox(id) {
   return state.icloudMailboxes.find((mailbox) => icloudMailboxId(mailbox) === safeString(id));
 }
 
+async function loadIcloudTeamOwners() {
+  const payload = await api("/api/icloud-team-owners");
+  state.icloudTeamOwners = asList(payload, ["owners", "icloud_team_owners"]);
+  return state.icloudTeamOwners;
+}
+
+function findIcloudTeamOwner(id) {
+  return state.icloudTeamOwners.find((owner) => safeString(owner.id) === safeString(id));
+}
+
 async function loadIcloudMailboxes({force = false} = {}) {
   if (state.icloudMailboxesLoading) return;
   if (state.icloudMailboxesLoaded && !force) return;
@@ -845,7 +878,7 @@ function renderIcloudMailboxTable() {
     const row = element("tr", {className: "loading-row"});
     row.append(element("td", {attrs: {colspan: "8"}}, [
       element("span", {className: "inline-loader", attrs: {"aria-hidden": "true"}}),
-      "正在载入 iCloud 母号…",
+      "正在载入 iCloud 资源池…",
     ]));
     body.append(row);
     status.textContent = "正在载入…";
@@ -860,9 +893,9 @@ function renderIcloudMailboxTable() {
   }
   if (!state.icloudMailboxes.length) {
     body.append(element("tr", {className: "empty-row"}, [
-      element("td", {text: "尚未添加 iCloud 母号", attrs: {colspan: "8"}}),
+      element("td", {text: "尚未添加 iCloud 资源池", attrs: {colspan: "8"}}),
     ]));
-    status.textContent = "0 个母号";
+    status.textContent = "0 个资源池";
     return;
   }
   const fragment = document.createDocumentFragment();
@@ -873,22 +906,25 @@ function renderIcloudMailboxTable() {
     const forwarding = safeString(firstValue(mailbox, ["forwarding_email"], "-"));
     const failure = safeString(firstValue(mailbox, ["failure_message", "failure_code"]));
     const row = element("tr", {dataset: {icloudMailboxId: id}});
-    row.append(labeledCell("母号", primarySecondary(name, forwarding)));
+    row.append(labeledCell("资源池", primarySecondary(name, forwarding)));
     const statusCell = element("div", {}, [statusBadge(mailboxStatus, ICLOUD_MAILBOX_STATUS)]);
     if (failure) statusCell.append(element("span", {className: "cell-error", text: failure, attrs: {title: failure}}));
     row.append(labeledCell("状态", statusCell));
-    row.append(labeledCell("Alias", element("span", {className: "cell-code", text: numberFormatter.format(Number(mailbox.alias_count || 0))})));
+    row.append(labeledCell("受管 Alias", primarySecondary(
+      numberFormatter.format(Number(mailbox.alias_count || 0)),
+      `${numberFormatter.format(Number(mailbox.owner_count || 0))} 母号 · ${numberFormatter.format(Number(mailbox.used_count || 0))} 已用完`,
+    )));
     row.append(labeledCell("HME Session", statusBadge(mailbox.session_configured ? "configured" : "missing", CONFIG_STATUS)));
     row.append(labeledCell("IMAP", statusBadge(mailbox.imap_configured ? "configured" : "missing", CONFIG_STATUS)));
-    row.append(labeledCell("母号 S5", statusBadge(mailbox.proxy_configured ? "configured" : "missing", CONFIG_STATUS)));
+    row.append(labeledCell("HME / IMAP S5", statusBadge(mailbox.proxy_configured ? "configured" : "missing", CONFIG_STATUS)));
     row.append(labeledCell("最近检测", formatDate(mailbox.last_checked_at)));
     const actions = element("div", {className: "row-actions"});
     const check = actionButton("检测", "check-icloud-mailbox", {mailboxId: id});
     check.disabled = mailboxStatus === "disabled";
     actions.append(check);
-    const generate = actionButton("生成", "open-icloud-generate", {mailboxId: id});
-    generate.disabled = mailboxStatus !== "ready";
-    actions.append(generate);
+    const sync = actionButton("同步 Alias", "open-icloud-sync", {mailboxId: id});
+    sync.disabled = mailboxStatus !== "ready";
+    actions.append(sync);
     const aliases = actionButton("Alias", "open-icloud-aliases", {mailboxId: id});
     aliases.disabled = Number(mailbox.alias_count || 0) < 1;
     actions.append(aliases);
@@ -903,7 +939,163 @@ function renderIcloudMailboxTable() {
     fragment.append(row);
   }
   body.append(fragment);
-  status.textContent = `${numberFormatter.format(state.icloudMailboxes.length)} 个母号`;
+  status.textContent = `${numberFormatter.format(state.icloudMailboxes.length)} 个资源池`;
+}
+
+function icloudSyncOwnerChoices() {
+  const choices = new Map();
+  for (const owner of state.icloudTeamOwners) {
+    if (
+      safeString(owner.mailbox_id) === state.activeIcloudMailboxId
+      && owner.state === "active"
+    ) {
+      choices.set(safeString(owner.email), safeString(owner.email));
+    }
+  }
+  for (const item of state.remoteIcloudAliases) {
+    if (item.selectionRole === "team_owner") {
+      choices.set(safeString(item.email), safeString(item.email));
+    }
+  }
+  return [...choices.keys()].sort((left, right) => left.localeCompare(right));
+}
+
+function renderIcloudSyncRows() {
+  const body = byId("icloud-sync-table-body");
+  body.replaceChildren();
+  if (!state.remoteIcloudAliases.length) {
+    body.append(element("tr", {className: "empty-row"}, [
+      element("td", {text: "iCloud 当前没有可同步的 Alias", attrs: {colspan: "5"}}),
+    ]));
+    return;
+  }
+  const ownerChoices = icloudSyncOwnerChoices();
+  const fragment = document.createDocumentFragment();
+  for (const item of state.remoteIcloudAliases) {
+    const row = element("tr", {dataset: {icloudSyncEmail: safeString(item.email)}});
+    row.append(labeledCell("隐藏邮箱", primarySecondary(safeString(item.email), safeString(item.label))));
+    row.append(labeledCell("远端", statusBadge(item.active ? "active" : "inactive", ICLOUD_ALIAS_STATUS)));
+
+    const roleSelect = element("select", {
+      dataset: {icloudImportRole: safeString(item.email)},
+      attrs: {"aria-label": `${safeString(item.email)} 接管角色`},
+    }, [
+      element("option", {text: "忽略", attrs: {value: "ignore"}}),
+      element("option", {text: "Team 母号", attrs: {value: "team_owner"}}),
+      element("option", {text: "当前子号", attrs: {value: "rotating_child"}}),
+    ]);
+    roleSelect.value = safeString(item.selectionRole, "ignore");
+    roleSelect.disabled = Boolean(item.imported) || !item.active;
+    row.append(labeledCell("接管为", roleSelect));
+
+    const parentSelect = element("select", {
+      dataset: {icloudParentOwner: safeString(item.email)},
+      attrs: {"aria-label": `${safeString(item.email)} 归属母号`},
+    }, [element("option", {text: "选择母号", attrs: {value: ""}})]);
+    for (const ownerEmail of ownerChoices) {
+      if (ownerEmail !== item.email) {
+        parentSelect.append(element("option", {text: ownerEmail, attrs: {value: ownerEmail}}));
+      }
+    }
+    parentSelect.value = safeString(item.parentOwnerEmail);
+    parentSelect.disabled = item.selectionRole !== "rotating_child" || Boolean(item.imported);
+    row.append(labeledCell("归属母号", parentSelect));
+
+    const proxyInput = element("input", {
+      dataset: {icloudOwnerProxy: safeString(item.email)},
+      attrs: {
+        type: "password",
+        maxlength: "4096",
+        placeholder: item.imported ? "已接管" : "socks5h://...",
+        autocomplete: "new-password",
+        spellcheck: "false",
+        "aria-label": `${safeString(item.email)} 母号 S5`,
+      },
+    });
+    proxyInput.value = safeString(item.ownerProxy);
+    proxyInput.disabled = item.selectionRole !== "team_owner" || Boolean(item.imported);
+    row.append(labeledCell("母号 S5", proxyInput));
+    fragment.append(row);
+  }
+  body.append(fragment);
+}
+
+async function openIcloudSync(mailbox) {
+  if (!mailbox) return;
+  state.activeIcloudMailboxId = icloudMailboxId(mailbox);
+  state.remoteIcloudAliases = [];
+  fieldError("icloud-sync-error", "");
+  const form = byId("icloud-sync-form");
+  form.reset();
+  form.elements.namedItem("mailbox_id").value = state.activeIcloudMailboxId;
+  byId("icloud-sync-title").textContent = `${safeString(mailbox.name)} · 同步 Alias`;
+  byId("icloud-sync-table-body").replaceChildren(element("tr", {className: "loading-row"}, [
+    element("td", {attrs: {colspan: "5"}}, [
+      element("span", {className: "inline-loader", attrs: {"aria-hidden": "true"}}),
+      "正在读取 iCloud Alias…",
+    ]),
+  ]));
+  byId("icloud-sync-dialog").showModal();
+  try {
+    await loadIcloudTeamOwners();
+    const payload = await api(`/api/icloud-mailboxes/${encodeURIComponent(state.activeIcloudMailboxId)}/remote-aliases`);
+    const existingOwnerById = new Map(state.icloudTeamOwners.map((owner) => [safeString(owner.id), owner]));
+    state.remoteIcloudAliases = asList(payload, ["aliases", "remote_aliases"]).map((item) => ({
+      ...item,
+      selectionRole: item.imported ? safeString(item.imported_role) : "ignore",
+      parentOwnerEmail: item.parent_owner_alias_id
+        ? safeString(existingOwnerById.get(safeString(item.parent_owner_alias_id))?.email)
+        : "",
+      ownerProxy: "",
+    }));
+    renderIcloudSyncRows();
+  } catch (error) {
+    byId("icloud-sync-table-body").replaceChildren(element("tr", {className: "error-row"}, [
+      element("td", {text: error?.message || String(error), attrs: {colspan: "5"}}),
+    ]));
+  }
+}
+
+async function handleIcloudSync(form) {
+  if (!ensureMutable()) return;
+  fieldError("icloud-sync-error", "");
+  const selected = state.remoteIcloudAliases.filter(
+    (item) => !item.imported && item.selectionRole !== "ignore",
+  );
+  if (!selected.length) {
+    fieldError("icloud-sync-error", "请至少选择一个未接管 Alias");
+    return;
+  }
+  const items = [];
+  for (const item of selected) {
+    if (item.selectionRole === "team_owner" && !safeString(item.ownerProxy).trim()) {
+      fieldError("icloud-sync-error", `请填写母号 ${safeString(item.email)} 的独立 S5`);
+      return;
+    }
+    if (item.selectionRole === "rotating_child" && !safeString(item.parentOwnerEmail)) {
+      fieldError("icloud-sync-error", `请选择子号 ${safeString(item.email)} 归属的母号`);
+      return;
+    }
+    items.push({
+      email: safeString(item.email),
+      role: item.selectionRole,
+      parent_owner_email: item.selectionRole === "rotating_child" ? safeString(item.parentOwnerEmail) : null,
+      owner_proxy: item.selectionRole === "team_owner" ? safeString(item.ownerProxy).trim() : "",
+    });
+  }
+  await api(`/api/icloud-mailboxes/${encodeURIComponent(state.activeIcloudMailboxId)}/aliases/import`, {
+    method: "POST",
+    body: {items},
+  });
+  byId("icloud-sync-dialog").close();
+  state.remoteIcloudAliases = [];
+  state.icloudMailboxesLoaded = false;
+  await Promise.all([
+    loadIcloudTeamOwners(),
+    loadIcloudMailboxes({force: true}),
+    refreshResources(["accounts", "workspaces"]),
+  ]);
+  showToast(`已接管 ${numberFormatter.format(items.length)} 个 Alias`, "success");
 }
 
 function renderInventoryTable() {
@@ -1505,6 +1697,7 @@ function comboboxChoices(role) {
   const combo = comboboxes.get(role);
   const query = combo.query.trim().toLocaleLowerCase("zh-CN");
   const choices = [];
+  const ownerAliasId = safeString(byId("workspace-form")?.elements.namedItem("owner_alias_id")?.value);
   const seen = new Set();
   const add = (choice) => {
     const key = `${choice.kind}:${choice.id}`;
@@ -1519,13 +1712,16 @@ function comboboxChoices(role) {
     const status = safeString(firstValue(account, ["status", "state"]));
     const isPinned = combo.original?.id === id || combo.selected?.id === id;
     if (status !== "available" && !isPinned) continue;
+    if (ownerAliasId && safeString(account.icloud_owner_alias_id) !== ownerAliasId && !isPinned) continue;
     const email = accountEmail(account);
     const haystack = `${email} ${safeString(account.primary_email)}`.toLocaleLowerCase("zh-CN");
     if (query && !haystack.includes(query)) continue;
     add(accountChoice(account));
     if (choices.filter((choice) => choice.kind === "account").length >= 8) break;
   }
-  for (const item of combo.inventoryResults.slice(0, INVENTORY_SEARCH_LIMIT)) add(inventoryChoice(item));
+  if (!ownerAliasId) {
+    for (const item of combo.inventoryResults.slice(0, INVENTORY_SEARCH_LIMIT)) add(inventoryChoice(item));
+  }
   return choices;
 }
 
@@ -1726,7 +1922,21 @@ function initializeCombobox(role, accountIdentifier) {
   renderCombobox(role);
 }
 
-function openWorkspaceDialog(workspace = null) {
+function renderWorkspaceOwnerOptions(selectedId = "") {
+  const select = byId("workspace-form").elements.namedItem("owner_alias_id");
+  select.replaceChildren(element("option", {text: "普通空间（不绑定 iCloud 母号）", attrs: {value: ""}}));
+  for (const owner of state.icloudTeamOwners) {
+    const workspaceLabel = owner.workspace_name ? ` · ${safeString(owner.workspace_name)}` : "";
+    select.append(element("option", {
+      text: `${safeString(owner.email)}${workspaceLabel}`,
+      attrs: {value: safeString(owner.id)},
+    }));
+  }
+  select.value = safeString(selectedId);
+}
+
+async function openWorkspaceDialog(workspace = null) {
+  await loadIcloudTeamOwners();
   const dialog = byId("workspace-dialog");
   const form = byId("workspace-form");
   byId("workspace-dialog-title").textContent = workspace ? "编辑空间" : "新增空间";
@@ -1737,6 +1947,7 @@ function openWorkspaceDialog(workspace = null) {
   uidControl.value = workspace ? workspaceUid(workspace) : "";
   uidControl.readOnly = Boolean(workspace);
   uidControl.setAttribute("aria-readonly", String(Boolean(workspace)));
+  renderWorkspaceOwnerOptions(firstValue(workspace, ["owner_alias_id"]));
   initializeCombobox("current", firstValue(workspace, ["current_account_id"]));
   initializeCombobox("next", firstValue(workspace, ["next_account_id"]));
   byId("workspace-form-error").hidden = true;
@@ -2030,25 +2241,38 @@ async function handleWorkspaceSubmit(form) {
   }
   const current = comboboxes.get("current").selected;
   const next = comboboxes.get("next").selected;
-  if (!current || !next) {
-    fieldError("workspace-form-error", "请明确选择当前账号和下一账号");
+  const ownerAliasId = safeString(values.owner_alias_id).trim();
+  if (!current || (!ownerAliasId && !next)) {
+    fieldError("workspace-form-error", ownerAliasId ? "请选择当前子号" : "请明确选择当前账号和下一账号");
     comboboxInput(!current ? "current" : "next").focus();
     return;
   }
-  if (current.kind === "account" && next.kind === "account" && current.id === next.id) {
+  if (ownerAliasId && current.kind !== "account") {
+    fieldError("workspace-form-error", "iCloud 母号空间的当前子号必须来自已接管 Alias");
+    comboboxInput("current").focus();
+    return;
+  }
+  if (ownerAliasId && safeString(findAccount(current.id)?.icloud_owner_alias_id) !== ownerAliasId) {
+    fieldError("workspace-form-error", "当前子号不属于所选 Team 母号");
+    comboboxInput("current").focus();
+    return;
+  }
+  if (current.kind === "account" && next?.kind === "account" && current.id === next.id) {
     fieldError("workspace-form-error", "当前账号和下一账号不能相同");
     return;
   }
   const payload = {
     name: safeString(values.name).trim(),
+    owner_alias_id: ownerAliasId || null,
   };
   if (current.kind === "account") payload.current_account_id = current.id;
   else payload.current_inventory_id = current.id;
-  if (next.kind === "account") payload.next_account_id = next.id;
-  else payload.next_inventory_id = next.id;
+  if (next?.kind === "account") payload.next_account_id = next.id;
+  else if (next?.kind === "inventory") payload.next_inventory_id = next.id;
   const id = safeString(values.workspace_id);
   if (id) {
     payload.version = Number(values.version || 1);
+    if (!next) payload.clear_next_account = true;
     await api(`/api/workspaces/${encodeURIComponent(id)}`, {method: "PATCH", body: payload});
   } else {
     payload.workspace_uid = safeString(values.workspace_uid).trim();
@@ -2143,7 +2367,7 @@ function openIcloudMailboxDialog(mailbox = null) {
   const form = byId("icloud-mailbox-form");
   form.reset();
   const editing = Boolean(mailbox);
-  byId("icloud-mailbox-dialog-title").textContent = editing ? "编辑 iCloud 母号" : "添加 iCloud 母号";
+  byId("icloud-mailbox-dialog-title").textContent = editing ? "编辑 iCloud 资源池" : "添加 iCloud 资源池";
   form.elements.namedItem("mailbox_id").value = editing ? icloudMailboxId(mailbox) : "";
   form.elements.namedItem("name").value = editing ? safeString(mailbox.name) : "";
   form.elements.namedItem("forwarding_email").value = editing ? safeString(mailbox.forwarding_email) : "";
@@ -2184,7 +2408,7 @@ async function handleIcloudMailboxSubmit(form) {
   const name = safeString(data.get("name")).trim();
   const forwardingEmail = safeString(data.get("forwarding_email")).trim();
   if (!name || !forwardingEmail) {
-    fieldError("icloud-mailbox-form-error", "母号名称和转发邮箱不能为空");
+    fieldError("icloud-mailbox-form-error", "资源池名称和转发邮箱不能为空");
     return;
   }
   const payload = {name, forwarding_email: forwardingEmail};
@@ -2221,10 +2445,10 @@ async function handleIcloudMailboxSubmit(form) {
   await loadIcloudMailboxes({force: true});
   showToast(
     id && safeString(saved?.status) === "unchecked"
-      ? "iCloud 母号已更新，需重新检测"
+      ? "iCloud 资源池已更新，需重新检测"
       : id
-        ? "iCloud 母号已更新"
-        : "iCloud 母号已安全保存",
+        ? "iCloud 资源池已更新"
+        : "iCloud 资源池已安全保存",
     "success",
   );
 }
@@ -2249,14 +2473,14 @@ async function toggleIcloudMailbox(id, nextStatus) {
   const mailbox = findIcloudMailbox(id);
   if (!mailbox) return;
   const action = nextStatus === "disabled" ? "停用" : "启用";
-  if (!window.confirm(`${action} iCloud 母号 ${safeString(mailbox.name)}？`)) return;
+  if (!window.confirm(`${action} iCloud 资源池 ${safeString(mailbox.name)}？`)) return;
   await api(`/api/icloud-mailboxes/${encodeURIComponent(id)}/status`, {
     method: "PATCH",
     body: {status: nextStatus},
   });
   state.icloudMailboxesLoaded = false;
   await loadIcloudMailboxes({force: true});
-  showToast(nextStatus === "disabled" ? "iCloud 母号已停用" : "iCloud 母号已启用，需重新检测", "success");
+  showToast(nextStatus === "disabled" ? "iCloud 资源池已停用" : "iCloud 资源池已启用，需重新检测", "success");
 }
 
 function openIcloudGenerateDialog(mailbox) {
@@ -2312,7 +2536,7 @@ function renderIcloudAliases() {
   body.replaceChildren();
   if (!state.icloudAliases.length) {
     body.append(element("tr", {className: "empty-row"}, [
-      element("td", {text: "该母号尚无已接入的隐藏邮箱", attrs: {colspan: "5"}}),
+      element("td", {text: "该资源池尚无已接管的隐藏邮箱", attrs: {colspan: "7"}}),
     ]));
     return;
   }
@@ -2320,11 +2544,28 @@ function renderIcloudAliases() {
   for (const alias of state.icloudAliases) {
     const row = element("tr", {dataset: {icloudAliasId: safeString(alias.id)}});
     row.append(labeledCell("隐藏邮箱", primarySecondary(safeString(alias.email), safeString(alias.label))));
-    row.append(labeledCell("远端状态", statusBadge(safeString(alias.state), ICLOUD_ALIAS_STATUS)));
-    row.append(labeledCell("账号状态", statusBadge(safeString(alias.account_status), ACCOUNT_STATUS)));
+    const isOwner = alias.role === "team_owner";
+    const role = primarySecondary(
+      isOwner ? "Team 母号" : "轮换子号",
+      isOwner ? "永久保护" : `归属 ${safeString(alias.owner_email, "未指定")}`,
+    );
+    row.append(labeledCell("角色 / 归属", role));
+    const localStatus = isOwner ? "protected" : alias.used_at ? "used" : safeString(alias.account_status, "available");
+    const usage = primarySecondary(
+      safeString(alias.workspace_name, isOwner ? "未绑定空间" : "未绑定"),
+      isOwner
+        ? `当前 ${safeString(alias.current_child_email, "未分配")} · 已用完 ${numberFormatter.format(Number(alias.used_child_count || 0))}`
+        : ACCOUNT_STATUS[localStatus]?.[0] || localStatus,
+    );
+    row.append(labeledCell("空间 / 使用状态", usage));
+    row.append(labeledCell("远端", statusBadge(safeString(alias.state), ICLOUD_ALIAS_STATUS)));
+    row.append(labeledCell("S5", statusBadge(alias.proxy_configured ? "configured" : "missing", CONFIG_STATUS)));
     row.append(labeledCell("创建时间", formatDate(alias.created_at)));
     const actions = element("div", {className: "row-actions"});
     const bound = ["bound_current", "bound_next"].includes(safeString(alias.account_status));
+    if (isOwner) {
+      actions.append(actionButton("S5", "open-icloud-owner-proxy", {aliasId: safeString(alias.id)}));
+    }
     const target = alias.state === "active" ? "inactive" : "active";
     const button = actionButton(
       target === "active" ? "启用" : "停用",
@@ -2332,7 +2573,7 @@ function renderIcloudAliases() {
       {aliasId: safeString(alias.id), state: target},
       target === "active" ? "text-action" : "text-action text-action--danger",
     );
-    button.disabled = bound;
+    button.disabled = bound || (isOwner && Boolean(alias.workspace_id) && target === "inactive");
     actions.append(button);
     row.append(labeledCell("操作", actions, "actions-cell"));
     fragment.append(row);
@@ -2347,7 +2588,7 @@ async function openIcloudAliases(mailbox) {
   byId("icloud-alias-title").textContent = `${safeString(mailbox.name)} · Alias`;
   const body = byId("icloud-alias-table-body");
   body.replaceChildren(element("tr", {className: "loading-row"}, [
-    element("td", {attrs: {colspan: "5"}}, [
+    element("td", {attrs: {colspan: "7"}}, [
       element("span", {className: "inline-loader", attrs: {"aria-hidden": "true"}}),
       "正在载入隐藏邮箱…",
     ]),
@@ -2359,7 +2600,7 @@ async function openIcloudAliases(mailbox) {
     renderIcloudAliases();
   } catch (error) {
     body.replaceChildren(element("tr", {className: "error-row"}, [
-      element("td", {text: error?.message || String(error), attrs: {colspan: "5"}}),
+      element("td", {text: error?.message || String(error), attrs: {colspan: "7"}}),
     ]));
   }
 }
@@ -2380,6 +2621,65 @@ async function setIcloudAliasState(aliasId, nextState) {
   await Promise.all([refreshResources(["accounts"]), loadIcloudMailboxes({force: true})]);
   renderIcloudAliases();
   showToast(`隐藏邮箱已${action}`, "success");
+}
+
+function openIcloudOwnerProxyDialog(aliasId) {
+  const owner = state.icloudAliases.find((item) => safeString(item.id) === safeString(aliasId))
+    || findIcloudTeamOwner(aliasId);
+  if (!owner || owner.role !== "team_owner") return;
+  const form = byId("icloud-owner-proxy-form");
+  form.reset();
+  form.elements.namedItem("alias_id").value = safeString(owner.id);
+  byId("icloud-owner-proxy-email").textContent = safeString(owner.email);
+  byId("icloud-owner-proxy-state").textContent = owner.proxy_configured ? "已配置，留空表示不更改" : "未配置";
+  form.elements.namedItem("proxy").placeholder = owner.proxy_configured ? "未更改" : "socks5h://user:password@host:port";
+  fieldError("icloud-owner-proxy-error", "");
+  byId("icloud-owner-proxy-dialog").showModal();
+}
+
+async function handleIcloudOwnerProxySubmit(form) {
+  if (!ensureMutable()) return;
+  fieldError("icloud-owner-proxy-error", "");
+  const aliasId = safeString(form.elements.namedItem("alias_id").value);
+  const proxy = safeString(form.elements.namedItem("proxy").value).trim();
+  const owner = state.icloudAliases.find((item) => safeString(item.id) === aliasId)
+    || findIcloudTeamOwner(aliasId);
+  if (!aliasId || (!proxy && !owner?.proxy_configured)) {
+    fieldError("icloud-owner-proxy-error", "请输入该母号自己的 S5");
+    return;
+  }
+  if (proxy) {
+    await api(`/api/icloud-team-owners/${encodeURIComponent(aliasId)}/proxy`, {
+      method: "PUT",
+      body: {proxy},
+    });
+  }
+  byId("icloud-owner-proxy-dialog").close();
+  await loadIcloudTeamOwners();
+  if (state.activeIcloudMailboxId) {
+    const payload = await api(`/api/icloud-mailboxes/${encodeURIComponent(state.activeIcloudMailboxId)}/aliases`);
+    state.icloudAliases = asList(payload, ["aliases", "icloud_aliases"]);
+    renderIcloudAliases();
+  }
+  showToast("母号 S5 已保存", "success");
+}
+
+async function clearIcloudOwnerProxy(form) {
+  if (!ensureMutable()) return;
+  const aliasId = safeString(form.elements.namedItem("alias_id").value);
+  if (!aliasId || !window.confirm("清除后无法现场创建下一子号，确认继续？")) return;
+  await api(`/api/icloud-team-owners/${encodeURIComponent(aliasId)}/proxy`, {
+    method: "PUT",
+    body: {proxy: ""},
+  });
+  byId("icloud-owner-proxy-dialog").close();
+  await loadIcloudTeamOwners();
+  if (state.activeIcloudMailboxId) {
+    const payload = await api(`/api/icloud-mailboxes/${encodeURIComponent(state.activeIcloudMailboxId)}/aliases`);
+    state.icloudAliases = asList(payload, ["aliases", "icloud_aliases"]);
+    renderIcloudAliases();
+  }
+  showToast("母号 S5 已清除", "success");
 }
 
 async function handleInventoryAllocation(form) {
@@ -2453,6 +2753,33 @@ async function advanceWorkspace(id) {
   }
   const replacement = result?.replacement ? accountEmail(result.replacement) : "未分配";
   showToast(`轮换已确认，新的下一账号：${replacement}`, "success");
+}
+
+async function replaceIcloudWorkspaceChild(id) {
+  if (!ensureMutable()) return;
+  const workspace = findWorkspace(id);
+  if (!workspace?.owner_alias_id) {
+    throw new ApiError("空间未绑定 iCloud Team 母号", {code: "owner_missing"});
+  }
+  const hasPreparedNext = Boolean(workspace.next_account_id);
+  const message = hasPreparedNext
+    ? `下一子号 ${workspaceAccountLabel(workspace, "next")} 已准备好，立即开始接力？`
+    : `将立即为 ${safeString(workspace.owner_email)} 新建一个隐藏邮箱，并启动子号接力。确认继续？`;
+  if (!window.confirm(message)) return;
+  const result = await api(
+    `/api/workspaces/${encodeURIComponent(id)}/replace-icloud-child`,
+    {
+      method: "POST",
+      body: {version: Number(firstValue(workspace, ["version"], 1))},
+    },
+  );
+  await refreshResources(["workspaces", "accounts", "runs", "queue"]);
+  state.icloudMailboxesLoaded = false;
+  await loadIcloudMailboxes({force: true});
+  showToast(
+    result.created ? `已创建 ${safeString(result.alias?.email)}，接力已入队` : "接力已入队",
+    "success",
+  );
 }
 
 function settingsPayload(form) {
@@ -2530,6 +2857,7 @@ document.addEventListener("click", (event) => {
     if (action === "open-workspace-dialog") return openWorkspaceDialog();
     if (action === "edit-workspace") return openWorkspaceDialog(findWorkspace(button.dataset.workspaceId));
     if (action === "advance-workspace") return advanceWorkspace(button.dataset.workspaceId);
+    if (action === "replace-icloud-child") return replaceIcloudWorkspaceChild(button.dataset.workspaceId);
     if (action === "open-account-import") {
       fieldError("account-import-error", "");
       byId("account-import-dialog").showModal();
@@ -2544,6 +2872,9 @@ document.addEventListener("click", (event) => {
     if (action === "check-icloud-mailbox") {
       return checkIcloudMailbox(button.dataset.mailboxId);
     }
+    if (action === "open-icloud-sync") {
+      return openIcloudSync(findIcloudMailbox(button.dataset.mailboxId));
+    }
     if (action === "open-icloud-generate") {
       return openIcloudGenerateDialog(findIcloudMailbox(button.dataset.mailboxId));
     }
@@ -2555,6 +2886,12 @@ document.addEventListener("click", (event) => {
     }
     if (action === "set-icloud-alias-state") {
       return setIcloudAliasState(button.dataset.aliasId, button.dataset.state);
+    }
+    if (action === "open-icloud-owner-proxy") {
+      return openIcloudOwnerProxyDialog(button.dataset.aliasId);
+    }
+    if (action === "clear-icloud-owner-proxy") {
+      return clearIcloudOwnerProxy(byId("icloud-owner-proxy-form"));
     }
     if (action === "open-account-proxy") return openAccountProxyDialog(findAccount(button.dataset.accountId));
     if (action === "clear-account-proxy") return clearAccountProxy(byId("account-proxy-form"));
@@ -2625,6 +2962,11 @@ document.addEventListener("input", (event) => {
     state.inventoryQuery = target.value;
     state.inventoryError = "";
     scheduleInventorySearch();
+  } else if (target.matches("[data-icloud-owner-proxy]")) {
+    const item = state.remoteIcloudAliases.find(
+      (candidate) => candidate.email === target.dataset.icloudOwnerProxy,
+    );
+    if (item) item.ownerProxy = target.value;
   } else if (target.matches("[data-combobox-input]")) {
     const role = target.dataset.comboboxInput;
     const combo = comboboxes.get(role);
@@ -2662,6 +3004,25 @@ document.addEventListener("change", (event) => {
       else state.selectedWorkspaceIds.delete(id);
     }
     renderWorkspaceTable();
+  } else if (target.matches("[data-icloud-import-role]")) {
+    const item = state.remoteIcloudAliases.find(
+      (candidate) => candidate.email === target.dataset.icloudImportRole,
+    );
+    if (item) {
+      item.selectionRole = target.value;
+      if (target.value !== "rotating_child") item.parentOwnerEmail = "";
+      if (target.value !== "team_owner") item.ownerProxy = "";
+      const owners = icloudSyncOwnerChoices().filter((email) => email !== item.email);
+      if (target.value === "rotating_child" && !item.parentOwnerEmail && owners.length === 1) {
+        item.parentOwnerEmail = owners[0];
+      }
+      renderIcloudSyncRows();
+    }
+  } else if (target.matches("[data-icloud-parent-owner]")) {
+    const item = state.remoteIcloudAliases.find(
+      (candidate) => candidate.email === target.dataset.icloudParentOwner,
+    );
+    if (item) item.parentOwnerEmail = target.value;
   } else if (target.id === "account-status-filter") {
     state.filters.accountStatus = target.value;
     state.accountPage = 1;
@@ -2671,6 +3032,22 @@ document.addEventListener("change", (event) => {
     state.inventoryResults = [];
     state.inventoryError = "";
     scheduleInventorySearch();
+  } else if (target.name === "owner_alias_id" && target.closest("#workspace-form")) {
+    const ownerAliasId = safeString(target.value);
+    for (const role of ["current", "next"]) {
+      const combo = comboboxes.get(role);
+      const account = combo.selected?.kind === "account" ? findAccount(combo.selected.id) : null;
+      if (
+        combo.selected
+        && ownerAliasId
+        && (!account || safeString(account.icloud_owner_alias_id) !== ownerAliasId)
+      ) {
+        clearCombobox(role);
+      } else {
+        combo.inventoryResults = [];
+        renderCombobox(role);
+      }
+    }
   } else if (target.id === "run-state-filter") {
     state.filters.runState = target.value;
     renderRunTable();
@@ -2694,6 +3071,8 @@ document.addEventListener("submit", (event) => {
   if (form.id === "account-proxy-form") task = () => handleAccountProxySubmit(form);
   if (form.id === "icloud-mailbox-form") task = () => handleIcloudMailboxSubmit(form);
   if (form.id === "icloud-generate-form") task = () => handleIcloudGenerate(form);
+  if (form.id === "icloud-sync-form") task = () => handleIcloudSync(form);
+  if (form.id === "icloud-owner-proxy-form") task = () => handleIcloudOwnerProxySubmit(form);
   if (form.id === "settings-form") task = () => handleSettingsSubmit(form);
   if (task) withBusy(submitter, task).catch(() => {});
 });
@@ -2704,9 +3083,15 @@ for (const dialog of document.querySelectorAll("dialog")) {
   });
   dialog.addEventListener("close", () => {
     if (dialog.id === "workspace-dialog") resetComboboxes();
-    if (["account-proxy-dialog", "icloud-mailbox-dialog"].includes(dialog.id)) {
+    if ([
+      "account-proxy-dialog",
+      "icloud-mailbox-dialog",
+      "icloud-owner-proxy-dialog",
+      "icloud-sync-dialog",
+    ].includes(dialog.id)) {
       dialog.querySelector("form")?.reset();
     }
+    if (dialog.id === "icloud-sync-dialog") state.remoteIcloudAliases = [];
   });
 }
 
