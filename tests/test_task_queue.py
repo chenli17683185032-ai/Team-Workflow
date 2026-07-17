@@ -676,6 +676,60 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(call["new_mailbox"].registration_email, next_account["email"])
         self.assertEqual(call["old_mailbox"].refresh_token, "refresh-inputs-current")
 
+    def test_run_inputs_resolve_icloud_imap_provider_and_parent_proxy(self):
+        parent_proxy = "socks5h://parent:parent-proxy-secret@proxy.invalid:1080"
+        profile = self.database.create_icloud_mailbox(
+            name="Apple parent",
+            forwarding_email="forwarding@example.com",
+            secrets={
+                "session": {
+                    "host": "p68-maildomainws.icloud.com",
+                    "dsid": "dsid",
+                    "client_id": "client",
+                    "client_build_number": "2536Project32",
+                    "client_mastering_number": "2536B20",
+                    "cookie": "icloud-session-secret",
+                },
+                "imap": {
+                    "host": "imap.example.com",
+                    "port": 993,
+                    "username": "forwarding@example.com",
+                    "password": "icloud-imap-secret",
+                    "folder": "INBOX",
+                },
+                "proxy": parent_proxy,
+            },
+            status="ready",
+        )
+        accounts = [
+            self.database.create_icloud_alias(
+                profile["id"],
+                email=f"hidden-{index}@icloud.com",
+                remote_metadata={"anonymousId": f"remote-{index}"},
+                label=f"Team Workflow {index}",
+            )["account"]
+            for index in range(2)
+        ]
+        workspace = self.database.create_workspace(
+            name="iCloud Space",
+            workspace_uid="icloud-space",
+            current_account_id=accounts[0]["id"],
+            next_account_id=accounts[1]["id"],
+        )
+        run = self.database.enqueue_workspace(workspace["id"])
+        queue = self.make_queue(RunnerHarness())
+
+        inputs = queue._build_run_inputs(run["id"])
+        old_mailbox, new_mailbox, secrets = inputs[1], inputs[2], inputs[-1]
+
+        self.assertEqual(old_mailbox.provider, "icloud_hme_imap")
+        self.assertEqual(new_mailbox.provider, "icloud_hme_imap")
+        self.assertEqual(old_mailbox.registration_email, "hidden-0@icloud.com")
+        self.assertEqual(old_mailbox.imap_password, "icloud-imap-secret")
+        self.assertEqual(old_mailbox.mailbox_proxy, parent_proxy)
+        self.assertIn("icloud-imap-secret", secrets)
+        self.assertIn(parent_proxy, secrets)
+
     def test_redact_text_removes_known_secrets_and_url_userinfo(self):
         value = "token=canary https://name:password@example.invalid/path"
         self.assertEqual(

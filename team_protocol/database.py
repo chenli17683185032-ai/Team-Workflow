@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ACCOUNT_STATUSES = frozenset(
     {
         "available",
@@ -37,6 +38,10 @@ QUEUE_STATES = frozenset({"pending", "running", "completed", "failed", "cancelle
 MAILBOX_INVENTORY_STATUSES = frozenset({"available", "disabled", "exhausted"})
 MAILBOX_ALLOCATION_STATES = frozenset({"allocated", "retired", "disabled"})
 IDENTITY_FAILURE_CODES = frozenset({"alias_disabled", "mailbox_credentials_invalid"})
+ICLOUD_MAILBOX_STATUSES = frozenset(
+    {"unchecked", "ready", "disabled", "session_invalid", "imap_invalid"}
+)
+ICLOUD_ALIAS_STATES = frozenset({"active", "inactive"})
 WORKFLOW_STEPS = (
     "old_login",
     "new_login",
@@ -178,6 +183,16 @@ def _normalize_primary_email(value: Any) -> str:
     local, domain = email.split("@", 1)
     if not local or not domain or "." not in domain or re.search(r"\+\d+$", local):
         raise ValidationError("primary_email is invalid")
+    return email
+
+
+def _normalize_email_address(value: Any, field: str = "email") -> str:
+    email = _required_text(value, field).casefold()
+    if email.count("@") != 1:
+        raise ValidationError(f"{field} is invalid")
+    local, domain = email.rsplit("@", 1)
+    if not local or not domain or "." not in domain or any(character.isspace() for character in email):
+        raise ValidationError(f"{field} is invalid")
     return email
 
 
@@ -437,11 +452,50 @@ _SCHEMA_V4_STATEMENTS = (
     "ALTER TABLE runs ADD COLUMN account_proxy_snapshot_blob BLOB",
 )
 
+_SCHEMA_V5_STATEMENTS = (
+    """
+    CREATE TABLE icloud_mailboxes (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        forwarding_email TEXT NOT NULL COLLATE NOCASE,
+        secret_blob BLOB NOT NULL,
+        secret_purpose TEXT NOT NULL,
+        proxy_configured INTEGER NOT NULL CHECK (proxy_configured IN (0, 1)),
+        status TEXT NOT NULL CHECK (
+            status IN ('unchecked', 'ready', 'disabled', 'session_invalid', 'imap_invalid')
+        ),
+        last_checked_at TEXT,
+        failure_code TEXT,
+        failure_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE icloud_aliases (
+        id TEXT PRIMARY KEY,
+        mailbox_id TEXT NOT NULL REFERENCES icloud_mailboxes(id) ON DELETE RESTRICT,
+        account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE RESTRICT,
+        email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        remote_blob BLOB NOT NULL,
+        remote_purpose TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'inactive')),
+        label TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX ix_icloud_mailboxes_status ON icloud_mailboxes(status, created_at, id)",
+    "CREATE INDEX ix_icloud_aliases_mailbox ON icloud_aliases(mailbox_id, created_at, id)",
+    "CREATE INDEX ix_icloud_aliases_state ON icloud_aliases(state, created_at, id)",
+)
+
 _SCHEMA_MIGRATIONS = {
     1: _SCHEMA_STATEMENTS,
     2: _SCHEMA_V2_STATEMENTS,
     3: _SCHEMA_V3_STATEMENTS,
     4: _SCHEMA_V4_STATEMENTS,
+    5: _SCHEMA_V5_STATEMENTS,
 }
 
 
@@ -512,6 +566,8 @@ class Database:
             raise ConflictError("mailbox inventory email already exists") from exc
         if "mailbox_alias_allocations" in message:
             raise ConflictError("mailbox alias is already allocated") from exc
+        if "icloud_aliases.email" in message or "icloud_aliases.account_id" in message:
+            raise ConflictError("iCloud alias is already linked") from exc
         if "workspaces.workspace_uid" in message:
             raise ConflictError("workspace UID already exists") from exc
         if "FOREIGN KEY constraint failed" in message:
@@ -700,6 +756,449 @@ class Database:
         with self._write_transaction() as connection:
             cursor = connection.execute("DELETE FROM settings WHERE key = ?", (key,))
         return cursor.rowcount == 1
+
+    @staticmethod
+    def _icloud_mailbox_view(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "name": str(row["name"]),
+            "forwarding_email": str(row["forwarding_email"]),
+            "status": str(row["status"]),
+            "alias_count": int(row["alias_count"]),
+            "session_configured": True,
+            "imap_configured": True,
+            "proxy_configured": bool(row["proxy_configured"]),
+            "last_checked_at": (
+                None if row["last_checked_at"] is None else str(row["last_checked_at"])
+            ),
+            "failure_code": (
+                None if row["failure_code"] is None else str(row["failure_code"])
+            ),
+            "failure_message": (
+                None if row["failure_message"] is None else str(row["failure_message"])
+            ),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _icloud_mailbox_select() -> str:
+        return """
+            SELECT mailbox.*,
+                   (SELECT COUNT(*) FROM icloud_aliases AS alias
+                    WHERE alias.mailbox_id = mailbox.id) AS alias_count
+            FROM icloud_mailboxes AS mailbox
+        """
+
+    @staticmethod
+    def _coerce_icloud_mailbox_secret(value: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValidationError("iCloud mailbox secret is invalid")
+        session = value.get("session")
+        imap = value.get("imap")
+        if not isinstance(session, Mapping) or not isinstance(imap, Mapping):
+            raise ValidationError("iCloud mailbox secret is incomplete")
+        required_session = {
+            "host",
+            "dsid",
+            "client_id",
+            "client_build_number",
+            "client_mastering_number",
+            "cookie",
+        }
+        if any(not str(session.get(key) or "").strip() for key in required_session):
+            raise ValidationError("iCloud HME session is incomplete")
+        required_imap = {"host", "username", "password"}
+        if any(not str(imap.get(key) or "").strip() for key in required_imap):
+            raise ValidationError("iCloud forwarding mailbox is incomplete")
+        try:
+            port = int(imap.get("port") or 993)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("iCloud forwarding mailbox port is invalid") from exc
+        if not 1 <= port <= 65535:
+            raise ValidationError("iCloud forwarding mailbox port is invalid")
+        proxy = str(value.get("proxy") or "").strip()
+        if proxy:
+            from .registrar import validate_proxy_url
+
+            try:
+                proxy = validate_proxy_url(proxy)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+            if urllib.parse.urlsplit(proxy).scheme.casefold() not in {
+                "http",
+                "socks5",
+                "socks5h",
+            }:
+                raise ValidationError("iCloud mailbox proxy must be HTTP or SOCKS5")
+        result = {
+            "session": dict(session),
+            "imap": {
+                "host": str(imap["host"]).strip(),
+                "port": port,
+                "username": str(imap["username"]).strip(),
+                "password": str(imap["password"]),
+                "folder": str(imap.get("folder") or "INBOX").strip(),
+            },
+            "proxy": proxy,
+        }
+        try:
+            _json_bytes(result)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("iCloud mailbox secret is not JSON serializable") from exc
+        return result
+
+    def create_icloud_mailbox(
+        self,
+        *,
+        name: str,
+        forwarding_email: str,
+        secrets: Mapping[str, Any],
+        mailbox_id: str | None = None,
+        status: str = "unchecked",
+    ) -> dict[str, Any]:
+        mailbox_id = _identifier(mailbox_id)
+        name = _required_text(name, "name")
+        if len(name) > 160:
+            raise ValidationError("name is too long")
+        forwarding_email = _normalize_email_address(
+            forwarding_email, "forwarding_email"
+        )
+        if status not in ICLOUD_MAILBOX_STATUSES:
+            raise ValidationError("iCloud mailbox status is invalid")
+        secret = self._coerce_icloud_mailbox_secret(secrets)
+        purpose = f"icloud-mailbox:{mailbox_id}:secrets"
+        ciphertext = self._require_secret_store().encrypt(_json_bytes(secret), purpose)
+        timestamp = _now()
+        with self._write_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO icloud_mailboxes(
+                    id, name, forwarding_email, secret_blob, secret_purpose,
+                    proxy_configured, status, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mailbox_id,
+                    name,
+                    forwarding_email,
+                    sqlite3.Binary(ciphertext),
+                    purpose,
+                    int(bool(secret["proxy"])),
+                    status,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return self.get_icloud_mailbox(mailbox_id)
+
+    def update_icloud_mailbox(
+        self,
+        mailbox_id: str,
+        *,
+        name: str | None = None,
+        forwarding_email: str | None = None,
+        secrets: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM icloud_mailboxes WHERE id = ?", (mailbox_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("iCloud mailbox not found")
+            updated_name = str(row["name"]) if name is None else _required_text(name, "name")
+            if len(updated_name) > 160:
+                raise ValidationError("name is too long")
+            updated_email = (
+                str(row["forwarding_email"])
+                if forwarding_email is None
+                else _normalize_email_address(forwarding_email, "forwarding_email")
+            )
+            if updated_email.casefold() != str(row["forwarding_email"]).casefold():
+                count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM icloud_aliases WHERE mailbox_id = ?",
+                        (mailbox_id,),
+                    ).fetchone()[0]
+                )
+                if count:
+                    raise StateConflictError(
+                        "forwarding email cannot change after aliases are created"
+                    )
+            verification_changed = (
+                secrets is not None
+                or updated_email.casefold()
+                != str(row["forwarding_email"]).casefold()
+            )
+            secret_blob = bytes(row["secret_blob"])
+            proxy_configured = int(row["proxy_configured"])
+            if secrets is not None:
+                secret = self._coerce_icloud_mailbox_secret(secrets)
+                secret_blob = self._require_secret_store().encrypt(
+                    _json_bytes(secret), str(row["secret_purpose"])
+                )
+                proxy_configured = int(bool(secret["proxy"]))
+            connection.execute(
+                """
+                UPDATE icloud_mailboxes
+                SET name = ?, forwarding_email = ?, secret_blob = ?,
+                    proxy_configured = ?, status = ?, failure_code = ?,
+                    failure_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    updated_name,
+                    updated_email,
+                    sqlite3.Binary(secret_blob),
+                    proxy_configured,
+                    "unchecked" if verification_changed else str(row["status"]),
+                    None if verification_changed else row["failure_code"],
+                    None if verification_changed else row["failure_message"],
+                    _now(),
+                    mailbox_id,
+                ),
+            )
+        return self.get_icloud_mailbox(mailbox_id)
+
+    def get_icloud_mailbox(self, mailbox_id: str) -> dict[str, Any]:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                self._icloud_mailbox_select() + " WHERE mailbox.id = ?",
+                (mailbox_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("iCloud mailbox not found")
+        return self._icloud_mailbox_view(row)
+
+    def list_icloud_mailboxes(self) -> list[dict[str, Any]]:
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                self._icloud_mailbox_select()
+                + " ORDER BY mailbox.created_at, mailbox.id"
+            ).fetchall()
+        return [self._icloud_mailbox_view(row) for row in rows]
+
+    def _icloud_mailbox_secret_tx(
+        self, connection: sqlite3.Connection, mailbox_id: str
+    ) -> tuple[sqlite3.Row, dict[str, Any]]:
+        row = connection.execute(
+            "SELECT * FROM icloud_mailboxes WHERE id = ?", (mailbox_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("iCloud mailbox not found")
+        expected_purpose = f"icloud-mailbox:{mailbox_id}:secrets"
+        if str(row["secret_purpose"]) != expected_purpose:
+            raise DatabaseError("iCloud mailbox secret purpose is invalid")
+        try:
+            plaintext = self._require_secret_store().decrypt(
+                bytes(row["secret_blob"]), expected_purpose
+            )
+            value = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            raise DatabaseError("iCloud mailbox secrets are invalid") from exc
+        if not isinstance(value, Mapping):
+            raise DatabaseError("iCloud mailbox secrets are invalid")
+        return row, dict(value)
+
+    def get_icloud_mailbox_secrets(self, mailbox_id: str) -> dict[str, Any]:
+        with self._read_connection() as connection:
+            _row, value = self._icloud_mailbox_secret_tx(connection, mailbox_id)
+        return value
+
+    def set_icloud_mailbox_status(
+        self,
+        mailbox_id: str,
+        status: str,
+        *,
+        failure_code: str | None = None,
+        failure_message: str | None = None,
+        checked: bool = False,
+    ) -> dict[str, Any]:
+        if status not in ICLOUD_MAILBOX_STATUSES:
+            raise ValidationError("iCloud mailbox status is invalid")
+        with self._write_transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE icloud_mailboxes
+                SET status = ?, last_checked_at = CASE WHEN ? THEN ? ELSE last_checked_at END,
+                    failure_code = ?, failure_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    int(checked),
+                    _now(),
+                    str(failure_code).strip() if failure_code else None,
+                    str(failure_message).strip() if failure_message else None,
+                    _now(),
+                    mailbox_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("iCloud mailbox not found")
+        return self.get_icloud_mailbox(mailbox_id)
+
+    def create_icloud_alias(
+        self,
+        mailbox_id: str,
+        *,
+        email: str,
+        remote_metadata: Mapping[str, Any],
+        label: str,
+    ) -> dict[str, Any]:
+        alias_email = _normalize_email_address(email, "alias_email")
+        clean_label = _required_text(label, "label")
+        if len(clean_label) > 160:
+            raise ValidationError("label is too long")
+        if not isinstance(remote_metadata, Mapping) or not str(
+            remote_metadata.get("anonymousId") or ""
+        ).strip():
+            raise ValidationError("iCloud alias remote metadata is incomplete")
+        alias_id = _identifier(None)
+        account_id = _identifier(None)
+        remote_purpose = f"icloud-alias:{alias_id}:remote"
+        remote_blob = self._require_secret_store().encrypt(
+            _json_bytes(remote_metadata), remote_purpose
+        )
+        timestamp = _now()
+        with self._write_transaction() as connection:
+            mailbox, secrets = self._icloud_mailbox_secret_tx(connection, mailbox_id)
+            if str(mailbox["status"]) != "ready":
+                raise InventoryDisabledError("iCloud mailbox is not ready")
+            credential_blob = self._require_secret_store().encrypt(
+                _json_bytes(
+                    {
+                        "provider": "icloud_hme_imap",
+                        "icloud_mailbox_id": mailbox_id,
+                        "icloud_alias_id": alias_id,
+                        "account_password": "",
+                    }
+                ),
+                f"account:{account_id}:credentials",
+            )
+            proxy_blob = None
+            proxy = str(secrets.get("proxy") or "").strip()
+            if proxy:
+                proxy_blob = self._require_secret_store().encrypt(
+                    proxy.encode("utf-8"), f"account:{account_id}:proxy"
+                )
+            connection.execute(
+                """
+                INSERT INTO accounts(
+                    id, email, primary_email, credential_blob, status, source,
+                    created_at, updated_at, proxy_blob
+                ) VALUES(?, ?, ?, ?, 'available', 'icloud_hme', ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    alias_email,
+                    mailbox["forwarding_email"],
+                    sqlite3.Binary(credential_blob),
+                    timestamp,
+                    timestamp,
+                    None if proxy_blob is None else sqlite3.Binary(proxy_blob),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO icloud_aliases(
+                    id, mailbox_id, account_id, email, remote_blob, remote_purpose,
+                    state, label, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                """,
+                (
+                    alias_id,
+                    mailbox_id,
+                    account_id,
+                    alias_email,
+                    sqlite3.Binary(remote_blob),
+                    remote_purpose,
+                    clean_label,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return {
+            "alias": self.get_icloud_alias(alias_id),
+            "account": self.get_account(account_id),
+        }
+
+    @staticmethod
+    def _icloud_alias_view(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "mailbox_id": str(row["mailbox_id"]),
+            "account_id": str(row["account_id"]),
+            "email": str(row["email"]),
+            "state": str(row["state"]),
+            "label": str(row["label"]),
+            "account_status": str(row["account_status"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def get_icloud_alias(self, alias_id: str) -> dict[str, Any]:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT alias.*, account.status AS account_status
+                FROM icloud_aliases AS alias
+                JOIN accounts AS account ON account.id = alias.account_id
+                WHERE alias.id = ?
+                """,
+                (alias_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("iCloud alias not found")
+        return self._icloud_alias_view(row)
+
+    def list_icloud_aliases(self, mailbox_id: str) -> list[dict[str, Any]]:
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT alias.*, account.status AS account_status
+                FROM icloud_aliases AS alias
+                JOIN accounts AS account ON account.id = alias.account_id
+                WHERE alias.mailbox_id = ?
+                ORDER BY alias.created_at DESC, alias.id DESC
+                """,
+                (mailbox_id,),
+            ).fetchall()
+        return [self._icloud_alias_view(row) for row in rows]
+
+    def get_icloud_alias_remote(self, alias_id: str) -> dict[str, Any]:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT remote_blob, remote_purpose FROM icloud_aliases WHERE id = ?",
+                (alias_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("iCloud alias not found")
+        expected_purpose = f"icloud-alias:{alias_id}:remote"
+        if str(row["remote_purpose"]) != expected_purpose:
+            raise DatabaseError("iCloud alias metadata purpose is invalid")
+        try:
+            plaintext = self._require_secret_store().decrypt(
+                bytes(row["remote_blob"]), expected_purpose
+            )
+            value = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            raise DatabaseError("iCloud alias metadata is invalid") from exc
+        if not isinstance(value, dict):
+            raise DatabaseError("iCloud alias metadata is invalid")
+        return value
+
+    def set_icloud_alias_state(self, alias_id: str, state: str) -> dict[str, Any]:
+        if state not in ICLOUD_ALIAS_STATES:
+            raise ValidationError("iCloud alias state is invalid")
+        with self._write_transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE icloud_aliases SET state = ?, updated_at = ? WHERE id = ?",
+                (state, _now(), alias_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("iCloud alias not found")
+        return self.get_icloud_alias(alias_id)
 
     @staticmethod
     def _mailbox_inventory_view(row: sqlite3.Row) -> dict[str, Any]:
@@ -1151,6 +1650,25 @@ class Database:
             else None
         )
         if preferred:
+            row = connection.execute(
+                """
+                SELECT account.*
+                FROM accounts AS account
+                JOIN icloud_aliases AS hme_alias
+                  ON hme_alias.account_id = account.id
+                JOIN icloud_mailboxes AS hme_mailbox
+                  ON hme_mailbox.id = hme_alias.mailbox_id
+                WHERE account.status = 'available'
+                  AND account.primary_email = ? COLLATE NOCASE
+                  AND hme_alias.state = 'active'
+                  AND hme_mailbox.status = 'ready'
+                ORDER BY hme_alias.created_at, hme_alias.id
+                LIMIT 1
+                """,
+                (preferred,),
+            ).fetchone()
+            if row is not None:
+                return self._account_view(row)
             parameters: list[Any] = [preferred]
             alias_clause = ""
             if after_alias_number is not None:
@@ -1189,8 +1707,16 @@ class Database:
               ON allocation.account_id = account.id
             LEFT JOIN mailbox_inventory AS inventory
               ON inventory.id = allocation.inventory_id
+            LEFT JOIN icloud_aliases AS hme_alias
+              ON hme_alias.account_id = account.id
+            LEFT JOIN icloud_mailboxes AS hme_mailbox
+              ON hme_mailbox.id = hme_alias.mailbox_id
             WHERE {' AND '.join(clauses)}
               AND (inventory.id IS NULL OR inventory.status <> 'disabled')
+              AND (
+                  hme_alias.id IS NULL
+                  OR (hme_alias.state = 'active' AND hme_mailbox.status = 'ready')
+              )
             ORDER BY
                 CASE WHEN inventory.source_order IS NULL THEN 1 ELSE 0 END,
                 inventory.source_order,
@@ -1743,6 +2269,46 @@ class Database:
             raise DatabaseError("account credentials are invalid")
         return value
 
+    def get_resolved_account_credentials(self, account_id: str) -> dict[str, Any]:
+        credentials = self.get_account_credentials(account_id)
+        if str(credentials.get("provider") or "") != "icloud_hme_imap":
+            return credentials
+        mailbox_id = str(credentials.get("icloud_mailbox_id") or "").strip()
+        alias_id = str(credentials.get("icloud_alias_id") or "").strip()
+        if not mailbox_id or not alias_id:
+            raise DatabaseError("iCloud account credentials are incomplete")
+        with self._read_connection() as connection:
+            association = connection.execute(
+                """
+                SELECT alias.state AS alias_state, mailbox.status AS mailbox_status
+                FROM icloud_aliases AS alias
+                JOIN icloud_mailboxes AS mailbox ON mailbox.id = alias.mailbox_id
+                WHERE alias.id = ? AND alias.mailbox_id = ? AND alias.account_id = ?
+                """,
+                (alias_id, mailbox_id, account_id),
+            ).fetchone()
+            if association is None:
+                raise DatabaseError("iCloud account association is invalid")
+            if str(association["alias_state"]) != "active":
+                raise StateConflictError("iCloud alias is inactive")
+            if str(association["mailbox_status"]) != "ready":
+                raise StateConflictError("iCloud mailbox is not ready")
+            _mailbox, secret = self._icloud_mailbox_secret_tx(connection, mailbox_id)
+        imap = secret.get("imap")
+        if not isinstance(imap, Mapping):
+            raise DatabaseError("iCloud forwarding mailbox is invalid")
+        return {
+            **credentials,
+            "provider": "icloud_hme_imap",
+            "forwarding_email": str(_mailbox["forwarding_email"]),
+            "imap_host": str(imap.get("host") or ""),
+            "imap_port": int(imap.get("port") or 993),
+            "imap_username": str(imap.get("username") or ""),
+            "imap_password": str(imap.get("password") or ""),
+            "imap_folder": str(imap.get("folder") or "INBOX"),
+            "mailbox_proxy": str(secret.get("proxy") or ""),
+        }
+
     def replace_account_credentials(
         self, account_id: str, credentials: Mapping[str, Any]
     ) -> None:
@@ -1955,6 +2521,20 @@ class Database:
                 raise InventoryExhaustedError("mailbox inventory is exhausted")
             return str(account["id"])
         if clean_account_id:
+            linked = connection.execute(
+                """
+                SELECT alias.state AS alias_state, mailbox.status AS mailbox_status
+                FROM icloud_aliases AS alias
+                JOIN icloud_mailboxes AS mailbox ON mailbox.id = alias.mailbox_id
+                WHERE alias.account_id = ?
+                """,
+                (clean_account_id,),
+            ).fetchone()
+            if linked is not None and (
+                str(linked["alias_state"]) != "active"
+                or str(linked["mailbox_status"]) != "ready"
+            ):
+                raise InventoryDisabledError("iCloud account mailbox is not ready")
             return clean_account_id
         if required:
             raise ValidationError(
@@ -3004,13 +3584,26 @@ class Database:
         ).fetchone()
         if target is None:
             raise StateConflictError("workspace account is missing")
-        inventory = connection.execute(
+        icloud_alias = connection.execute(
             """
-            SELECT * FROM mailbox_inventory
-            WHERE primary_email = ? COLLATE NOCASE
+            SELECT alias.*, mailbox.status AS mailbox_status
+            FROM icloud_aliases AS alias
+            JOIN icloud_mailboxes AS mailbox ON mailbox.id = alias.mailbox_id
+            WHERE alias.account_id = ?
             """,
-            (target["primary_email"],),
+            (target_id,),
         ).fetchone()
+        inventory = (
+            None
+            if icloud_alias is not None
+            else connection.execute(
+                """
+                SELECT * FROM mailbox_inventory
+                WHERE primary_email = ? COLLATE NOCASE
+                """,
+                (target["primary_email"],),
+            ).fetchone()
+        )
 
         connection.execute(
             "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ?",
@@ -3019,6 +3612,11 @@ class Database:
         self._set_allocation_state_tx(
             connection, target_id, "disabled", timestamp
         )
+        if failure_code == "alias_disabled" and icloud_alias is not None:
+            connection.execute(
+                "UPDATE icloud_aliases SET state = 'inactive', updated_at = ? WHERE id = ?",
+                (timestamp, icloud_alias["id"]),
+            )
         if failure_code == "mailbox_credentials_invalid" and inventory is not None:
             connection.execute(
                 """
@@ -3029,6 +3627,16 @@ class Database:
                 """,
                 (failure_code, timestamp, inventory["id"]),
             )
+        if failure_code == "mailbox_credentials_invalid" and icloud_alias is not None:
+            connection.execute(
+                """
+                UPDATE icloud_mailboxes
+                SET status = 'imap_invalid', failure_code = ?,
+                    failure_message = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (failure_code, timestamp, icloud_alias["mailbox_id"]),
+            )
 
         if role == "current":
             promoted_id = (
@@ -3037,14 +3645,28 @@ class Database:
                 else str(workspace["next_account_id"])
             )
             if promoted_id is not None and failure_code == "mailbox_credentials_invalid":
-                promoted = connection.execute(
-                    "SELECT primary_email FROM accounts WHERE id = ?", (promoted_id,)
-                ).fetchone()
-                if (
-                    promoted is not None
-                    and str(promoted["primary_email"]).casefold()
-                    == str(target["primary_email"]).casefold()
-                ):
+                if icloud_alias is not None:
+                    promoted = connection.execute(
+                        """
+                        SELECT alias.mailbox_id
+                        FROM icloud_aliases AS alias WHERE alias.account_id = ?
+                        """,
+                        (promoted_id,),
+                    ).fetchone()
+                    same_mailbox = (
+                        promoted is not None
+                        and str(promoted["mailbox_id"]) == str(icloud_alias["mailbox_id"])
+                    )
+                else:
+                    promoted = connection.execute(
+                        "SELECT primary_email FROM accounts WHERE id = ?", (promoted_id,)
+                    ).fetchone()
+                    same_mailbox = (
+                        promoted is not None
+                        and str(promoted["primary_email"]).casefold()
+                        == str(target["primary_email"]).casefold()
+                    )
+                if same_mailbox:
                     connection.execute(
                         "UPDATE accounts SET status = 'disabled', updated_at = ? WHERE id = ?",
                         (timestamp, promoted_id),
@@ -3673,6 +4295,8 @@ class Database:
             expected_tables.update(
                 {"mailbox_inventory", "mailbox_alias_allocations"}
             )
+        if schema_version >= 5:
+            expected_tables.update({"icloud_mailboxes", "icloud_aliases"})
         try:
             with self._temporary_snapshot_file(snapshot) as snapshot_path:
                 connection = sqlite3.connect(
@@ -3779,6 +4403,43 @@ class Database:
                             if not isinstance(json.loads(plaintext.decode("utf-8")), dict):
                                 raise RestoreValidationError(
                                     "restore candidate mailbox credentials are invalid"
+                                )
+                    if schema_version >= 5:
+                        for row in connection.execute(
+                            """
+                            SELECT id, secret_blob, secret_purpose
+                            FROM icloud_mailboxes
+                            """
+                        ):
+                            purpose = f"icloud-mailbox:{row['id']}:secrets"
+                            if str(row["secret_purpose"]) != purpose:
+                                raise RestoreValidationError(
+                                    "restore candidate iCloud mailbox purpose is invalid"
+                                )
+                            plaintext = self._require_secret_store().decrypt(
+                                bytes(row["secret_blob"]), purpose
+                            )
+                            if not isinstance(json.loads(plaintext.decode("utf-8")), dict):
+                                raise RestoreValidationError(
+                                    "restore candidate iCloud mailbox secrets are invalid"
+                                )
+                        for row in connection.execute(
+                            """
+                            SELECT id, remote_blob, remote_purpose
+                            FROM icloud_aliases
+                            """
+                        ):
+                            purpose = f"icloud-alias:{row['id']}:remote"
+                            if str(row["remote_purpose"]) != purpose:
+                                raise RestoreValidationError(
+                                    "restore candidate iCloud alias purpose is invalid"
+                                )
+                            plaintext = self._require_secret_store().decrypt(
+                                bytes(row["remote_blob"]), purpose
+                            )
+                            if not isinstance(json.loads(plaintext.decode("utf-8")), dict):
+                                raise RestoreValidationError(
+                                    "restore candidate iCloud alias metadata is invalid"
                                 )
                     run_query = (
                         "SELECT id, checkpoint_blob, proxy_blob, "

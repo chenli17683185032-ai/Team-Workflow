@@ -14,6 +14,7 @@ from team_protocol.database import (
     BindingConflictError,
     ConflictError,
     Database,
+    InventoryDisabledError,
     RestoreValidationError,
     StaleVersionError,
     StateConflictError,
@@ -128,6 +129,35 @@ class DatabaseTests(unittest.TestCase):
             "client_id": f"client-{local}",
             "refresh_token": f"refresh-{local}",
             "source_order": source_order,
+        }
+
+    @staticmethod
+    def icloud_secret(suffix: str, *, proxy: str | None = None) -> dict:
+        return {
+            "session": {
+                "host": "p68-maildomainws.icloud.com",
+                "dsid": f"dsid-{suffix}",
+                "client_id": f"client-{suffix}",
+                "client_build_number": "2536Project32",
+                "client_mastering_number": "2536B20",
+                "cookie": f"icloud-cookie-secret-{suffix}",
+                "lang_code": "en-us",
+                "origin": "https://www.icloud.com",
+                "referer": "https://www.icloud.com/",
+                "user_agent": "Browser Test",
+            },
+            "imap": {
+                "host": "imap.example.com",
+                "port": 993,
+                "username": f"forward-{suffix}@example.com",
+                "password": f"imap-password-secret-{suffix}",
+                "folder": "INBOX",
+            },
+            "proxy": (
+                f"socks5h://parent-{suffix}:proxy-password-secret-{suffix}@proxy.invalid:1080"
+                if proxy is None
+                else proxy
+            ),
         }
 
     def assert_secret_absent_from_database_files(self, secret: str) -> None:
@@ -261,7 +291,7 @@ class DatabaseTests(unittest.TestCase):
         self.database.initialize()
         diagnostics = self.database.diagnostics()
 
-        self.assertEqual(diagnostics["schema_version"], 4)
+        self.assertEqual(diagnostics["schema_version"], 5)
         self.assertEqual(diagnostics["journal_mode"], "wal")
         self.assertTrue(diagnostics["foreign_keys"])
         self.assertEqual(diagnostics["busy_timeout_ms"], 5000)
@@ -299,6 +329,185 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(self.database.delete_setting("proxy"))
         self.assertFalse(self.database.delete_setting("proxy"))
         self.assertNotIn("proxy", {row["key"] for row in self.database.list_settings()})
+
+    def test_icloud_mailbox_alias_and_resolved_credentials_are_encrypted(self):
+        profile = self.database.create_icloud_mailbox(
+            mailbox_id="icloud-profile-one",
+            name="Apple parent one",
+            forwarding_email="forward-one@example.com",
+            secrets=self.icloud_secret("one"),
+            status="ready",
+        )
+        created = self.database.create_icloud_alias(
+            profile["id"],
+            email="hidden-one@icloud.com",
+            remote_metadata={
+                "hme": "hidden-one@icloud.com",
+                "anonymousId": "remote-anonymous-secret-one",
+                "recipientMailId": "remote-recipient-secret-one",
+            },
+            label="Team Workflow one",
+        )
+        account = created["account"]
+
+        self.assertEqual(profile["status"], "ready")
+        self.assertTrue(profile["session_configured"])
+        self.assertTrue(profile["imap_configured"])
+        self.assertTrue(profile["proxy_configured"])
+        self.assertEqual(self.database.get_icloud_mailbox(profile["id"])["alias_count"], 1)
+        self.assertEqual(account["source"], "icloud_hme")
+        self.assertTrue(account["proxy_configured"])
+        base_credentials = self.database.get_account_credentials(account["id"])
+        self.assertEqual(base_credentials["icloud_mailbox_id"], profile["id"])
+        self.assertNotIn("imap_password", base_credentials)
+        resolved = self.database.get_resolved_account_credentials(account["id"])
+        self.assertEqual(resolved["provider"], "icloud_hme_imap")
+        self.assertEqual(resolved["imap_password"], "imap-password-secret-one")
+        self.assertEqual(
+            resolved["mailbox_proxy"],
+            "socks5h://parent-one:proxy-password-secret-one@proxy.invalid:1080",
+        )
+        remote = self.database.get_icloud_alias_remote(created["alias"]["id"])
+        self.assertEqual(remote["anonymousId"], "remote-anonymous-secret-one")
+        serialized_views = json.dumps(
+            {
+                "profiles": self.database.list_icloud_mailboxes(),
+                "aliases": self.database.list_icloud_aliases(profile["id"]),
+                "account": account,
+            }
+        )
+        for secret in (
+            "icloud-cookie-secret-one",
+            "imap-password-secret-one",
+            "proxy-password-secret-one",
+            "remote-anonymous-secret-one",
+            "remote-recipient-secret-one",
+        ):
+            self.assertNotIn(secret, serialized_views)
+            self.assert_secret_absent_from_database_files(secret)
+
+    def test_icloud_profile_updates_are_resolved_without_duplicating_account_secrets(self):
+        profile = self.database.create_icloud_mailbox(
+            name="Apple parent",
+            forwarding_email="forward-update@example.com",
+            secrets=self.icloud_secret("before"),
+            status="ready",
+        )
+        account = self.database.create_icloud_alias(
+            profile["id"],
+            email="hidden-update@icloud.com",
+            remote_metadata={"anonymousId": "remote-update"},
+            label="Team Workflow update",
+        )["account"]
+        before = self.database.get_account_credentials(account["id"])
+
+        updated_secret = self.icloud_secret("after")
+        updated = self.database.update_icloud_mailbox(
+            profile["id"], name="Apple parent refreshed", secrets=updated_secret
+        )
+        self.assertEqual(updated["status"], "unchecked")
+        with self.assertRaises(StateConflictError):
+            self.database.get_resolved_account_credentials(account["id"])
+        self.database.set_icloud_mailbox_status(profile["id"], "ready", checked=True)
+        resolved = self.database.get_resolved_account_credentials(account["id"])
+
+        self.assertEqual(
+            self.database.get_account_credentials(account["id"]), before
+        )
+        self.assertEqual(resolved["imap_password"], "imap-password-secret-after")
+        self.assertEqual(resolved["forwarding_email"], "forward-update@example.com")
+        with self.assertRaises(StateConflictError):
+            self.database.update_icloud_mailbox(
+                profile["id"], forwarding_email="different@example.com"
+            )
+
+    def test_icloud_name_only_update_preserves_detection_status(self):
+        profile = self.database.create_icloud_mailbox(
+            name="Apple parent",
+            forwarding_email="forward-name@example.com",
+            secrets=self.icloud_secret("name-only"),
+            status="ready",
+        )
+        checked = self.database.set_icloud_mailbox_status(
+            profile["id"], "ready", checked=True
+        )
+
+        updated = self.database.update_icloud_mailbox(
+            profile["id"], name="Apple parent renamed"
+        )
+
+        self.assertEqual(updated["name"], "Apple parent renamed")
+        self.assertEqual(updated["status"], "ready")
+        self.assertEqual(updated["last_checked_at"], checked["last_checked_at"])
+
+    def test_icloud_invalid_profile_is_skipped_during_binding_and_replacement(self):
+        first_profile = self.database.create_icloud_mailbox(
+            name="First Apple parent",
+            forwarding_email="shared-forward@example.com",
+            secrets=self.icloud_secret("first"),
+            status="ready",
+        )
+        first_accounts = [
+            self.database.create_icloud_alias(
+                first_profile["id"],
+                email=f"first-hidden-{index}@icloud.com",
+                remote_metadata={"anonymousId": f"remote-first-{index}"},
+                label=f"Team Workflow first {index}",
+            )["account"]
+            for index in range(2)
+        ]
+        second_profile = self.database.create_icloud_mailbox(
+            name="Second Apple parent",
+            forwarding_email="other-forward@example.com",
+            secrets=self.icloud_secret("second"),
+            status="ready",
+        )
+        second_account = self.database.create_icloud_alias(
+            second_profile["id"],
+            email="second-hidden@icloud.com",
+            remote_metadata={"anonymousId": "remote-second"},
+            label="Team Workflow second",
+        )["account"]
+        workspace = self.database.create_workspace(
+            name="iCloud rotation",
+            workspace_uid="icloud-rotation",
+            current_account_id=first_accounts[0]["id"],
+            next_account_id=first_accounts[1]["id"],
+        )
+
+        result = self.database.replace_workspace_account(
+            workspace["id"],
+            role="next",
+            failure_code="mailbox_credentials_invalid",
+            expected_version=workspace["version"],
+        )
+
+        self.assertEqual(result["replacement"]["id"], second_account["id"])
+        self.assertEqual(
+            self.database.get_icloud_mailbox(first_profile["id"])["status"],
+            "imap_invalid",
+        )
+        with self.assertRaises(StateConflictError):
+            self.database.get_resolved_account_credentials(first_accounts[0]["id"])
+        spare_profile = self.database.create_icloud_mailbox(
+            name="Unchecked Apple parent",
+            forwarding_email="unchecked@example.com",
+            secrets=self.icloud_secret("unchecked"),
+            status="ready",
+        )
+        spare = self.database.create_icloud_alias(
+            spare_profile["id"],
+            email="unchecked-hidden@icloud.com",
+            remote_metadata={"anonymousId": "remote-unchecked"},
+            label="Team Workflow unchecked",
+        )["account"]
+        self.database.set_icloud_mailbox_status(spare_profile["id"], "session_invalid")
+        with self.assertRaises(InventoryDisabledError):
+            self.database.create_workspace(
+                name="Blocked",
+                workspace_uid="blocked-icloud-profile",
+                current_account_id=spare["id"],
+            )
 
     def test_account_credentials_are_encrypted_and_email_is_case_insensitive_unique(self):
         account = self.create_account("one")
@@ -1006,6 +1215,61 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaises(RestoreValidationError):
             self.database.validate_restore_candidate(wrong_purpose)
 
+    def test_v5_snapshot_restores_icloud_mailbox_alias_and_encrypted_secrets(self):
+        model = self.legacy_model(with_state=False)
+        self.database.apply_legacy_import(model)
+        profile = self.database.create_icloud_mailbox(
+            mailbox_id="icloud-backup-profile",
+            name="Backup Apple parent",
+            forwarding_email="forward-backup@example.com",
+            secrets=self.icloud_secret("backup"),
+            status="ready",
+        )
+        created = self.database.create_icloud_alias(
+            profile["id"],
+            email="hidden-backup@icloud.com",
+            remote_metadata={
+                "hme": "hidden-backup@icloud.com",
+                "anonymousId": "remote-anonymous-secret-backup",
+                "recipientMailId": "remote-recipient-secret-backup",
+            },
+            label="Team Workflow backup",
+        )
+        candidate = self.backup_candidate(self.database, model)
+
+        for secret in (
+            "icloud-cookie-secret-backup",
+            "imap-password-secret-backup",
+            "proxy-password-secret-backup",
+            "remote-anonymous-secret-backup",
+            "remote-recipient-secret-backup",
+        ):
+            self.assertNotIn(secret.encode(), candidate.sqlite_snapshot)
+
+        target_path = Path(self.temporary_directory.name) / "icloud-restore" / "console.db"
+        target = Database(target_path, secret_store=TestSecretStore())
+        validation = target.validate_restore_candidate(candidate)
+        target.set_queue_paused(True)
+        result = target.restore_verified_backup(candidate, validation)
+
+        restored_profile = target.get_icloud_mailbox(profile["id"])
+        restored_alias = target.get_icloud_alias(created["alias"]["id"])
+        restored_credentials = target.get_resolved_account_credentials(
+            created["account"]["id"]
+        )
+        self.assertEqual(result["row_counts"]["icloud_mailboxes"], 1)
+        self.assertEqual(result["row_counts"]["icloud_aliases"], 1)
+        self.assertEqual(restored_profile["status"], "ready")
+        self.assertEqual(restored_alias["email"], "hidden-backup@icloud.com")
+        self.assertEqual(
+            restored_credentials["imap_password"],
+            "imap-password-secret-backup",
+        )
+        self.assertEqual(
+            target.get_icloud_alias_remote(restored_alias["id"])["anonymousId"],
+            "remote-anonymous-secret-backup",
+        )
+
     def test_restore_rejects_candidate_changed_after_validation_and_running_queue(self):
         source_path = Path(self.temporary_directory.name) / "source.db"
         source = Database(source_path, secret_store=TestSecretStore())
@@ -1079,10 +1343,10 @@ class DatabaseTests(unittest.TestCase):
             connection.close()
 
         upgraded = Database(legacy_path, secret_store=TestSecretStore())
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 4)
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 5)
         self.assertEqual(upgraded.get_meta("instance_id"), "legacy-instance")
         upgraded.initialize()
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 4)
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 5)
 
     def test_inventory_import_search_and_credentials_are_encrypted(self):
         records = [
@@ -1494,9 +1758,9 @@ class DatabaseTests(unittest.TestCase):
         restored = self.database.restore_verified_backup(candidate, validation)
 
         self.assertEqual(validation.schema_version, 1)
-        self.assertEqual(restored["schema_version"], 4)
+        self.assertEqual(restored["schema_version"], 5)
         self.assertEqual(self.database.get_meta("instance_id"), "snapshot-v1-instance")
-        self.assertEqual(self.database.diagnostics()["schema_version"], 4)
+        self.assertEqual(self.database.diagnostics()["schema_version"], 5)
 
 
 if __name__ == "__main__":

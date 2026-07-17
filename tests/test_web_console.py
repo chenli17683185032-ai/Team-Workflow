@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from team_protocol.database import Database
+from team_protocol.database import Database, StateConflictError
+from team_protocol.icloud_hme import HmeError, HmeSessionError
 from team_protocol.migration import CleanupFailure, CleanupResult, cleanup_plaintext
 from team_protocol.web_console import (
     ConsoleAlreadyRunningError,
@@ -177,6 +178,30 @@ class WebConsoleTests(unittest.TestCase):
             "source_order": order,
         }
 
+    @staticmethod
+    def icloud_payload():
+        url = (
+            "https://p68-maildomainws.icloud.com/v2/hme/list?"
+            "clientBuildNumber=2536Project32&clientMasteringNumber=2536B20&"
+            "clientId=client-icloud&dsid=dsid-icloud"
+        )
+        cookie = (
+            "X-APPLE-DS-WEB-SESSION-TOKEN=icloud-session-secret; "
+            "X-APPLE-WEBAUTH-USER=icloud-user-secret; "
+            "X-APPLE-WEBAUTH-TOKEN=icloud-auth-secret"
+        )
+        return {
+            "name": "Apple parent",
+            "forwarding_email": "forwarding@example.com",
+            "session_import": f"curl '{url}' -H 'Cookie: {cookie}'",
+            "imap_host": "imap.example.com",
+            "imap_port": 993,
+            "imap_username": "forwarding@example.com",
+            "imap_password": "imap-password-secret",
+            "imap_folder": "INBOX",
+            "proxy": "socks5h://parent:proxy-password-secret@proxy.invalid:1080",
+        }
+
     def legacy_fixture(self):
         config = self.root / "workflow.json"
         mail = self.root / "hotmail.txt"
@@ -290,6 +315,188 @@ class WebConsoleTests(unittest.TestCase):
         self.assertNotIn("proxy-secret", serialized)
         self.assertNotIn("management-canary", serialized)
         self.assertTrue(payload["settings"]["secrets"]["proxy"])
+
+    def test_icloud_api_import_check_generate_and_deactivate_is_secret_safe(self):
+        created_remote = []
+        deactivated = []
+        checked_configs = []
+
+        class FakeHmeClient:
+            def list_settings(self):
+                return {
+                    "selectedForwardTo": "forwarding@example.com",
+                    "hmeEmails": [{"hme": "existing@icloud.com"}],
+                }
+
+            def create_alias(self, *, label, note):
+                index = len(created_remote) + 1
+                item = {
+                    "hme": f"generated-{index}@icloud.com",
+                    "anonymousId": f"remote-anonymous-secret-{index}",
+                    "recipientMailId": f"remote-recipient-secret-{index}",
+                    "label": label,
+                    "note": note,
+                }
+                created_remote.append(item)
+                return item
+
+            def activate_alias(self, anonymous_id):
+                del anonymous_id
+
+            def deactivate_alias(self, anonymous_id):
+                deactivated.append(anonymous_id)
+
+        clients = []
+
+        def factory(session, **kwargs):
+            clients.append((session, kwargs))
+            return FakeHmeClient()
+
+        self.controller.hme_client_factory = factory
+        self.controller.imap_checker = (
+            lambda config, **_kwargs: checked_configs.append(config)
+        )
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as client:
+            imported = client.post(
+                "/api/icloud-mailboxes",
+                json=self.icloud_payload(),
+                headers=self.origin_headers,
+            )
+            self.assertEqual(imported.status_code, 201, imported.text)
+            profile = imported.json()
+            self.assertEqual(profile["status"], "unchecked")
+            self.assertTrue(profile["proxy_configured"])
+
+            checked = client.post(
+                f"/api/icloud-mailboxes/{profile['id']}/check",
+                headers=self.origin_headers,
+            )
+            self.assertEqual(checked.status_code, 200, checked.text)
+            self.assertEqual(checked.json()["mailbox"]["status"], "ready")
+            self.assertEqual(checked.json()["remote_alias_count"], 1)
+
+            renamed = client.patch(
+                f"/api/icloud-mailboxes/{profile['id']}",
+                json={
+                    "name": "Apple parent renamed",
+                    "forwarding_email": "forwarding@example.com",
+                },
+                headers=self.origin_headers,
+            )
+            self.assertEqual(renamed.status_code, 200, renamed.text)
+            self.assertEqual(renamed.json()["status"], "ready")
+
+            generated = client.post(
+                f"/api/icloud-mailboxes/{profile['id']}/aliases",
+                json={"count": 2, "label_prefix": "Team child"},
+                headers=self.origin_headers,
+            )
+            self.assertEqual(generated.status_code, 201, generated.text)
+            result = generated.json()
+            self.assertEqual(result["created"], 2)
+            self.assertFalse(result["stopped"])
+
+            aliases = client.get(
+                f"/api/icloud-mailboxes/{profile['id']}/aliases",
+                headers=self.origin_headers,
+            )
+            self.assertEqual(aliases.status_code, 200)
+            first_alias = aliases.json()[0]
+            disabled = client.patch(
+                f"/api/icloud-aliases/{first_alias['id']}/state",
+                json={"state": "inactive"},
+                headers=self.origin_headers,
+            )
+            self.assertEqual(disabled.status_code, 200, disabled.text)
+            self.assertEqual(disabled.json()["state"], "inactive")
+
+            profiles = client.get(
+                "/api/icloud-mailboxes", headers=self.origin_headers
+            )
+            accounts = client.get("/api/accounts", headers=self.origin_headers)
+
+        self.assertEqual(len(checked_configs), 1)
+        self.assertEqual(checked_configs[0].password, "imap-password-secret")
+        self.assertEqual(
+            checked_configs[0].proxy,
+            "socks5h://parent:proxy-password-secret@proxy.invalid:1080",
+        )
+        self.assertEqual(clients[0][1]["proxy"], checked_configs[0].proxy)
+        self.assertIn(first_alias["email"], {
+            item["email"] for item in accounts.json()
+        })
+        disabled_account = self.database.get_account(first_alias["account_id"])
+        self.assertEqual(disabled_account["status"], "disabled")
+        self.assertEqual(deactivated, ["remote-anonymous-secret-2"])
+        serialized = json.dumps(
+            {
+                "imported": imported.json(),
+                "checked": checked.json(),
+                "generated": generated.json(),
+                "aliases": aliases.json(),
+                "profiles": profiles.json(),
+                "accounts": accounts.json(),
+            }
+        )
+        for secret in (
+            "icloud-session-secret",
+            "icloud-user-secret",
+            "icloud-auth-secret",
+            "imap-password-secret",
+            "proxy-password-secret",
+            "remote-anonymous-secret",
+            "remote-recipient-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+            for path in self.root.glob("console.db*"):
+                if path.is_file():
+                    self.assertNotIn(secret.encode(), path.read_bytes())
+
+    def test_icloud_generation_reports_partial_success_and_session_failure_safely(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        calls = []
+
+        class PartialClient:
+            def create_alias(self, **_kwargs):
+                calls.append(1)
+                if len(calls) == 2:
+                    raise HmeError("response-secret-that-must-not-leak")
+                return {
+                    "hme": "partial@icloud.com",
+                    "anonymousId": "partial-remote-secret",
+                }
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: PartialClient()
+        )
+        result = self.controller.generate_icloud_aliases(
+            profile["id"], {"count": 3, "label_prefix": "Partial"}
+        )
+
+        self.assertEqual(result["created"], 1)
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["failure_code"], "hme_request_failed")
+        self.assertEqual(
+            self.database.get_icloud_mailbox(profile["id"])["status"], "unchecked"
+        )
+        self.assertNotIn("response-secret", json.dumps(result))
+
+        class ExpiredClient:
+            def list_settings(self):
+                raise HmeSessionError("expired with cookie-secret-canary")
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: ExpiredClient()
+        )
+        with self.assertRaises(StateConflictError) as caught:
+            self.controller.check_icloud_mailbox(profile["id"])
+        self.assertNotIn("cookie-secret-canary", str(caught.exception))
+        self.assertEqual(
+            self.database.get_icloud_mailbox(profile["id"])["status"],
+            "session_invalid",
+        )
 
     def test_large_inventory_is_absent_from_bootstrap_and_sse_reset(self):
         before = len(json.dumps(self.controller.bootstrap(), sort_keys=True))

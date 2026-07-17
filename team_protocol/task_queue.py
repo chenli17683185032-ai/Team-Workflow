@@ -475,8 +475,8 @@ class TaskQueue:
         ):
             raise StateConflictError("account identity no longer matches the run snapshot")
 
-        old_credentials = self.database.get_account_credentials(old_account["id"])
-        new_credentials = self.database.get_account_credentials(new_account["id"])
+        old_credentials = self.database.get_resolved_account_credentials(old_account["id"])
+        new_credentials = self.database.get_resolved_account_credentials(new_account["id"])
         old_mailbox = self._mailbox(old_account, old_credentials)
         new_mailbox = self._mailbox(new_account, new_credentials)
 
@@ -723,6 +723,30 @@ class TaskQueue:
     def _mailbox(
         account: Mapping[str, Any], credentials: Mapping[str, Any]
     ) -> MailboxCredentials:
+        provider = str(credentials.get("provider") or "appleemail_hotmail").strip()
+        if provider == "icloud_hme_imap":
+            required = {
+                "forwarding_email": str(credentials.get("forwarding_email") or "").strip(),
+                "imap_host": str(credentials.get("imap_host") or "").strip(),
+                "imap_username": str(credentials.get("imap_username") or "").strip(),
+                "imap_password": str(credentials.get("imap_password") or ""),
+            }
+            if any(not value for value in required.values()):
+                raise StateConflictError("iCloud forwarding mailbox credentials are incomplete")
+            return MailboxCredentials(
+                primary_email=str(account["primary_email"]),
+                registration_email=str(account["email"]),
+                client_id="",
+                refresh_token="",
+                provider=provider,
+                forwarding_email=required["forwarding_email"],
+                imap_host=required["imap_host"],
+                imap_port=int(credentials.get("imap_port") or 993),
+                imap_username=required["imap_username"],
+                imap_password=required["imap_password"],
+                imap_folder=str(credentials.get("imap_folder") or "INBOX"),
+                mailbox_proxy=str(credentials.get("mailbox_proxy") or ""),
+            )
         client_id = str(credentials.get("client_id") or "").strip()
         refresh_token = str(credentials.get("refresh_token") or "").strip()
         if not client_id or not refresh_token:

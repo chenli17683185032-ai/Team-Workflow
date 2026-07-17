@@ -8,6 +8,9 @@
 - macOS 使用登录钥匙串保存随机主密钥，并以 AES-GCM 加密 SQLite 中的敏感字段；Windows 继续使用 DPAPI。
 - 支持为每个账号独立配置 S5 / SOCKS5 代理，并按“账号代理、全局模板、直连”的顺序回退。
 - 任务分别冻结旧号和新号的加密代理快照，失败重试保持原代理不漂移。
+- 支持导入 iCloud Hide My Email cURL/HAR，为每个母号独立配置 HME Session、真实转发邮箱 IMAP 和 S5。
+- 支持检测母号连接、批量生成 1-20 个隐藏邮箱，以及启用或停用已接入的 Alias。
+- iCloud Alias 生成后直接进入普通账号池，并继承对应母号的账号级 S5。
 
 ### 改进
 
@@ -16,17 +19,21 @@
 - 账号列表只暴露代理配置状态，代理 URL、用户名和密码不进入 API 响应或页面 DOM。
 - 邮箱验证码轮询优先读取收件箱最新邮件，并降低垃圾箱与完整历史扫描频率。
 - 邮箱请求使用剩余验证码等待时间作为超时上限，避免单次慢请求突破整体等待窗口。
+- 数据库升级到 schema v5，新增认证加密的 iCloud 母号和 Alias 元数据，并纳入备份恢复验证。
+- 新增 IMAP OTP Provider，以目标 Alias、邮件时间和已消费 UID 隔离同一转发邮箱中的验证码。
 
 ### 安全与隐私
 
 - 保留既有代理隔离、旧邮件基线、别名匹配与敏感日志脱敏规则。
+- HME Cookie、IMAP 密码、母号 S5 和 Apple 远端标识不进入 API、DOM、日志或 SQLite 明文。
 - 本次变更及提交元数据不包含真实账号、邮箱、空间标识、令牌、密钥或本机路径。
 
 ### 验证
 
-- macOS：`python -B -m unittest discover -s tests -v`，189 项通过，6 项 Windows DPAPI 测试按平台跳过。
+- macOS：`python -B -m unittest discover -s tests -v`，215 项通过，6 项 Windows DPAPI 测试按平台跳过。
 - `node --check team_protocol/web_static/app.js`：通过。
 - 真实 macOS Keychain 加密往返、默认数据目录启动、首页与 bootstrap、账号代理保存及正常停止均通过。
+- iCloud 使用模拟 HME/IMAP 完成端到端回归，并在 `1440×900` 桌面控制台完成虚拟母号保存、密文扫描和 DOM 秘密清理验收；未使用真实 Apple 凭据或创建远端 Alias。
 
 ## 2026-07-16
 

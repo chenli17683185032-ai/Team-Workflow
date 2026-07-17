@@ -34,17 +34,40 @@ class MailboxCredentials:
     client_id: str
     refresh_token: str
     password: str = ""
+    provider: str = "appleemail_hotmail"
+    forwarding_email: str = ""
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_username: str = ""
+    imap_password: str = ""
+    imap_folder: str = "INBOX"
+    mailbox_proxy: str = ""
 
     def as_auth_credential(self) -> str:
-        return json.dumps(
-            {
+        if self.provider == "icloud_hme_imap":
+            payload = {
+                "provider": self.provider,
+                "primary_email": self.primary_email,
+                "registration_email": self.registration_email,
+                "forwarding_email": self.forwarding_email or self.primary_email,
+                "imap_host": self.imap_host,
+                "imap_port": int(self.imap_port),
+                "imap_username": self.imap_username,
+                "imap_password": self.imap_password,
+                "imap_folder": self.imap_folder,
+                "mailbox_proxy": self.mailbox_proxy,
+            }
+        else:
+            payload = {
                 "provider": "appleemail_hotmail",
                 "primary_email": self.primary_email,
                 "registration_email": self.registration_email,
                 "client_id": self.client_id,
                 "refresh_token": self.refresh_token,
                 "password": self.password,
-            },
+            }
+        return json.dumps(
+            payload,
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -284,6 +307,7 @@ class RegistrarAdapter:
         from .registrar_runtime import (
             appleemail_provider,
             fingerprint_profiles,
+            icloud_imap_provider,
             register,
             sentinel_browser,
         )
@@ -293,6 +317,7 @@ class RegistrarAdapter:
         self._register_module = register
         self._event_emitter = register.EventEmitter
         self._provider_class = appleemail_provider.AppleEmailHotmailProvider
+        self._icloud_provider_class = icloud_imap_provider.ICloudImapProvider
         self._mailbox_identity_error_class = (
             appleemail_provider.MailboxCredentialsInvalidError
         )
@@ -388,9 +413,20 @@ class RegistrarAdapter:
             provider_initial_state, Mapping
         ):
             raise TypeError("provider_initial_state must be a mapping")
-        provider = self._provider_class(
+        provider_name = str(mailbox.provider or "appleemail_hotmail").strip().casefold()
+        if provider_name == "appleemail_hotmail":
+            provider_class = self._provider_class
+        elif provider_name == "icloud_hme_imap":
+            provider_class = self._icloud_provider_class
+        else:
+            raise ValueError("unsupported mailbox provider")
+        provider = provider_class(
             accounts=[],
-            api_base="https://www.appleemail.top",
+            **(
+                {"api_base": "https://www.appleemail.top"}
+                if provider_name == "appleemail_hotmail"
+                else {}
+            ),
             initial_state=dict(provider_initial_state or {}),
             state_callback=provider_state_callback,
         )
@@ -482,7 +518,7 @@ class RegistrarAdapter:
                         account_password=internal_password,
                         proxy=proxy,
                         mail_provider=provider,
-                        mail_provider_name="appleemail_hotmail",
+                        mail_provider_name=provider_name,
                         mail_auth_credential=mailbox.as_auth_credential(),
                         session_profile=session_profile,
                         emitter=emitter,

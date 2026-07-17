@@ -37,6 +37,13 @@ from .database import (
     ValidationError,
     default_app_dir,
 )
+from .icloud_hme import (
+    HmeClient,
+    HmeError,
+    HmeSessionError,
+    ICloudHmeSession,
+    parse_hme_session_import,
+)
 from .migration import (
     CleanupResult,
     MigrationBackupError,
@@ -54,6 +61,12 @@ from .migration import (
     verify_backup,
 )
 from .secret_store import SecretStore, SecretStoreError
+from .registrar_runtime.appleemail_provider import MailboxCredentialsInvalidError
+from .registrar_runtime.icloud_imap_provider import (
+    ImapMailboxConfig,
+    ImapMailboxError,
+    check_imap_mailbox,
+)
 from .sub2api import Sub2APIClient, Sub2APIError
 from .task_queue import TaskQueue, redact_value
 
@@ -108,6 +121,14 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
         "sub2api_api_key",
         "sub2api_totp_secret",
         "proxy",
+        "cookie",
+        "session",
+        "session_import",
+        "imap_password",
+        "mailbox_proxy",
+        "remote_metadata",
+        "anonymousid",
+        "recipientmailid",
     }
 )
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -263,6 +284,44 @@ class AccountProxyRequest(StrictModel):
     proxy: str = Field(default="", max_length=4096)
 
 
+class ICloudMailboxCreateRequest(StrictModel):
+    name: str = Field(min_length=1, max_length=160)
+    forwarding_email: str = Field(min_length=3, max_length=320)
+    session_import: str = Field(min_length=1, max_length=2_000_000)
+    imap_host: str = Field(min_length=1, max_length=320)
+    imap_port: int = Field(default=993, ge=1, le=65535)
+    imap_username: str = Field(min_length=1, max_length=320)
+    imap_password: str = Field(min_length=1, max_length=4096)
+    imap_folder: str = Field(default="INBOX", min_length=1, max_length=320)
+    proxy: str = Field(default="", max_length=4096)
+
+
+class ICloudMailboxUpdateRequest(StrictModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    forwarding_email: str | None = Field(default=None, min_length=3, max_length=320)
+    session_import: str | None = Field(default=None, min_length=1, max_length=2_000_000)
+    imap_host: str | None = Field(default=None, min_length=1, max_length=320)
+    imap_port: int | None = Field(default=None, ge=1, le=65535)
+    imap_username: str | None = Field(default=None, min_length=1, max_length=320)
+    imap_password: str | None = Field(default=None, max_length=4096)
+    imap_folder: str | None = Field(default=None, min_length=1, max_length=320)
+    proxy: str | None = Field(default=None, max_length=4096)
+    clear_proxy: bool = False
+
+
+class ICloudAliasBatchRequest(StrictModel):
+    count: int = Field(default=1, ge=1, le=20)
+    label_prefix: str = Field(default="Team Workflow", min_length=1, max_length=100)
+
+
+class ICloudMailboxStatusRequest(StrictModel):
+    status: Literal["disabled", "unchecked"]
+
+
+class ICloudAliasStateRequest(StrictModel):
+    state: Literal["active", "inactive"]
+
+
 class QueueEnqueueRequest(StrictModel):
     workspace_ids: list[str] = Field(min_length=1, max_length=500)
 
@@ -324,6 +383,8 @@ class WebConsoleController:
         backup_dir: str | Path | None = None,
         legacy_config_path: str | Path | None = None,
         inventory_expected_count: int | None = None,
+        hme_client_factory: Any = HmeClient,
+        imap_checker: Any = check_imap_mailbox,
     ) -> None:
         self.app_dir = (
             Path(app_dir).expanduser().resolve()
@@ -351,6 +412,9 @@ class WebConsoleController:
             else max(1, int(inventory_expected_count))
         )
         self.request_token = secrets.token_urlsafe(32)
+        self.hme_client_factory = hme_client_factory
+        self.imap_checker = imap_checker
+        self._icloud_operation_lock = threading.Lock()
         self._dialog_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._started = False
@@ -701,6 +765,355 @@ class WebConsoleController:
         )
         self.task_queue.notify_change()
         return _safe_payload(account)
+
+    def _icloud_secret_from_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        existing: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = dict(existing or {})
+        current_session = current.get("session")
+        imported = payload.get("session_import")
+        if imported is not None:
+            try:
+                session = parse_hme_session_import(str(imported)).as_secret_dict()
+            except HmeSessionError as exc:
+                raise FieldInputError({"session_import": str(exc)}) from exc
+        elif isinstance(current_session, Mapping):
+            session = dict(current_session)
+        else:
+            raise FieldInputError({"session_import": "iCloud HME session is required"})
+
+        current_imap = current.get("imap")
+        imap = dict(current_imap) if isinstance(current_imap, Mapping) else {}
+        fields = {
+            "host": "imap_host",
+            "port": "imap_port",
+            "username": "imap_username",
+            "folder": "imap_folder",
+        }
+        for target, source in fields.items():
+            if source in payload and payload[source] is not None:
+                imap[target] = payload[source]
+        if "imap_password" in payload and payload["imap_password"]:
+            imap["password"] = str(payload["imap_password"])
+        if not existing and not str(payload.get("imap_password") or ""):
+            raise FieldInputError({"imap_password": "IMAP password is required"})
+
+        if bool(payload.get("clear_proxy")) and str(payload.get("proxy") or "").strip():
+            raise FieldInputError({"proxy": "proxy cannot be set and cleared together"})
+        proxy = str(current.get("proxy") or "").strip()
+        if bool(payload.get("clear_proxy")):
+            proxy = ""
+        elif "proxy" in payload and str(payload.get("proxy") or "").strip():
+            proxy = str(payload["proxy"]).strip()
+        return {"session": session, "imap": imap, "proxy": proxy}
+
+    def create_icloud_mailbox(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        secret = self._icloud_secret_from_payload(payload)
+        mailbox = self.database.create_icloud_mailbox(
+            name=str(payload.get("name") or "").strip(),
+            forwarding_email=str(payload.get("forwarding_email") or "").strip(),
+            secrets=secret,
+        )
+        self.task_queue.notify_change()
+        return _safe_payload(mailbox)
+
+    def update_icloud_mailbox(
+        self, mailbox_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        current_secret = self.database.get_icloud_mailbox_secrets(str(mailbox_id))
+        secret_fields = {
+            "session_import",
+            "imap_host",
+            "imap_port",
+            "imap_username",
+            "imap_password",
+            "imap_folder",
+            "proxy",
+            "clear_proxy",
+        }
+        secret = (
+            self._icloud_secret_from_payload(payload, existing=current_secret)
+            if set(payload) & secret_fields
+            else None
+        )
+        mailbox = self.database.update_icloud_mailbox(
+            str(mailbox_id),
+            name=(str(payload["name"]).strip() if "name" in payload else None),
+            forwarding_email=(
+                str(payload["forwarding_email"]).strip()
+                if "forwarding_email" in payload
+                else None
+            ),
+            secrets=secret,
+        )
+        self.task_queue.notify_change()
+        return _safe_payload(mailbox)
+
+    def list_icloud_mailboxes(self) -> list[dict[str, Any]]:
+        return _safe_payload(self.database.list_icloud_mailboxes())
+
+    def list_icloud_aliases(self, mailbox_id: str) -> list[dict[str, Any]]:
+        self.database.get_icloud_mailbox(str(mailbox_id))
+        return _safe_payload(self.database.list_icloud_aliases(str(mailbox_id)))
+
+    def _icloud_client(self, mailbox_id: str) -> tuple[dict[str, Any], Any]:
+        mailbox = self.database.get_icloud_mailbox(mailbox_id)
+        secret = self.database.get_icloud_mailbox_secrets(mailbox_id)
+        session_value = secret.get("session")
+        if not isinstance(session_value, Mapping):
+            raise StateConflictError("iCloud HME session is missing")
+        try:
+            session = ICloudHmeSession.from_mapping(session_value)
+        except HmeSessionError as exc:
+            raise StateConflictError("iCloud HME session is invalid") from exc
+        client = self.hme_client_factory(
+            session,
+            proxy=str(secret.get("proxy") or ""),
+            timeout=20.0,
+        )
+        return secret, client
+
+    @staticmethod
+    def _imap_config(
+        mailbox: Mapping[str, Any], secret: Mapping[str, Any]
+    ) -> ImapMailboxConfig:
+        imap = secret.get("imap")
+        if not isinstance(imap, Mapping):
+            raise StateConflictError("iCloud forwarding mailbox is missing")
+        config = ImapMailboxConfig(
+            registration_email=str(mailbox["forwarding_email"]),
+            forwarding_email=str(mailbox["forwarding_email"]),
+            host=str(imap.get("host") or ""),
+            port=int(imap.get("port") or 993),
+            username=str(imap.get("username") or ""),
+            password=str(imap.get("password") or ""),
+            folder=str(imap.get("folder") or "INBOX"),
+            proxy=str(secret.get("proxy") or ""),
+        )
+        try:
+            config.validate()
+        except ValueError as exc:
+            raise StateConflictError("iCloud forwarding mailbox is invalid") from exc
+        return config
+
+    def check_icloud_mailbox(self, mailbox_id: str) -> dict[str, Any]:
+        mailbox_id = str(mailbox_id)
+        if not self._icloud_operation_lock.acquire(blocking=False):
+            raise StateConflictError("another iCloud mailbox operation is running")
+        try:
+            mailbox = self.database.get_icloud_mailbox(mailbox_id)
+            secret, client = self._icloud_client(mailbox_id)
+            try:
+                settings = client.list_settings()
+            except HmeSessionError as exc:
+                self.database.set_icloud_mailbox_status(
+                    mailbox_id,
+                    "session_invalid",
+                    failure_code="session_rejected",
+                    failure_message="iCloud HME session was rejected",
+                    checked=True,
+                )
+                raise StateConflictError("iCloud HME session was rejected") from exc
+            except HmeError as exc:
+                self.database.set_icloud_mailbox_status(
+                    mailbox_id,
+                    "unchecked",
+                    failure_code="hme_unavailable",
+                    failure_message="iCloud HME check failed",
+                    checked=True,
+                )
+                raise StateConflictError("iCloud HME check failed") from exc
+
+            selected_forward = str(settings.get("selectedForwardTo") or "").strip().casefold()
+            if selected_forward and selected_forward != str(
+                mailbox["forwarding_email"]
+            ).casefold():
+                self.database.set_icloud_mailbox_status(
+                    mailbox_id,
+                    "unchecked",
+                    failure_code="forwarding_mismatch",
+                    failure_message="iCloud forwarding address does not match",
+                    checked=True,
+                )
+                raise StateConflictError("iCloud forwarding address does not match")
+            try:
+                self.imap_checker(self._imap_config(mailbox, secret), timeout=15.0)
+            except MailboxCredentialsInvalidError as exc:
+                self.database.set_icloud_mailbox_status(
+                    mailbox_id,
+                    "imap_invalid",
+                    failure_code="imap_credentials_invalid",
+                    failure_message="IMAP credentials were rejected",
+                    checked=True,
+                )
+                raise StateConflictError("IMAP credentials were rejected") from exc
+            except (ImapMailboxError, OSError, TimeoutError) as exc:
+                self.database.set_icloud_mailbox_status(
+                    mailbox_id,
+                    "unchecked",
+                    failure_code="imap_unavailable",
+                    failure_message="IMAP connection check failed",
+                    checked=True,
+                )
+                raise StateConflictError("IMAP connection check failed") from exc
+
+            aliases = settings.get("hmeEmails") or []
+            checked = self.database.set_icloud_mailbox_status(
+                mailbox_id, "ready", checked=True
+            )
+            self.task_queue.notify_change()
+            return _safe_payload(
+                {
+                    "mailbox": checked,
+                    "remote_alias_count": len(aliases) if isinstance(aliases, list) else 0,
+                    "selected_forward_to": selected_forward,
+                }
+            )
+        finally:
+            self._icloud_operation_lock.release()
+
+    def generate_icloud_aliases(
+        self, mailbox_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        mailbox_id = str(mailbox_id)
+        count = int(payload.get("count") or 1)
+        if not 1 <= count <= 20:
+            raise FieldInputError({"count": "count must be between 1 and 20"})
+        prefix = str(payload.get("label_prefix") or "Team Workflow").strip()
+        if not prefix or len(prefix) > 100:
+            raise FieldInputError({"label_prefix": "label prefix is invalid"})
+        mailbox = self.database.get_icloud_mailbox(mailbox_id)
+        if mailbox["status"] != "ready":
+            raise StateConflictError("iCloud mailbox must pass detection before generation")
+        if not self._icloud_operation_lock.acquire(blocking=False):
+            raise StateConflictError("another iCloud mailbox operation is running")
+        created: list[dict[str, Any]] = []
+        failure_code: str | None = None
+        try:
+            _secret, client = self._icloud_client(mailbox_id)
+            start = int(mailbox["alias_count"])
+            for index in range(count):
+                label = f"{prefix} {start + index + 1}"
+                try:
+                    remote = client.create_alias(
+                        label=label,
+                        note=f"Team Workflow profile {mailbox_id}",
+                    )
+                except HmeSessionError:
+                    failure_code = "session_rejected"
+                    self.database.set_icloud_mailbox_status(
+                        mailbox_id,
+                        "session_invalid",
+                        failure_code=failure_code,
+                        failure_message="iCloud HME session was rejected",
+                        checked=True,
+                    )
+                    break
+                except HmeError:
+                    failure_code = "hme_request_failed"
+                    self.database.set_icloud_mailbox_status(
+                        mailbox_id,
+                        "unchecked",
+                        failure_code=failure_code,
+                        failure_message="iCloud alias generation failed",
+                    )
+                    break
+                email_address = str(remote.get("hme") or "").strip().casefold()
+                if not email_address:
+                    failure_code = "invalid_reserve_response"
+                    break
+                try:
+                    stored = self.database.create_icloud_alias(
+                        mailbox_id,
+                        email=email_address,
+                        remote_metadata=remote,
+                        label=label,
+                    )
+                except DatabaseError:
+                    anonymous_id = str(remote.get("anonymousId") or "").strip()
+                    if anonymous_id:
+                        try:
+                            client.deactivate_alias(anonymous_id)
+                        except HmeError:
+                            pass
+                    if not created:
+                        raise
+                    failure_code = "local_persistence_failed"
+                    break
+                created.append(stored)
+            self.task_queue.notify_change()
+            if not created and failure_code:
+                raise StateConflictError(
+                    "iCloud alias generation stopped before an alias was stored"
+                )
+            return _safe_payload(
+                {
+                    "requested": count,
+                    "created": len(created),
+                    "stopped": len(created) != count,
+                    "failure_code": failure_code,
+                    "items": created,
+                    "mailbox": self.database.get_icloud_mailbox(mailbox_id),
+                }
+            )
+        finally:
+            self._icloud_operation_lock.release()
+
+    def update_icloud_mailbox_status(
+        self, mailbox_id: str, status_value: str
+    ) -> dict[str, Any]:
+        if status_value not in {"disabled", "unchecked"}:
+            raise FieldInputError({"status": "status must be disabled or unchecked"})
+        mailbox = self.database.set_icloud_mailbox_status(
+            str(mailbox_id), status_value
+        )
+        self.task_queue.notify_change()
+        return _safe_payload(mailbox)
+
+    def update_icloud_alias_state(
+        self, alias_id: str, state_value: str
+    ) -> dict[str, Any]:
+        if state_value not in {"active", "inactive"}:
+            raise FieldInputError({"state": "state must be active or inactive"})
+        alias = self.database.get_icloud_alias(str(alias_id))
+        if alias["state"] == state_value:
+            return _safe_payload(alias)
+        account = self.database.get_account(alias["account_id"])
+        if account["status"] in {"bound_current", "bound_next"}:
+            raise StateConflictError("a bound iCloud alias cannot change remote state")
+        mailbox = self.database.get_icloud_mailbox(alias["mailbox_id"])
+        if mailbox["status"] != "ready":
+            raise StateConflictError("iCloud mailbox is not ready")
+        _secret, client = self._icloud_client(alias["mailbox_id"])
+        remote = self.database.get_icloud_alias_remote(str(alias_id))
+        anonymous_id = str(remote.get("anonymousId") or "").strip()
+        if not anonymous_id:
+            raise StateConflictError("iCloud alias remote identifier is missing")
+        try:
+            if state_value == "active":
+                client.activate_alias(anonymous_id)
+            else:
+                client.deactivate_alias(anonymous_id)
+        except HmeSessionError as exc:
+            self.database.set_icloud_mailbox_status(
+                alias["mailbox_id"],
+                "session_invalid",
+                failure_code="session_rejected",
+                failure_message="iCloud HME session was rejected",
+            )
+            raise StateConflictError("iCloud HME session was rejected") from exc
+        except HmeError as exc:
+            raise StateConflictError("iCloud alias state update failed") from exc
+        updated = self.database.set_icloud_alias_state(str(alias_id), state_value)
+        if state_value == "inactive" and account["status"] == "available":
+            self.database.transition_account_status(account["id"], "disabled")
+        elif state_value == "active" and account["status"] == "disabled":
+            self.database.transition_account_status(account["id"], "available")
+        self.task_queue.notify_change()
+        return _safe_payload(self.database.get_icloud_alias(str(alias_id)))
 
     def queue_snapshot(self) -> dict[str, Any]:
         return _safe_payload(self.task_queue.snapshot())
@@ -1238,6 +1651,67 @@ def create_app(
     async def update_account_proxy(account_id: str, request: AccountProxyRequest):
         return await _call_controller(
             controller.update_account_proxy, account_id, request.proxy
+        )
+
+    @app.get("/api/icloud-mailboxes")
+    async def list_icloud_mailboxes():
+        return await _call_controller(controller.list_icloud_mailboxes)
+
+    @app.post("/api/icloud-mailboxes", status_code=status.HTTP_201_CREATED)
+    async def create_icloud_mailbox(request: ICloudMailboxCreateRequest):
+        return await _call_controller(
+            controller.create_icloud_mailbox, request.model_dump()
+        )
+
+    @app.patch("/api/icloud-mailboxes/{mailbox_id}")
+    async def update_icloud_mailbox(
+        mailbox_id: str, request: ICloudMailboxUpdateRequest
+    ):
+        return await _call_controller(
+            controller.update_icloud_mailbox,
+            mailbox_id,
+            request.model_dump(exclude_unset=True),
+        )
+
+    @app.post("/api/icloud-mailboxes/{mailbox_id}/check")
+    async def check_icloud_mailbox(mailbox_id: str):
+        return await _call_controller(controller.check_icloud_mailbox, mailbox_id)
+
+    @app.post(
+        "/api/icloud-mailboxes/{mailbox_id}/aliases",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def generate_icloud_aliases(
+        mailbox_id: str, request: ICloudAliasBatchRequest
+    ):
+        return await _call_controller(
+            controller.generate_icloud_aliases,
+            mailbox_id,
+            request.model_dump(),
+        )
+
+    @app.get("/api/icloud-mailboxes/{mailbox_id}/aliases")
+    async def list_icloud_aliases(mailbox_id: str):
+        return await _call_controller(controller.list_icloud_aliases, mailbox_id)
+
+    @app.patch("/api/icloud-mailboxes/{mailbox_id}/status")
+    async def update_icloud_mailbox_status(
+        mailbox_id: str, request: ICloudMailboxStatusRequest
+    ):
+        return await _call_controller(
+            controller.update_icloud_mailbox_status,
+            mailbox_id,
+            request.status,
+        )
+
+    @app.patch("/api/icloud-aliases/{alias_id}/state")
+    async def update_icloud_alias_state(
+        alias_id: str, request: ICloudAliasStateRequest
+    ):
+        return await _call_controller(
+            controller.update_icloud_alias_state,
+            alias_id,
+            request.state,
         )
 
     @app.get("/api/queue")

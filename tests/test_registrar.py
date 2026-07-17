@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import subprocess
 import sys
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -86,6 +87,17 @@ class RegistrarTests(unittest.TestCase):
             registration_email="main+1@example.com",
             client_id="client-id",
             refresh_token="refresh-token",
+        )
+
+    @classmethod
+    def _apple_mailbox(cls):
+        mailbox = cls._mailbox()
+        return AppleEmailMailbox(
+            primary_email=mailbox.primary_email,
+            registration_email=mailbox.registration_email,
+            client_id=mailbox.client_id,
+            refresh_token=mailbox.refresh_token,
+            password=mailbox.password,
         )
 
     def test_primary_email_for_alias(self):
@@ -183,6 +195,43 @@ class RegistrarTests(unittest.TestCase):
         )
         self.assertEqual(restored.profile_id, profile.profile_id)
         self.assertEqual(restored.impersonate, profile.impersonate)
+
+    def test_adapter_selects_icloud_imap_provider_without_changing_outlook_default(self):
+        captured = {}
+
+        class Provider:
+            def __init__(self, **kwargs):
+                captured["provider_kwargs"] = kwargs
+
+        adapter = self._adapter_for_login(
+            {"ok": True, "token_data": {"access_token": "token"}}
+        )
+        adapter._icloud_provider_class = Provider
+        mailbox = MailboxCredentials(
+            primary_email="forwarding@example.com",
+            registration_email="hidden@icloud.com",
+            client_id="",
+            refresh_token="",
+            provider="icloud_hme_imap",
+            forwarding_email="forwarding@example.com",
+            imap_host="imap.example.com",
+            imap_username="forwarding@example.com",
+            imap_password="imap-secret",
+            mailbox_proxy="socks5h://parent:proxy-secret@proxy.invalid:1080",
+        )
+
+        adapter.login(
+            email="hidden@icloud.com",
+            account_password="",
+            mailbox=mailbox,
+            verbose=False,
+        )
+
+        payload = json.loads(mailbox.as_auth_credential())
+        self.assertEqual(payload["provider"], "icloud_hme_imap")
+        self.assertEqual(payload["imap_password"], "imap-secret")
+        self.assertNotIn("refresh_token", payload)
+        self.assertNotIn("api_base", captured["provider_kwargs"])
 
     def test_offline_cli_import_does_not_load_registrar_network_dependencies(self):
         script = """
@@ -419,7 +468,7 @@ import team_protocol.cli
 
     def test_provider_propagates_only_explicit_mailbox_auth_rejection(self):
         provider = AppleEmailHotmailProvider(accounts=[])
-        mailbox = AppleEmailMailbox(**vars(self._mailbox()))
+        mailbox = self._apple_mailbox()
         explicit = SimpleNamespace(
             status_code=400,
             text='{"error":"invalid_grant"}',
@@ -446,7 +495,7 @@ import team_protocol.cli
             accounts=[],
             full_scan_interval_seconds=5,
         )
-        mailbox = AppleEmailMailbox(**vars(self._mailbox()))
+        mailbox = self._apple_mailbox()
         calls = []
 
         def post(url, **kwargs):
@@ -475,7 +524,7 @@ import team_protocol.cli
             accounts=[],
             full_scan_interval_seconds=0,
         )
-        mailbox = AppleEmailMailbox(**vars(self._mailbox()))
+        mailbox = self._apple_mailbox()
         calls = []
 
         def post(url, **kwargs):

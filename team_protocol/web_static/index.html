@@ -118,13 +118,15 @@
           <h1 id="accounts-title">账号库</h1>
         </div>
         <div class="heading-actions">
-          <button type="button" class="button button--primary" data-action="open-account-import">导入 Outlook / Hotmail TXT</button>
+          <button type="button" class="button" data-action="open-account-import">导入 Outlook / Hotmail TXT</button>
+          <button type="button" class="button button--primary" data-action="open-icloud-mailbox">添加 iCloud 母号</button>
         </div>
       </header>
 
       <div class="section-tabs" role="tablist" aria-label="账号库视图">
-        <button type="button" id="account-used-tab" class="is-active" role="tab" aria-selected="true" aria-controls="account-used-panel" data-action="select-account-view" data-account-view="used">已用账号</button>
-        <button type="button" id="account-inventory-tab" role="tab" aria-selected="false" aria-controls="account-inventory-panel" data-action="select-account-view" data-account-view="inventory">邮箱库存</button>
+        <button type="button" id="account-used-tab" class="is-active" role="tab" aria-selected="true" aria-controls="account-used-panel" data-action="select-account-view" data-account-view="used">账号池</button>
+        <button type="button" id="account-inventory-tab" role="tab" aria-selected="false" aria-controls="account-inventory-panel" data-action="select-account-view" data-account-view="inventory">Outlook 母邮箱</button>
+        <button type="button" id="account-icloud-tab" role="tab" aria-selected="false" aria-controls="account-icloud-panel" data-action="select-account-view" data-account-view="icloud">iCloud 隐藏邮箱</button>
       </div>
 
       <div id="account-used-panel" role="tabpanel" aria-labelledby="account-used-tab">
@@ -198,6 +200,25 @@
             <thead><tr><th scope="col">主邮箱</th><th scope="col">状态</th><th scope="col">下一个子号</th><th scope="col">最近失效</th><th class="actions-cell" scope="col">操作</th></tr></thead>
             <tbody id="inventory-table-body">
               <tr class="empty-row"><td colspan="5">输入邮箱搜索库存</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="account-icloud-panel" role="tabpanel" aria-labelledby="account-icloud-tab" hidden>
+        <div class="table-toolbar icloud-toolbar">
+          <div class="segmented-control" aria-label="iCloud 母号操作">
+            <button type="button" data-action="refresh-icloud-mailboxes">刷新</button>
+            <button type="button" data-action="open-icloud-mailbox">添加母号</button>
+          </div>
+          <span class="inventory-search-status" id="icloud-mailbox-status" role="status" aria-live="polite">尚未载入</span>
+        </div>
+        <div class="table-frame">
+          <table class="data-table icloud-mailbox-table">
+            <caption class="sr-only">iCloud 隐藏邮箱母号与连接状态</caption>
+            <thead><tr><th scope="col">母号</th><th scope="col">状态</th><th scope="col">Alias</th><th scope="col">HME Session</th><th scope="col">IMAP</th><th scope="col">母号 S5</th><th scope="col">最近检测</th><th class="actions-cell" scope="col">操作</th></tr></thead>
+            <tbody id="icloud-mailbox-table-body">
+              <tr class="empty-row"><td colspan="8">尚未添加 iCloud 母号</td></tr>
             </tbody>
           </table>
         </div>
@@ -442,6 +463,85 @@
         <button type="submit" class="button button--primary">保存代理</button>
       </footer>
     </form>
+  </dialog>
+
+  <dialog class="side-dialog side-dialog--detail" id="icloud-mailbox-dialog" aria-labelledby="icloud-mailbox-dialog-title">
+    <form method="dialog" class="dialog-shell" id="icloud-mailbox-form" novalidate>
+      <header class="dialog-header">
+        <div><p class="eyebrow">ICLOUD HIDE MY EMAIL</p><h2 id="icloud-mailbox-dialog-title">添加 iCloud 母号</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭 iCloud 母号编辑">×</button>
+      </header>
+      <div class="dialog-content">
+        <input type="hidden" name="mailbox_id">
+        <div class="form-grid form-grid--two">
+          <label class="field"><span>母号名称</span><input name="name" type="text" maxlength="160" required autocomplete="off"></label>
+          <label class="field"><span>转发邮箱</span><input name="forwarding_email" type="email" maxlength="320" required autocomplete="username" spellcheck="false"></label>
+        </div>
+        <label class="field"><span>iCloud HME cURL / HAR</span><textarea name="session_import" maxlength="2000000" spellcheck="false" autocomplete="off"></textarea></label>
+        <div class="form-grid form-grid--imap">
+          <label class="field"><span>IMAP 主机</span><input name="imap_host" type="text" maxlength="320" required autocomplete="off" spellcheck="false"></label>
+          <label class="field"><span>端口</span><input name="imap_port" type="number" min="1" max="65535" value="993" required inputmode="numeric"></label>
+          <label class="field"><span>目录</span><input name="imap_folder" type="text" maxlength="320" value="INBOX" required autocomplete="off"></label>
+        </div>
+        <div class="form-grid form-grid--two">
+          <label class="field"><span>IMAP 用户名</span><input name="imap_username" type="text" maxlength="320" required autocomplete="username" spellcheck="false"></label>
+          <label class="field"><span>IMAP 授权码 / 密码</span><input name="imap_password" type="password" maxlength="4096" autocomplete="new-password"></label>
+        </div>
+        <label class="field"><span>母号 S5</span><input name="proxy" type="password" maxlength="4096" placeholder="socks5h://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
+        <label class="check-control" id="icloud-clear-proxy-control" hidden><input name="clear_proxy" type="checkbox"><span aria-hidden="true"></span>清除已保存的母号 S5</label>
+        <div class="form-error" id="icloud-mailbox-form-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">取消</button>
+        <button type="submit" class="button button--primary">保存母号</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal-dialog" id="icloud-generate-dialog" aria-labelledby="icloud-generate-title">
+    <form method="dialog" class="dialog-shell" id="icloud-generate-form" novalidate>
+      <header class="dialog-header">
+        <div><p class="eyebrow">HIDE MY EMAIL</p><h2 id="icloud-generate-title">生成隐藏邮箱</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭隐藏邮箱生成">×</button>
+      </header>
+      <div class="dialog-content">
+        <input type="hidden" name="mailbox_id">
+        <dl class="allocation-preview">
+          <div><dt>母号</dt><dd id="icloud-generate-mailbox">-</dd></div>
+          <div><dt>转发邮箱</dt><dd id="icloud-generate-forwarding">-</dd></div>
+        </dl>
+        <div class="form-grid form-grid--two">
+          <label class="field"><span>生成数量</span><input name="count" type="number" min="1" max="20" value="1" required inputmode="numeric"></label>
+          <label class="field"><span>iCloud 标签前缀</span><input name="label_prefix" type="text" maxlength="100" value="Team Workflow" required autocomplete="off"></label>
+        </div>
+        <div class="form-error" id="icloud-generate-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">取消</button>
+        <button type="submit" class="button button--primary">开始生成</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="side-dialog side-dialog--detail" id="icloud-alias-dialog" aria-labelledby="icloud-alias-title">
+    <div class="dialog-shell">
+      <header class="dialog-header">
+        <div><p class="eyebrow">ICLOUD ALIASES</p><h2 id="icloud-alias-title">隐藏邮箱</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭隐藏邮箱列表">×</button>
+      </header>
+      <div class="dialog-content">
+        <div class="table-frame table-frame--standalone">
+          <table class="data-table icloud-alias-table">
+            <caption class="sr-only">iCloud 隐藏邮箱列表</caption>
+            <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">远端状态</th><th scope="col">账号状态</th><th scope="col">创建时间</th><th class="actions-cell" scope="col">操作</th></tr></thead>
+            <tbody id="icloud-alias-table-body"><tr class="loading-row"><td colspan="5"><span class="inline-loader" aria-hidden="true"></span>正在载入隐藏邮箱…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">关闭</button>
+      </footer>
+    </div>
   </dialog>
 
   <div class="toast-region" id="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>

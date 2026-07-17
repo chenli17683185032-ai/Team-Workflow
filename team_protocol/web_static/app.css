@@ -562,6 +562,7 @@ main {
 
 .search-control input,
 .field input,
+.field textarea,
 .field select,
 .select-control select,
 .date-control input {
@@ -573,6 +574,15 @@ main {
   color: var(--ink);
   background: #fff;
   border-radius: var(--radius);
+}
+
+.field textarea {
+  min-height: 168px;
+  padding: 10px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .search-control input {
@@ -781,6 +791,25 @@ input[readonly] {
 .inventory-table th:nth-child(3) { width: 18%; }
 .inventory-table th:nth-child(4) { width: 22%; }
 .inventory-table th:nth-child(5) { width: 120px; }
+
+.icloud-mailbox-table th:nth-child(1) { width: 20%; }
+.icloud-mailbox-table th:nth-child(2) { width: 9%; }
+.icloud-mailbox-table th:nth-child(3) { width: 7%; }
+.icloud-mailbox-table th:nth-child(4) { width: 10%; }
+.icloud-mailbox-table th:nth-child(5) { width: 8%; }
+.icloud-mailbox-table th:nth-child(6) { width: 8%; }
+.icloud-mailbox-table th:nth-child(7) { width: 13%; }
+.icloud-mailbox-table th:nth-child(8) { width: 25%; }
+
+.icloud-alias-table th:nth-child(1) { width: 34%; }
+.icloud-alias-table th:nth-child(2) { width: 14%; }
+.icloud-alias-table th:nth-child(3) { width: 16%; }
+.icloud-alias-table th:nth-child(4) { width: 20%; }
+.icloud-alias-table th:nth-child(5) { width: 16%; }
+
+.icloud-mailbox-table .row-actions {
+  gap: 2px;
+}
 
 .run-table th:nth-child(1) { width: 18%; }
 .run-table th:nth-child(2) { width: 24%; }
@@ -1010,6 +1039,19 @@ input[readonly] {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
   gap: 16px;
+}
+
+.form-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.form-grid--two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.form-grid--imap {
+  grid-template-columns: minmax(0, 1fr) 110px 150px;
 }
 
 .field {
@@ -1571,6 +1613,10 @@ dialog::backdrop {
   padding: 20px 18px;
   overflow: auto;
   overscroll-behavior: contain;
+}
+
+.table-frame--standalone {
+  border-radius: var(--radius);
 }
 
 .form-error,
