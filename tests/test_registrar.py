@@ -399,12 +399,7 @@ import team_protocol.cli
 
     def test_provider_propagates_only_explicit_mailbox_auth_rejection(self):
         provider = AppleEmailHotmailProvider(accounts=[])
-        mailbox = AppleEmailMailbox(
-            primary_email="main@example.com",
-            registration_email="main+1@example.com",
-            client_id="client-id",
-            refresh_token="refresh-token",
-        )
+        mailbox = AppleEmailMailbox(**vars(self._mailbox()))
         explicit = SimpleNamespace(
             status_code=400,
             text='{"error":"invalid_grant"}',
@@ -416,6 +411,123 @@ import team_protocol.cli
         ):
             with self.assertRaises(MailboxCredentialsInvalidError):
                 provider._fetch_messages(mailbox, "INBOX")
+
+    @staticmethod
+    def _mail_response(payload):
+        return SimpleNamespace(
+            status_code=200,
+            text="",
+            raise_for_status=lambda: None,
+            json=lambda: payload,
+        )
+
+    def test_provider_wait_for_otp_uses_inbox_latest_fast_path(self):
+        provider = AppleEmailHotmailProvider(
+            accounts=[],
+            full_scan_interval_seconds=5,
+        )
+        mailbox = AppleEmailMailbox(**vars(self._mailbox()))
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs["json"]["mailbox"]))
+            return self._mail_response(
+                {"code": "123456", "to": mailbox.registration_email}
+            )
+
+        with patch(
+            "team_protocol.registrar_runtime.appleemail_provider.requests.post",
+            side_effect=post,
+        ):
+            code = provider.wait_for_otp(
+                mailbox.credential_json(),
+                mailbox.registration_email,
+                timeout=5,
+            )
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0].endswith("/api/mail-new"))
+        self.assertEqual(calls[0][1], "INBOX")
+
+    def test_provider_wait_for_otp_falls_back_to_latest_then_full_scan(self):
+        provider = AppleEmailHotmailProvider(
+            accounts=[],
+            full_scan_interval_seconds=0,
+        )
+        mailbox = AppleEmailMailbox(**vars(self._mailbox()))
+        calls = []
+
+        def post(url, **kwargs):
+            endpoint = url.rsplit("/", 1)[-1]
+            folder = kwargs["json"]["mailbox"]
+            calls.append((endpoint, folder))
+            if endpoint == "mail-all" and folder == "Junk":
+                return self._mail_response(
+                    {"messages": [{"code": "654321", "to": mailbox.registration_email}]}
+                )
+            return self._mail_response({})
+
+        with patch(
+            "team_protocol.registrar_runtime.appleemail_provider.requests.post",
+            side_effect=post,
+        ):
+            code = provider.wait_for_otp(
+                mailbox.credential_json(),
+                mailbox.registration_email,
+                timeout=5,
+            )
+
+        self.assertEqual(code, "654321")
+        self.assertEqual(
+            calls,
+            [
+                ("mail-new", "INBOX"),
+                ("mail-new", "Junk"),
+                ("mail-all", "INBOX"),
+                ("mail-all", "Junk"),
+            ],
+        )
+
+    def test_provider_wait_for_otp_bounds_http_timeout_by_remaining_deadline(self):
+        provider = AppleEmailHotmailProvider(
+            accounts=[],
+            request_timeout=20,
+            full_scan_interval_seconds=5,
+        )
+        mailbox = AppleEmailMailbox(
+            primary_email="main@example.com",
+            registration_email="main+1@example.com",
+            client_id="client-id",
+            refresh_token="refresh-token",
+        )
+        request_timeouts = []
+
+        def post(_url, **kwargs):
+            request_timeouts.append(kwargs["timeout"])
+            return self._mail_response(
+                {"code": "123456", "to": mailbox.registration_email}
+            )
+
+        with (
+            patch(
+                "team_protocol.registrar_runtime.appleemail_provider.time.monotonic",
+                side_effect=[100.0, 100.0, 102.0],
+            ),
+            patch(
+                "team_protocol.registrar_runtime.appleemail_provider.requests.post",
+                side_effect=post,
+            ),
+        ):
+            code = provider.wait_for_otp(
+                mailbox.credential_json(),
+                mailbox.registration_email,
+                timeout=5,
+            )
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(len(request_timeouts), 1)
+        self.assertAlmostEqual(request_timeouts[0], 3.0, places=3)
 
     def test_provider_can_publish_detached_state_without_writing_a_file(self):
         with tempfile.TemporaryDirectory() as directory:

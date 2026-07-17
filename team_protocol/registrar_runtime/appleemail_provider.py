@@ -21,6 +21,7 @@ DEFAULT_ALIAS_COUNT = 5
 DEFAULT_MAILBOXES = ("INBOX", "Junk")
 DEFAULT_ALIAS_MODE = "random"
 DEFAULT_OTP_EARLY_TOLERANCE_SECONDS = 8.0
+DEFAULT_OTP_FULL_SCAN_INTERVAL_SECONDS = 5.0
 _OTP_PATTERN = re.compile(r"(?<![#&A-Za-z0-9])(\d{6})(?![A-Za-z0-9])")
 _EMAIL_ADDRESS_PATTERN = re.compile(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+\.[A-Za-z]{2,}")
 _MAILBOX_AUTH_ERROR_CODES = (
@@ -430,12 +431,14 @@ class AppleEmailHotmailProvider:
         api_base: str = DEFAULT_APPLEEMAIL_API_BASE,
         mailboxes: Iterable[str] = DEFAULT_MAILBOXES,
         request_timeout: int = 20,
+        full_scan_interval_seconds: float = DEFAULT_OTP_FULL_SCAN_INTERVAL_SECONDS,
         initial_state: Optional[Mapping[str, Any]] = None,
         state_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.api_base = str(api_base or DEFAULT_APPLEEMAIL_API_BASE).strip().rstrip("/")
         self.mailboxes = tuple(str(item or "").strip() for item in mailboxes if str(item or "").strip()) or DEFAULT_MAILBOXES
         self.request_timeout = max(3, int(request_timeout or 20))
+        self.full_scan_interval_seconds = max(0.0, float(full_scan_interval_seconds))
         if initial_state is not None:
             self._state = _safe_state_snapshot(initial_state)
         else:
@@ -699,19 +702,48 @@ class AppleEmailHotmailProvider:
             except Exception:
                 selected_proxy = proxy
         try:
-            deadline = time.time() + max(1, int(timeout or 60))
-            while time.time() < deadline:
+            started_at = time.monotonic()
+            deadline = started_at + max(1, int(timeout or 60))
+            next_full_scan_at = started_at + self.full_scan_interval_seconds
+            primary_mailbox = next(
+                (
+                    folder
+                    for folder in self.mailboxes
+                    if folder.casefold() == "inbox"
+                ),
+                self.mailboxes[0],
+            )
+            while time.monotonic() < deadline:
                 if stop_event is not None and stop_event.is_set():
                     return ""
-                code = self._fetch_code(
+                code = self._fetch_latest_code(
                     mailbox,
+                    primary_mailbox,
                     sent_at_ts=sent_at_ts,
                     proxy=selected_proxy,
                     exclude_codes=excluded,
+                    deadline=deadline,
                 )
                 if code:
                     return code
-                delay = random.uniform(1.0, 1.8)
+                if time.monotonic() >= next_full_scan_at:
+                    code = self._fetch_fallback_code(
+                        mailbox,
+                        primary_mailbox=primary_mailbox,
+                        sent_at_ts=sent_at_ts,
+                        proxy=selected_proxy,
+                        exclude_codes=excluded,
+                        deadline=deadline,
+                    )
+                    if code:
+                        return code
+                    next_full_scan_at = (
+                        time.monotonic() + self.full_scan_interval_seconds
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ""
+                delay = min(random.uniform(1.0, 1.8), remaining)
                 if stop_event is not None:
                     stop_event.wait(delay)
                 else:
@@ -749,6 +781,21 @@ class AppleEmailHotmailProvider:
         if not messages and last_error:
             return ""
 
+        return self._code_from_messages(
+            mailbox,
+            messages,
+            sent_at_ts=sent_at_ts,
+            exclude_codes=exclude_codes,
+        )
+
+    def _code_from_messages(
+        self,
+        mailbox: AppleEmailMailbox,
+        messages: Iterable[Any],
+        *,
+        sent_at_ts: Optional[float],
+        exclude_codes: Optional[set[str]] = None,
+    ) -> str:
         baseline = self._baseline_for(mailbox)
         baseline_fingerprints = baseline.get("fingerprints")
         if not isinstance(baseline_fingerprints, set):
@@ -782,6 +829,92 @@ class AppleEmailHotmailProvider:
             if code:
                 if code in excluded:
                     return ""
+                return code
+        return ""
+
+    def _remaining_request_timeout(self, deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0.0
+        return min(float(self.request_timeout), remaining)
+
+    def _fetch_latest_code(
+        self,
+        mailbox: AppleEmailMailbox,
+        folder: str,
+        *,
+        sent_at_ts: Optional[float],
+        proxy: Any,
+        exclude_codes: Optional[set[str]],
+        deadline: float,
+    ) -> str:
+        request_timeout = self._remaining_request_timeout(deadline)
+        if request_timeout <= 0:
+            return ""
+        try:
+            latest = self._fetch_latest_message(
+                mailbox,
+                folder,
+                proxy=proxy,
+                request_timeout=request_timeout,
+            )
+        except MailboxCredentialsInvalidError:
+            raise
+        except Exception:
+            return ""
+        return self._code_from_messages(
+            mailbox,
+            _normalize_messages(latest),
+            sent_at_ts=sent_at_ts,
+            exclude_codes=exclude_codes,
+        )
+
+    def _fetch_fallback_code(
+        self,
+        mailbox: AppleEmailMailbox,
+        *,
+        primary_mailbox: str,
+        sent_at_ts: Optional[float],
+        proxy: Any,
+        exclude_codes: Optional[set[str]],
+        deadline: float,
+    ) -> str:
+        for folder in self.mailboxes:
+            if folder == primary_mailbox:
+                continue
+            code = self._fetch_latest_code(
+                mailbox,
+                folder,
+                sent_at_ts=sent_at_ts,
+                proxy=proxy,
+                exclude_codes=exclude_codes,
+                deadline=deadline,
+            )
+            if code:
+                return code
+
+        for folder in self.mailboxes:
+            request_timeout = self._remaining_request_timeout(deadline)
+            if request_timeout <= 0:
+                return ""
+            try:
+                messages = self._fetch_messages(
+                    mailbox,
+                    folder,
+                    proxy=proxy,
+                    request_timeout=request_timeout,
+                )
+            except MailboxCredentialsInvalidError:
+                raise
+            except Exception:
+                continue
+            code = self._code_from_messages(
+                mailbox,
+                messages,
+                sent_at_ts=sent_at_ts,
+                exclude_codes=exclude_codes,
+            )
+            if code:
                 return code
         return ""
 
@@ -832,7 +965,14 @@ class AppleEmailHotmailProvider:
                 last_error = str(exc)
         return messages, last_error
 
-    def _fetch_messages(self, mailbox: AppleEmailMailbox, folder: str, proxy: Any = None) -> list[Any]:
+    def _fetch_messages(
+        self,
+        mailbox: AppleEmailMailbox,
+        folder: str,
+        proxy: Any = None,
+        *,
+        request_timeout: float | None = None,
+    ) -> list[Any]:
         response = requests.post(
             f"{self.api_base}/api/mail-all",
             json={
@@ -842,7 +982,11 @@ class AppleEmailHotmailProvider:
                 "mailbox": folder,
             },
             proxies=_proxies_dict(proxy),
-            timeout=self.request_timeout,
+            timeout=(
+                self.request_timeout
+                if request_timeout is None
+                else max(0.001, min(float(self.request_timeout), request_timeout))
+            ),
         )
         if _is_explicit_mailbox_auth_rejection(response):
             raise MailboxCredentialsInvalidError("mailbox refresh credentials were rejected")
@@ -853,7 +997,14 @@ class AppleEmailHotmailProvider:
             payload = response.text
         return _normalize_messages(payload)
 
-    def _fetch_latest_message(self, mailbox: AppleEmailMailbox, folder: str, proxy: Any = None) -> Any:
+    def _fetch_latest_message(
+        self,
+        mailbox: AppleEmailMailbox,
+        folder: str,
+        proxy: Any = None,
+        *,
+        request_timeout: float | None = None,
+    ) -> Any:
         response = requests.post(
             f"{self.api_base}/api/mail-new",
             json={
@@ -864,7 +1015,11 @@ class AppleEmailHotmailProvider:
                 "response_type": "json",
             },
             proxies=_proxies_dict(proxy),
-            timeout=self.request_timeout,
+            timeout=(
+                self.request_timeout
+                if request_timeout is None
+                else max(0.001, min(float(self.request_timeout), request_timeout))
+            ),
         )
         if _is_explicit_mailbox_auth_rejection(response):
             raise MailboxCredentialsInvalidError("mailbox refresh credentials were rejected")
