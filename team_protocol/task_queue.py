@@ -481,10 +481,35 @@ class TaskQueue:
         new_mailbox = self._mailbox(new_account, new_credentials)
 
         proxy_template = self._secret_setting("proxy")
+        had_run_proxy = bool(run["proxy_configured"])
         proxy = self.database.get_run_proxy(run_id) if run["proxy_configured"] else None
         if proxy is None:
             proxy = str(proxy_template or "").strip()
             self.database.set_run_proxy(run_id, proxy)
+
+        checkpoint = self.database.get_run_checkpoint(run_id) or {}
+        proxy_snapshot = self.database.get_run_account_proxy_snapshot(run_id)
+        if proxy_snapshot is None:
+            if had_run_proxy:
+                current_override = None
+                next_override = None
+            else:
+                current_override = self.database.get_account_proxy(old_account["id"])
+                next_override = self.database.get_account_proxy(new_account["id"])
+
+            def proxy_entry(account_proxy: str | None) -> dict[str, str]:
+                if account_proxy is not None:
+                    return {"proxy": account_proxy, "source": "account"}
+                if proxy:
+                    return {"proxy": proxy, "source": "global"}
+                return {"proxy": "", "source": "direct"}
+
+            proxy_snapshot = {
+                "version": 1,
+                "current": proxy_entry(current_override),
+                "next": proxy_entry(next_override),
+            }
+            self.database.set_run_account_proxy_snapshot(run_id, proxy_snapshot)
 
         old_identity = self.database.ensure_account_network_identity(
             old_account["id"],
@@ -496,7 +521,6 @@ class TaskQueue:
         )
         if old_identity["proxy_sid"] == new_identity["proxy_sid"]:
             raise StateConflictError("old and new accounts share the same proxy SID")
-        checkpoint = self.database.get_run_checkpoint(run_id) or {}
         legacy_profile = checkpoint.get("_fingerprint_profile")
         legacy_geo = checkpoint.get("_proxy_geo")
         legacy_browserforge = checkpoint.get("_browserforge_fingerprint")
@@ -518,35 +542,35 @@ class TaskQueue:
 
         old_legacy = uses_legacy_identity("old", old_identity)
         new_legacy = uses_legacy_identity("new", new_identity)
-        try:
-            old_proxy = bind_proxy_sid(
-                proxy,
-                str(old_identity["proxy_sid"]),
-                required=bool(proxy),
-            )
-            new_proxy = bind_proxy_sid(
-                proxy,
-                str(new_identity["proxy_sid"]),
-                required=bool(proxy),
-            )
-        except ValueError:
-            legacy_openai_steps = {
-                "old_login",
-                "old_workspace",
-                "new_login",
-                "new_workspace",
-                "invite",
-                "old_leave",
-                "pat",
-            }
-            if not any(step in checkpoint for step in legacy_openai_steps):
-                raise
-            old_proxy = proxy
-            new_proxy = proxy
-        if old_legacy:
-            old_proxy = proxy
-        if new_legacy:
-            new_proxy = proxy
+        legacy_openai_steps = {
+            "old_login",
+            "old_workspace",
+            "new_login",
+            "new_workspace",
+            "invite",
+            "old_leave",
+            "pat",
+        }
+
+        def account_proxy(
+            role: str, identity: Mapping[str, Any], *, legacy_recovery: bool
+        ) -> str:
+            entry = proxy_snapshot[role]
+            source_proxy = str(entry["proxy"])
+            try:
+                bound = bind_proxy_sid(
+                    source_proxy,
+                    str(identity["proxy_sid"]),
+                    required=entry["source"] == "global" and bool(source_proxy),
+                )
+            except ValueError:
+                if not any(step in checkpoint for step in legacy_openai_steps):
+                    raise
+                return proxy
+            return proxy if legacy_recovery else bound
+
+        old_proxy = account_proxy("current", old_identity, legacy_recovery=old_legacy)
+        new_proxy = account_proxy("next", new_identity, legacy_recovery=new_legacy)
 
         def account_network(
             account_id: str,
@@ -668,6 +692,8 @@ class TaskQueue:
                         *new_credentials.values(),
                         proxy_template,
                         proxy,
+                        proxy_snapshot["current"]["proxy"],
+                        proxy_snapshot["next"]["proxy"],
                         old_proxy,
                         new_proxy,
                         old_identity.get("proxy_sid"),

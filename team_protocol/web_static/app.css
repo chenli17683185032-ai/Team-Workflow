@@ -767,13 +767,14 @@ input[readonly] {
 .workspace-table th:nth-child(7) { width: 13%; }
 .workspace-table th:nth-child(8) { width: 112px; }
 
-.account-table th:nth-child(1),
-.account-table th:nth-child(2) { width: 20%; }
-.account-table th:nth-child(3) { width: 13%; }
-.account-table th:nth-child(4) { width: 17%; }
-.account-table th:nth-child(5) { width: 10%; }
-.account-table th:nth-child(6) { width: 12%; }
-.account-table th:nth-child(7) { width: 140px; }
+.account-table th:nth-child(1) { width: 19%; }
+.account-table th:nth-child(2) { width: 17%; }
+.account-table th:nth-child(3) { width: 8%; }
+.account-table th:nth-child(4) { width: 10%; }
+.account-table th:nth-child(5) { width: 12%; }
+.account-table th:nth-child(6) { width: 8%; }
+.account-table th:nth-child(7) { width: 12%; }
+.account-table th:nth-child(8) { width: 14%; }
 
 .inventory-table th:nth-child(1) { width: 34%; }
 .inventory-table th:nth-child(2) { width: 14%; }

@@ -1,4 +1,6 @@
+import base64
 import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -110,6 +112,85 @@ class SecretStoreFailureTests(unittest.TestCase):
         self.assertEqual(str(decrypt_error.exception), "Secret decryption failed.")
         self.assertNotIn(canary.decode("ascii"), str(encrypt_error.exception))
         self.assertNotIn(canary.decode("ascii"), str(decrypt_error.exception))
+
+
+class MacOSSecretStoreTests(unittest.TestCase):
+    def setUp(self):
+        backend = secret_store._MacOSKeychain(_master_key=b"m" * 32)
+        self.store = SecretStore(_backend=backend)
+
+    def test_roundtrip_empty_binary_and_purpose_binding(self):
+        for payload in (b"", bytes(range(256)), b"\x00\xffbinary\x00"):
+            with self.subTest(payload_size=len(payload)):
+                ciphertext = self.store.encrypt(payload, "account.credentials")
+                self.assertEqual(
+                    self.store.decrypt(ciphertext, "account.credentials"), payload
+                )
+                if payload:
+                    self.assertNotIn(payload, ciphertext)
+
+        ciphertext = self.store.encrypt(b"purpose-canary", "account.credentials")
+        with self.assertRaisesRegex(SecretStoreError, r"^Secret decryption failed\.$"):
+            self.store.decrypt(ciphertext, "checkpoint")
+
+    def test_tampering_is_rejected(self):
+        ciphertext = bytearray(self.store.encrypt(b"tamper-canary", "proxy"))
+        ciphertext[-1] ^= 1
+
+        with self.assertRaisesRegex(SecretStoreError, r"^Secret decryption failed\.$"):
+            self.store.decrypt(bytes(ciphertext), "proxy")
+
+    def test_keychain_existing_key_is_reused(self):
+        encoded = base64.b64encode(b"k" * 32).decode("ascii")
+        completed = subprocess.CompletedProcess([], 0, stdout=encoded + "\n", stderr="")
+        with mock.patch.object(secret_store.subprocess, "run", return_value=completed) as run:
+            key = secret_store._load_or_create_macos_master_key()
+
+        self.assertEqual(key, b"k" * 32)
+        self.assertEqual(run.call_count, 1)
+
+    def test_keychain_first_use_writes_secret_via_stdin_and_reads_it_back(self):
+        created_key = b"n" * 32
+        encoded = base64.b64encode(created_key).decode("ascii")
+        missing = subprocess.CompletedProcess([], 44, stdout="", stderr="not found")
+        written = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        loaded = subprocess.CompletedProcess([], 0, stdout=encoded + "\n", stderr="")
+        with (
+            mock.patch.object(secret_store.os, "urandom", return_value=created_key),
+            mock.patch.object(
+                secret_store.subprocess,
+                "run",
+                side_effect=[missing, written, loaded],
+            ) as run,
+        ):
+            key = secret_store._load_or_create_macos_master_key()
+
+        self.assertEqual(key, created_key)
+        write_call = run.call_args_list[1]
+        self.assertEqual(write_call.args[0], ["/usr/bin/security", "-i"])
+        self.assertIn(encoded, write_call.kwargs["input"])
+        self.assertNotIn(encoded, " ".join(write_call.args[0]))
+
+    def test_keychain_failures_are_stable_and_hide_native_output(self):
+        completed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="failure with keychain-canary"
+        )
+        with mock.patch.object(secret_store.subprocess, "run", return_value=completed):
+            with self.assertRaises(SecretStoreError) as caught:
+                secret_store._read_macos_master_key()
+
+        self.assertEqual(str(caught.exception), "macOS Keychain is unavailable.")
+        self.assertNotIn("keychain-canary", str(caught.exception))
+
+    def test_default_backend_selects_macos_keychain(self):
+        backend = object()
+        with (
+            mock.patch.object(secret_store.sys, "platform", "darwin"),
+            mock.patch.object(secret_store, "_MacOSKeychain", return_value=backend),
+        ):
+            store = SecretStore()
+
+        self.assertIs(store._backend, backend)
 
 
 if __name__ == "__main__":

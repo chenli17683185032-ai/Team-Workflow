@@ -259,6 +259,10 @@ class AccountStatusRequest(StrictModel):
     status: str
 
 
+class AccountProxyRequest(StrictModel):
+    proxy: str = Field(default="", max_length=4096)
+
+
 class QueueEnqueueRequest(StrictModel):
     workspace_ids: list[str] = Field(min_length=1, max_length=500)
 
@@ -685,6 +689,16 @@ class WebConsoleController:
 
     def update_account_status(self, account_id: str, new_status: str) -> dict[str, Any]:
         account = self.database.transition_account_status(account_id, str(new_status))
+        self.task_queue.notify_change()
+        return _safe_payload(account)
+
+    def update_account_proxy(self, account_id: str, proxy: str) -> dict[str, Any]:
+        value = str(proxy or "").strip()
+        account = (
+            self.database.set_account_proxy(account_id, value)
+            if value
+            else self.database.clear_account_proxy(account_id)
+        )
         self.task_queue.notify_change()
         return _safe_payload(account)
 
@@ -1220,6 +1234,12 @@ def create_app(
             controller.update_account_status, account_id, request.status
         )
 
+    @app.put("/api/accounts/{account_id}/proxy")
+    async def update_account_proxy(account_id: str, request: AccountProxyRequest):
+        return await _call_controller(
+            controller.update_account_proxy, account_id, request.proxy
+        )
+
     @app.get("/api/queue")
     async def queue_snapshot():
         return await _call_controller(controller.queue_snapshot)
@@ -1460,7 +1480,10 @@ def serve_web_console(
                 access_log=False,
             )
         )
-        server.run()
+        try:
+            server.run()
+        except KeyboardInterrupt:
+            pass
         return 0
     finally:
         instance_lock.release()

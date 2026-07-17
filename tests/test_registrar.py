@@ -15,6 +15,7 @@ from team_protocol.registrar import (
     generate_proxy_sid,
     primary_email_for_alias,
     proxy_region_code,
+    validate_proxy_url,
 )
 from team_protocol.registrar_runtime.appleemail_provider import (
     AppleEmailHotmailProvider,
@@ -40,6 +41,25 @@ class FakeSessionProfile:
 
 
 class RegistrarTests(unittest.TestCase):
+    def test_proxy_validation_normalizes_s5_aliases_and_rejects_incomplete_urls(self):
+        self.assertEqual(
+            validate_proxy_url("s5://user:pass@proxy.example:1080"),
+            "socks5://user:pass@proxy.example:1080",
+        )
+        self.assertEqual(
+            validate_proxy_url("socks5h://proxy.example:1080"),
+            "socks5h://proxy.example:1080",
+        )
+        for invalid in (
+            "ftp://proxy.example:21",
+            "socks5://proxy.example",
+            "socks5://:1080",
+            "socks5://proxy.example:99999",
+            "socks5://proxy.example:1080 bad",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_proxy_url(invalid)
+
     @staticmethod
     def _adapter_for_login(result_or_error):
         adapter = RegistrarAdapter.__new__(RegistrarAdapter)

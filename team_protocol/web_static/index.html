@@ -158,9 +158,9 @@
       <div class="table-frame">
         <table class="data-table account-table">
           <caption class="sr-only">账号状态与空间绑定</caption>
-          <thead><tr><th scope="col">邮箱</th><th scope="col">主邮箱</th><th scope="col">状态</th><th scope="col">绑定空间</th><th scope="col">来源</th><th scope="col">更新时间</th><th class="actions-cell" scope="col">操作</th></tr></thead>
+          <thead><tr><th scope="col">邮箱</th><th scope="col">主邮箱</th><th scope="col">状态</th><th scope="col">代理</th><th scope="col">绑定空间</th><th scope="col">来源</th><th scope="col">更新时间</th><th class="actions-cell" scope="col">操作</th></tr></thead>
           <tbody id="account-table-body">
-            <tr class="loading-row"><td colspan="7"><span class="inline-loader" aria-hidden="true"></span>正在载入账号…</td></tr>
+            <tr class="loading-row"><td colspan="8"><span class="inline-loader" aria-hidden="true"></span>正在载入账号…</td></tr>
           </tbody>
         </table>
       </div>
@@ -417,6 +417,29 @@
       <footer class="dialog-footer">
         <button type="button" class="button" data-action="close-dialog">取消</button>
         <button type="submit" class="button button--primary">确认分配</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal-dialog" id="account-proxy-dialog" aria-labelledby="account-proxy-title">
+    <form method="dialog" class="dialog-shell" id="account-proxy-form" novalidate>
+      <header class="dialog-header">
+        <div><p class="eyebrow">ACCOUNT NETWORK</p><h2 id="account-proxy-title">账号代理</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭账号代理">×</button>
+      </header>
+      <div class="dialog-content">
+        <input type="hidden" name="account_id">
+        <dl class="allocation-preview">
+          <div><dt>账号</dt><dd id="account-proxy-email">-</dd></div>
+          <div><dt>当前状态</dt><dd id="account-proxy-state">继承全局代理</dd></div>
+        </dl>
+        <label class="field"><span>S5 / SOCKS5 代理</span><input name="proxy" type="password" maxlength="4096" placeholder="socks5://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
+        <div class="form-error" id="account-proxy-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="text-action text-action--danger" data-action="clear-account-proxy">清除独立代理</button>
+        <button type="button" class="button" data-action="close-dialog">取消</button>
+        <button type="submit" class="button button--primary">保存代理</button>
       </footer>
     </form>
   </dialog>

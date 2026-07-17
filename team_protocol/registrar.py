@@ -71,6 +71,27 @@ def _normalize_proxy_url(value: str, default_scheme: str = "http") -> str:
     return text if "://" in text else f"{default_scheme}://{text}"
 
 
+def validate_proxy_url(value: str) -> str:
+    proxy = _normalize_proxy_url(value)
+    if not proxy:
+        raise ValueError("proxy is required")
+    if any(character.isspace() or ord(character) < 32 for character in proxy):
+        raise ValueError("proxy URL contains invalid whitespace")
+    try:
+        parsed = urllib.parse.urlsplit(proxy)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise ValueError("proxy URL is invalid") from None
+    if parsed.scheme.casefold() not in {"http", "https", "socks5", "socks5h"}:
+        raise ValueError("proxy URL scheme is unsupported")
+    if not hostname:
+        raise ValueError("proxy hostname is required")
+    if port is None:
+        raise ValueError("proxy port is required")
+    return urllib.parse.urlunsplit(parsed)
+
+
 def _render_proxy_template(value: str, index: int) -> str:
     text = str(value or "").strip()
     if not text:

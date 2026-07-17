@@ -4,4 +4,5 @@ fastapi
 uvicorn
 playwright==1.58.0
 browserforge==1.2.4
+cryptography>=43
 tzdata>=2025.2; platform_system == "Windows"

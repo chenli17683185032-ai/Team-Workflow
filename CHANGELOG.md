@@ -2,8 +2,18 @@
 
 ## 2026-07-17
 
+### 新增
+
+- 支持 macOS 原生运行，默认数据目录为 `~/Library/Application Support/TeamWorkflowConsole`。
+- macOS 使用登录钥匙串保存随机主密钥，并以 AES-GCM 加密 SQLite 中的敏感字段；Windows 继续使用 DPAPI。
+- 支持为每个账号独立配置 S5 / SOCKS5 代理，并按“账号代理、全局模板、直连”的顺序回退。
+- 任务分别冻结旧号和新号的加密代理快照，失败重试保持原代理不漂移。
+
 ### 改进
 
+- 增加 `TEAM_WORKFLOW_APP_DIR` 数据目录覆盖变量。
+- macOS 终端停止 Web 服务时不再输出 `KeyboardInterrupt` traceback。
+- 账号列表只暴露代理配置状态，代理 URL、用户名和密码不进入 API 响应或页面 DOM。
 - 邮箱验证码轮询优先读取收件箱最新邮件，并降低垃圾箱与完整历史扫描频率。
 - 邮箱请求使用剩余验证码等待时间作为超时上限，避免单次慢请求突破整体等待窗口。
 
@@ -14,8 +24,9 @@
 
 ### 验证
 
-- `python -B -m unittest discover -s '.\\tests' -v`：182 项测试通过。
-- `python -B -m compileall -q '.\\team_protocol' '.\\tests'`：通过。
+- macOS：`python -B -m unittest discover -s tests -v`，189 项通过，6 项 Windows DPAPI 测试按平台跳过。
+- `node --check team_protocol/web_static/app.js`：通过。
+- 真实 macOS Keychain 加密往返、默认数据目录启动、首页与 bootstrap、账号代理保存及正常停止均通过。
 
 ## 2026-07-16
 

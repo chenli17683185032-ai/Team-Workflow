@@ -8,6 +8,7 @@ import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from team_protocol.database import (
     BindingConflictError,
@@ -135,6 +136,29 @@ class DatabaseTests(unittest.TestCase):
             if path.is_file():
                 self.assertNotIn(encoded, path.read_bytes(), str(path))
 
+    def test_default_app_dir_honors_override_and_macos_convention(self):
+        with mock.patch.dict(
+            os.environ,
+            {"TEAM_WORKFLOW_APP_DIR": "~/custom-team-workflow"},
+            clear=False,
+        ):
+            self.assertEqual(
+                database_module.default_app_dir(),
+                Path("~/custom-team-workflow").expanduser(),
+            )
+
+        environment = dict(os.environ)
+        environment.pop("TEAM_WORKFLOW_APP_DIR", None)
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(database_module.sys, "platform", "darwin"),
+            mock.patch.object(database_module.Path, "home", return_value=Path("/Users/tester")),
+        ):
+            self.assertEqual(
+                database_module.default_app_dir(),
+                Path("/Users/tester/Library/Application Support/TeamWorkflowConsole"),
+            )
+
     def legacy_model(self, *, with_state: bool = True) -> LegacyImportModel:
         root = Path(self.temporary_directory.name) / "legacy"
         root.mkdir(parents=True, exist_ok=True)
@@ -237,7 +261,7 @@ class DatabaseTests(unittest.TestCase):
         self.database.initialize()
         diagnostics = self.database.diagnostics()
 
-        self.assertEqual(diagnostics["schema_version"], 3)
+        self.assertEqual(diagnostics["schema_version"], 4)
         self.assertEqual(diagnostics["journal_mode"], "wal")
         self.assertTrue(diagnostics["foreign_keys"])
         self.assertEqual(diagnostics["busy_timeout_ms"], 5000)
@@ -513,6 +537,56 @@ class DatabaseTests(unittest.TestCase):
         self.assert_secret_absent_from_database_files(proxy)
         with self.assertRaises(StateConflictError):
             self.database.set_run_proxy(run["id"], "http://different.example:9000")
+
+    def test_account_proxy_is_encrypted_normalized_and_clearable(self):
+        account = self.create_account("independent-proxy")
+        proxy = "s5://mother-a:proxy-secret@proxy-a.example:1080"
+
+        configured = self.database.set_account_proxy(account["id"], proxy)
+
+        self.assertTrue(configured["proxy_configured"])
+        self.assertEqual(
+            self.database.get_account_proxy(account["id"]),
+            "socks5://mother-a:proxy-secret@proxy-a.example:1080",
+        )
+        self.assert_secret_absent_from_database_files("proxy-secret")
+        with self.assertRaises(ValidationError):
+            self.database.set_account_proxy(account["id"], "ftp://proxy.example:21")
+
+        cleared = self.database.clear_account_proxy(account["id"])
+        self.assertFalse(cleared["proxy_configured"])
+        self.assertIsNone(self.database.get_account_proxy(account["id"]))
+
+    def test_run_account_proxy_snapshot_is_encrypted_and_immutable(self):
+        workspace, _, _ = self.create_workspace("proxy-snapshot")
+        run = self.database.enqueue_workspace(workspace["id"])
+        snapshot = {
+            "version": 1,
+            "current": {
+                "proxy": "socks5://old:old-secret@old.example:1080",
+                "source": "account",
+            },
+            "next": {
+                "proxy": "socks5://global-{sid}:global-secret@global.example:1080",
+                "source": "global",
+            },
+        }
+
+        self.database.set_run_account_proxy_snapshot(run["id"], snapshot)
+        self.database.set_run_account_proxy_snapshot(run["id"], snapshot)
+
+        self.assertEqual(
+            self.database.get_run_account_proxy_snapshot(run["id"]), snapshot
+        )
+        self.assertTrue(
+            self.database.get_run(run["id"])["account_proxy_snapshot_configured"]
+        )
+        self.assert_secret_absent_from_database_files("old-secret")
+        self.assert_secret_absent_from_database_files("global-secret")
+        changed = json.loads(json.dumps(snapshot))
+        changed["current"]["proxy"] = "socks5://changed.example:1080"
+        with self.assertRaises(StateConflictError):
+            self.database.set_run_account_proxy_snapshot(run["id"], changed)
 
     def test_queue_pause_fifo_claim_and_single_running(self):
         first, _, _ = self.create_workspace("fifo-first")
@@ -844,8 +918,24 @@ class DatabaseTests(unittest.TestCase):
             other.apply_legacy_import(different)
 
     def test_snapshot_uses_live_wal_content_and_restore_replaces_database(self):
-        model = self.legacy_model()
+        model = self.legacy_model(with_state=False)
         self.database.apply_legacy_import(model)
+        workspace = self.database.list_workspaces()[0]
+        current_account = self.database.get_account(workspace["current_account_id"])
+        self.database.set_account_proxy(
+            current_account["id"],
+            "socks5://backup-user:backup-proxy-secret@backup.proxy.invalid:1080",
+        )
+        run = self.database.enqueue_workspace(workspace["id"])
+        proxy_snapshot = {
+            "version": 1,
+            "current": {
+                "proxy": self.database.get_account_proxy(current_account["id"]),
+                "source": "account",
+            },
+            "next": {"proxy": "", "source": "direct"},
+        }
+        self.database.set_run_account_proxy_snapshot(run["id"], proxy_snapshot)
         candidate = self.backup_candidate(self.database, model)
         self.assertTrue(candidate.sqlite_snapshot.startswith(b"SQLite format 3\x00"))
 
@@ -870,6 +960,8 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(target.list_accounts()), 3)
         self.assertNotIn("target-only@example.com", {row["email"] for row in target.list_accounts()})
         self.assertEqual(result["row_counts"]["accounts"], 3)
+        self.assertEqual(target.get_account_proxy(current_account["id"]), proxy_snapshot["current"]["proxy"])
+        self.assertEqual(target.get_run_account_proxy_snapshot(run["id"]), proxy_snapshot)
 
     def test_restore_candidate_rejects_tampering_and_wrong_secret_purpose(self):
         model = self.legacy_model()
@@ -987,10 +1079,10 @@ class DatabaseTests(unittest.TestCase):
             connection.close()
 
         upgraded = Database(legacy_path, secret_store=TestSecretStore())
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 3)
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 4)
         self.assertEqual(upgraded.get_meta("instance_id"), "legacy-instance")
         upgraded.initialize()
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 3)
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 4)
 
     def test_inventory_import_search_and_credentials_are_encrypted(self):
         records = [
@@ -1402,9 +1494,9 @@ class DatabaseTests(unittest.TestCase):
         restored = self.database.restore_verified_backup(candidate, validation)
 
         self.assertEqual(validation.schema_version, 1)
-        self.assertEqual(restored["schema_version"], 3)
+        self.assertEqual(restored["schema_version"], 4)
         self.assertEqual(self.database.get_meta("instance_id"), "snapshot-v1-instance")
-        self.assertEqual(self.database.diagnostics()["schema_version"], 3)
+        self.assertEqual(self.database.diagnostics()["schema_version"], 4)
 
 
 if __name__ == "__main__":

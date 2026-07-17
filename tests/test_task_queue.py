@@ -90,6 +90,10 @@ class FakeRunner:
                 + self.config.proxy
                 + " refresh="
                 + self.kwargs["old_mailbox"].refresh_token
+                + " old-network="
+                + self.kwargs["old_network"].proxy
+                + " new-network="
+                + self.kwargs["new_network"].proxy
             )
             if isinstance(self.behavior, BaseException):
                 raise self.behavior
@@ -331,6 +335,85 @@ class TaskQueueTests(unittest.TestCase):
             for event in self.database.list_run_events(run_id=run["id"])
         ]
         self.assertIn("failed run queued for retry", messages)
+
+    def test_account_specific_static_socks5_proxies_override_global_and_retry_stays_frozen(self):
+        workspace, current, next_account = self.make_workspace("account-proxy")
+        old_proxy = "s5://mother-a:old-proxy-secret@old.proxy.invalid:1080"
+        new_proxy = "socks5h://mother-b:new-proxy-secret@new.proxy.invalid:1081"
+        self.database.set_account_proxy(current["id"], old_proxy)
+        self.database.set_account_proxy(next_account["id"], new_proxy)
+        harness = RunnerHarness("fail", "success")
+        queue = self.make_queue(harness)
+        run = queue.enqueue([workspace["id"]])[0]
+
+        queue.start()
+        self.assertTrue(
+            wait_until(lambda: self.database.get_run(run["id"])["state"] == "failed")
+        )
+        snapshot = self.database.get_run_account_proxy_snapshot(run["id"])
+        first_old = harness.calls[0]["old_network"].proxy
+        first_new = harness.calls[0]["new_network"].proxy
+        self.assertEqual(
+            first_old,
+            "socks5://mother-a:old-proxy-secret@old.proxy.invalid:1080",
+        )
+        self.assertEqual(first_new, new_proxy)
+        self.assertEqual(snapshot["current"]["source"], "account")
+        self.assertEqual(snapshot["next"]["source"], "account")
+
+        self.database.set_account_proxy(
+            current["id"], "socks5://changed-old:changed@changed.invalid:1080"
+        )
+        self.database.set_account_proxy(
+            next_account["id"], "socks5://changed-new:changed@changed.invalid:1080"
+        )
+        queue.retry(run["id"])
+
+        self.assertTrue(
+            wait_until(
+                lambda: self.database.get_run(run["id"])["state"] == "succeeded"
+            )
+        )
+        self.assertEqual(
+            [call["old_network"].proxy for call in harness.calls],
+            [first_old, first_old],
+        )
+        self.assertEqual(
+            [call["new_network"].proxy for call in harness.calls],
+            [first_new, first_new],
+        )
+        events = json.dumps(self.database.list_run_events(run_id=run["id"]))
+        self.assertNotIn("old-proxy-secret", events)
+        self.assertNotIn("new-proxy-secret", events)
+
+    def test_account_proxy_can_fall_back_to_global_template_per_side(self):
+        workspace, current, next_account = self.make_workspace("proxy-fallback")
+        self.database.set_account_proxy(
+            current["id"], "socks5://static:secret@static.proxy.invalid:1080"
+        )
+        harness = RunnerHarness("success")
+        queue = self.make_queue(harness)
+        run = queue.enqueue([workspace["id"]])[0]
+
+        queue.start()
+        self.assertTrue(
+            wait_until(
+                lambda: self.database.get_run(run["id"])["state"] == "succeeded"
+            )
+        )
+
+        call = harness.calls[0]
+        snapshot = self.database.get_run_account_proxy_snapshot(run["id"])
+        self.assertEqual(
+            call["old_network"].proxy,
+            "socks5://static:secret@static.proxy.invalid:1080",
+        )
+        self.assertIn(
+            self.database.get_account_network_identity(next_account["id"])["proxy_sid"],
+            call["new_network"].proxy,
+        )
+        self.assertEqual(snapshot["current"]["source"], "account")
+        self.assertEqual(snapshot["next"]["source"], "global")
 
     def test_only_structured_identity_error_uses_atomic_replacement(self):
         workspace, _, _ = self.make_workspace("identity")

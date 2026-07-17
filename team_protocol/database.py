@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import threading
 import uuid
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ACCOUNT_STATUSES = frozenset(
     {
         "available",
@@ -48,6 +49,8 @@ WORKFLOW_STEPS = (
 )
 _UNSET = object()
 _ACCOUNT_RUNTIME_IDENTITY_VERSION = 1
+_RUN_PROXY_SNAPSHOT_VERSION = 1
+_RUN_PROXY_SOURCES = frozenset({"account", "global", "direct"})
 _ACCOUNT_RUNTIME_IDENTITY_KEYS = frozenset(
     {
         "version",
@@ -128,10 +131,19 @@ class RestoreValidation:
 
 
 def default_app_dir() -> Path:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if not local_app_data:
-        raise DatabaseConfigurationError("LOCALAPPDATA is not configured")
-    return Path(local_app_data) / "TeamWorkflowConsole"
+    override = str(os.environ.get("TEAM_WORKFLOW_APP_DIR") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise DatabaseConfigurationError("LOCALAPPDATA is not configured")
+        return Path(local_app_data) / "TeamWorkflowConsole"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "TeamWorkflowConsole"
+    xdg_data_home = str(os.environ.get("XDG_DATA_HOME") or "").strip()
+    base = Path(xdg_data_home).expanduser() if xdg_data_home else Path.home() / ".local" / "share"
+    return base / "TeamWorkflowConsole"
 
 
 def default_database_path() -> Path:
@@ -217,6 +229,29 @@ def _validate_account_runtime_identity(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise DatabaseError("account runtime identity is not JSON serializable") from exc
     return identity
+
+
+def _validate_run_proxy_snapshot(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise DatabaseError("run proxy snapshot is invalid")
+    snapshot = dict(value)
+    if set(snapshot) != {"version", "current", "next"}:
+        raise DatabaseError("run proxy snapshot has invalid fields")
+    if int(snapshot.get("version") or 0) != _RUN_PROXY_SNAPSHOT_VERSION:
+        raise DatabaseError("run proxy snapshot version is unsupported")
+    normalized: dict[str, Any] = {"version": _RUN_PROXY_SNAPSHOT_VERSION}
+    for role in ("current", "next"):
+        entry = snapshot.get(role)
+        if not isinstance(entry, Mapping) or set(entry) != {"proxy", "source"}:
+            raise DatabaseError("run proxy snapshot entry is invalid")
+        proxy = str(entry.get("proxy") or "").strip()
+        source = str(entry.get("source") or "").strip()
+        if source not in _RUN_PROXY_SOURCES:
+            raise DatabaseError("run proxy snapshot source is invalid")
+        if (source == "direct") != (not proxy):
+            raise DatabaseError("run proxy snapshot source does not match its value")
+        normalized[role] = {"proxy": proxy, "source": source}
+    return normalized
 
 
 _SCHEMA_STATEMENTS = (
@@ -397,10 +432,16 @@ _SCHEMA_V3_STATEMENTS = (
     "ALTER TABLE accounts ADD COLUMN runtime_identity_blob BLOB",
 )
 
+_SCHEMA_V4_STATEMENTS = (
+    "ALTER TABLE accounts ADD COLUMN proxy_blob BLOB",
+    "ALTER TABLE runs ADD COLUMN account_proxy_snapshot_blob BLOB",
+)
+
 _SCHEMA_MIGRATIONS = {
     1: _SCHEMA_STATEMENTS,
     2: _SCHEMA_V2_STATEMENTS,
     3: _SCHEMA_V3_STATEMENTS,
+    4: _SCHEMA_V4_STATEMENTS,
 }
 
 
@@ -1552,13 +1593,15 @@ class Database:
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
             "credentials_configured": True,
+            "proxy_configured": row["proxy_blob"] is not None,
         }
 
     def get_account(self, account_id: str) -> dict[str, Any]:
         with self._read_connection() as connection:
             row = connection.execute(
                 """
-                SELECT id, email, primary_email, status, source, created_at, updated_at
+                SELECT id, email, primary_email, status, source, created_at, updated_at,
+                       proxy_blob
                 FROM accounts WHERE id = ?
                 """,
                 (account_id,),
@@ -1571,11 +1614,60 @@ class Database:
         with self._read_connection() as connection:
             rows = connection.execute(
                 """
-                SELECT id, email, primary_email, status, source, created_at, updated_at
+                SELECT id, email, primary_email, status, source, created_at, updated_at,
+                       proxy_blob
                 FROM accounts ORDER BY email COLLATE NOCASE
                 """
             ).fetchall()
         return [self._account_view(row) for row in rows]
+
+    def set_account_proxy(self, account_id: str, proxy: str) -> dict[str, Any]:
+        from .registrar import validate_proxy_url
+
+        try:
+            normalized = validate_proxy_url(proxy)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        ciphertext = self._require_secret_store().encrypt(
+            normalized.encode("utf-8"), f"account:{account_id}:proxy"
+        )
+        with self._write_transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE accounts SET proxy_blob = ?, updated_at = ? WHERE id = ?
+                """,
+                (sqlite3.Binary(ciphertext), _now(), account_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("account not found")
+        return self.get_account(account_id)
+
+    def clear_account_proxy(self, account_id: str) -> dict[str, Any]:
+        with self._write_transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE accounts SET proxy_blob = NULL, updated_at = ? WHERE id = ?",
+                (_now(), account_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("account not found")
+        return self.get_account(account_id)
+
+    def get_account_proxy(self, account_id: str) -> str | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT proxy_blob FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("account not found")
+        if row["proxy_blob"] is None:
+            return None
+        plaintext = self._require_secret_store().decrypt(
+            bytes(row["proxy_blob"]), f"account:{account_id}:proxy"
+        )
+        try:
+            return plaintext.decode("utf-8")
+        except UnicodeDecodeError:
+            raise DatabaseError("account proxy is invalid") from None
 
     def prune_unreferenced_legacy_accounts(self) -> int:
         """Remove only over-imported legacy inventory unrelated to a workspace."""
@@ -2129,6 +2221,8 @@ class Database:
             "current_step": None if row["current_step"] is None else str(row["current_step"]),
             "checkpoint_configured": row["checkpoint_blob"] is not None,
             "proxy_configured": row["proxy_blob"] is not None,
+            "account_proxy_snapshot_configured": row["account_proxy_snapshot_blob"]
+            is not None,
             "result": result,
             "redacted_error": (
                 None if row["redacted_error"] is None else str(row["redacted_error"])
@@ -2323,6 +2417,61 @@ class Database:
             bytes(row["proxy_blob"]), f"run:{run_id}:proxy"
         )
         return plaintext.decode("utf-8")
+
+    def set_run_account_proxy_snapshot(
+        self, run_id: str, snapshot: Mapping[str, Any]
+    ) -> None:
+        validated = _validate_run_proxy_snapshot(snapshot)
+        purpose = f"run:{run_id}:account-proxies:v1"
+        plaintext = _json_bytes(validated)
+        ciphertext = self._require_secret_store().encrypt(plaintext, purpose)
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT state, account_proxy_snapshot_blob FROM runs WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("run not found")
+            existing_blob = row["account_proxy_snapshot_blob"]
+            if existing_blob is not None:
+                existing = self._require_secret_store().decrypt(
+                    bytes(existing_blob), purpose
+                )
+                if existing != plaintext:
+                    raise StateConflictError("run account proxy snapshot is immutable")
+                return
+            if row["state"] not in {"queued", "running", "stopping"}:
+                raise StateConflictError(
+                    "terminal run account proxy snapshot cannot be changed"
+                )
+            connection.execute(
+                "UPDATE runs SET account_proxy_snapshot_blob = ? WHERE id = ?",
+                (sqlite3.Binary(ciphertext), run_id),
+            )
+
+    def get_run_account_proxy_snapshot(
+        self, run_id: str
+    ) -> dict[str, Any] | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT account_proxy_snapshot_blob FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("run not found")
+        if row["account_proxy_snapshot_blob"] is None:
+            return None
+        plaintext = self._require_secret_store().decrypt(
+            bytes(row["account_proxy_snapshot_blob"]),
+            f"run:{run_id}:account-proxies:v1",
+        )
+        try:
+            value = json.loads(plaintext.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DatabaseError("run proxy snapshot is invalid") from exc
+        return _validate_run_proxy_snapshot(value)
 
     @staticmethod
     def _queue_view(row: sqlite3.Row) -> dict[str, Any]:
@@ -3576,11 +3725,21 @@ class Database:
                         self._require_secret_store().decrypt(
                             bytes(row["value_blob"]), f"setting:{row['key']}"
                         )
-                    account_query = (
-                        "SELECT id, credential_blob, runtime_identity_blob FROM accounts"
-                        if schema_version >= 3
-                        else "SELECT id, credential_blob, NULL AS runtime_identity_blob FROM accounts"
-                    )
+                    if schema_version >= 4:
+                        account_query = (
+                            "SELECT id, credential_blob, runtime_identity_blob, "
+                            "proxy_blob AS account_proxy_blob FROM accounts"
+                        )
+                    elif schema_version >= 3:
+                        account_query = (
+                            "SELECT id, credential_blob, runtime_identity_blob, "
+                            "NULL AS account_proxy_blob FROM accounts"
+                        )
+                    else:
+                        account_query = (
+                            "SELECT id, credential_blob, NULL AS runtime_identity_blob, "
+                            "NULL AS account_proxy_blob FROM accounts"
+                        )
                     for row in connection.execute(account_query):
                         plaintext = self._require_secret_store().decrypt(
                             bytes(row["credential_blob"]),
@@ -3598,6 +3757,14 @@ class Database:
                             _validate_account_runtime_identity(
                                 json.loads(runtime_plaintext.decode("utf-8"))
                             )
+                        if row["account_proxy_blob"] is not None:
+                            account_proxy = self._require_secret_store().decrypt(
+                                bytes(row["account_proxy_blob"]),
+                                f"account:{row['id']}:proxy",
+                            ).decode("utf-8")
+                            from .registrar import validate_proxy_url
+
+                            validate_proxy_url(account_proxy)
                     if schema_version >= 2:
                         for row in connection.execute(
                             """
@@ -3613,9 +3780,14 @@ class Database:
                                 raise RestoreValidationError(
                                     "restore candidate mailbox credentials are invalid"
                                 )
-                    for row in connection.execute(
-                        "SELECT id, checkpoint_blob, proxy_blob FROM runs"
-                    ):
+                    run_query = (
+                        "SELECT id, checkpoint_blob, proxy_blob, "
+                        "account_proxy_snapshot_blob FROM runs"
+                        if schema_version >= 4
+                        else "SELECT id, checkpoint_blob, proxy_blob, "
+                        "NULL AS account_proxy_snapshot_blob FROM runs"
+                    )
+                    for row in connection.execute(run_query):
                         if row["checkpoint_blob"] is not None:
                             plaintext = self._require_secret_store().decrypt(
                                 bytes(row["checkpoint_blob"]),
@@ -3629,6 +3801,14 @@ class Database:
                             self._require_secret_store().decrypt(
                                 bytes(row["proxy_blob"]), f"run:{row['id']}:proxy"
                             ).decode("utf-8")
+                        if row["account_proxy_snapshot_blob"] is not None:
+                            snapshot_plaintext = self._require_secret_store().decrypt(
+                                bytes(row["account_proxy_snapshot_blob"]),
+                                f"run:{row['id']}:account-proxies:v1",
+                            )
+                            _validate_run_proxy_snapshot(
+                                json.loads(snapshot_plaintext.decode("utf-8"))
+                            )
                     row_counts = {
                         table: int(
                             connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

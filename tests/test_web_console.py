@@ -464,6 +464,50 @@ class WebConsoleTests(unittest.TestCase):
         self.assertNotIn("refresh-token", body)
         self.assertNotIn("client-id", body)
 
+    def test_account_proxy_api_configures_clears_and_never_echoes_the_url(self):
+        account = self.account("proxy-api")
+        proxy = "s5://mother-user:proxy-api-secret@proxy.example:1080"
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as client:
+            configured = client.put(
+                f"/api/accounts/{account['id']}/proxy",
+                headers=self.origin_headers,
+                json={"proxy": proxy},
+            )
+            listed = client.get(
+                "/api/accounts",
+                headers={"X-Workflow-Token": self.controller.request_token},
+            )
+            invalid = client.put(
+                f"/api/accounts/{account['id']}/proxy",
+                headers=self.origin_headers,
+                json={"proxy": "ftp://proxy.example:21"},
+            )
+            bootstrap = client.get("/api/bootstrap")
+            stored_proxy = self.database.get_account_proxy(account["id"])
+            cleared = client.put(
+                f"/api/accounts/{account['id']}/proxy",
+                headers=self.origin_headers,
+                json={"proxy": ""},
+            )
+
+        serialized = configured.text + listed.text + invalid.text + bootstrap.text + cleared.text
+        self.assertEqual(configured.status_code, 200)
+        self.assertTrue(configured.json()["proxy_configured"])
+        self.assertTrue(
+            next(item for item in listed.json() if item["id"] == account["id"])[
+                "proxy_configured"
+            ]
+        )
+        self.assertEqual(
+            stored_proxy,
+            "socks5://mother-user:proxy-api-secret@proxy.example:1080",
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertFalse(cleared.json()["proxy_configured"])
+        self.assertNotIn("proxy-api-secret", serialized)
+        self.assertNotIn("mother-user", serialized)
+
     def test_workspace_inventory_selection_and_replace_api_are_transactional(self):
         imported = self.database.import_mailbox_inventory(
             [

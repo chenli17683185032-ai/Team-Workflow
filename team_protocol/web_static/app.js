@@ -49,6 +49,11 @@ const INVENTORY_STATUS = {
   exhausted: ["已耗尽", "warning"],
 };
 
+const PROXY_STATUS = {
+  configured: ["独立 S5", "success"],
+  inherited: ["全局 / 直连", "neutral"],
+};
+
 const RUN_STATUS = {
   queued: ["排队中", "accent"],
   running: ["运行中", "info"],
@@ -668,7 +673,7 @@ function renderAccountTable() {
   const pageAccounts = visible.slice(startIndex, startIndex + pageSize);
   body.replaceChildren();
   if (!pageAccounts.length) {
-    body.append(loadingOrErrorRow(7, "accounts", state.accounts.length ? "没有符合筛选条件的账号" : "尚未分配任何子号"));
+    body.append(loadingOrErrorRow(8, "accounts", state.accounts.length ? "没有符合筛选条件的账号" : "尚未分配任何子号"));
   } else {
     const fragment = document.createDocumentFragment();
     for (const account of pageAccounts) {
@@ -679,10 +684,12 @@ function renderAccountTable() {
       row.append(labeledCell("邮箱", element("span", {className: "cell-primary", text: email, attrs: {title: email}})));
       row.append(labeledCell("主邮箱", element("span", {className: "cell-secondary", text: safeString(account.primary_email, email), attrs: {title: safeString(account.primary_email, email)}})));
       row.append(labeledCell("状态", statusBadge(status, ACCOUNT_STATUS)));
+      row.append(labeledCell("代理", statusBadge(account.proxy_configured ? "configured" : "inherited", PROXY_STATUS)));
       row.append(labeledCell("绑定空间", accountBindingLabel(account)));
       row.append(labeledCell("来源", safeString(firstValue(account, ["source"], "import"))));
       row.append(labeledCell("更新时间", formatDate(firstValue(account, ["updated_at", "created_at"]))));
       const actions = element("div", {className: "row-actions"});
+      actions.append(actionButton("代理", "open-account-proxy", {accountId: id}));
       const binding = accountBinding(account);
       if (binding && ["bound_current", "bound_next"].includes(status)) {
         actions.append(actionButton("不可用", "invalidate-bound-account", {
@@ -1953,6 +1960,55 @@ function openInventoryAllocation(item) {
   dialog.showModal();
 }
 
+function openAccountProxyDialog(account) {
+  if (!account) return;
+  const dialog = byId("account-proxy-dialog");
+  const form = byId("account-proxy-form");
+  form.reset();
+  form.elements.namedItem("account_id").value = accountId(account);
+  byId("account-proxy-email").textContent = accountEmail(account);
+  byId("account-proxy-state").textContent = account.proxy_configured ? "已配置独立代理" : "继承全局代理";
+  const clearButton = form.querySelector('[data-action="clear-account-proxy"]');
+  clearButton.disabled = !account.proxy_configured;
+  fieldError("account-proxy-error", "");
+  dialog.showModal();
+  form.elements.namedItem("proxy").focus();
+}
+
+async function handleAccountProxySubmit(form) {
+  if (!ensureMutable()) return;
+  fieldError("account-proxy-error", "");
+  const data = new FormData(form);
+  const accountIdentifier = safeString(data.get("account_id"));
+  const proxy = safeString(data.get("proxy")).trim();
+  if (!accountIdentifier || !proxy) {
+    fieldError("account-proxy-error", "请输入完整的代理地址");
+    return;
+  }
+  await api(`/api/accounts/${encodeURIComponent(accountIdentifier)}/proxy`, {
+    method: "PUT",
+    body: {proxy},
+  });
+  byId("account-proxy-dialog").close();
+  await refreshResources(["accounts"]);
+  showToast("账号代理已保存", "success");
+}
+
+async function clearAccountProxy(form) {
+  if (!ensureMutable()) return;
+  const accountIdentifier = safeString(form.elements.namedItem("account_id").value);
+  const account = findAccount(accountIdentifier);
+  if (!accountIdentifier || !account?.proxy_configured) return;
+  if (!window.confirm(`清除 ${accountEmail(account)} 的独立代理？`)) return;
+  await api(`/api/accounts/${encodeURIComponent(accountIdentifier)}/proxy`, {
+    method: "PUT",
+    body: {proxy: ""},
+  });
+  byId("account-proxy-dialog").close();
+  await refreshResources(["accounts"]);
+  showToast("账号代理已清除", "success");
+}
+
 async function handleInventoryAllocation(form) {
   if (!ensureMutable()) return;
   fieldError("account-allocation-error", "");
@@ -2106,6 +2162,8 @@ document.addEventListener("click", (event) => {
       byId("account-import-dialog").showModal();
       return;
     }
+    if (action === "open-account-proxy") return openAccountProxyDialog(findAccount(button.dataset.accountId));
+    if (action === "clear-account-proxy") return clearAccountProxy(byId("account-proxy-form"));
     if (action === "select-account-view") return selectAccountView(button.dataset.accountView);
     if (action === "open-inventory-allocation") {
       return openInventoryAllocation(state.inventoryResults.find((item) => inventoryId(item) === button.dataset.inventoryId));
@@ -2239,6 +2297,7 @@ document.addEventListener("submit", (event) => {
   if (form.id === "workspace-form") task = () => handleWorkspaceSubmit(form);
   if (form.id === "account-import-form") task = () => handleAccountImport(form);
   if (form.id === "account-allocation-form") task = () => handleInventoryAllocation(form);
+  if (form.id === "account-proxy-form") task = () => handleAccountProxySubmit(form);
   if (form.id === "settings-form") task = () => handleSettingsSubmit(form);
   if (task) withBusy(submitter, task).catch(() => {});
 });
