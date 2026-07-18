@@ -9,6 +9,7 @@ from team_protocol.icloud_hme import (
     HmeError,
     HmeSessionError,
     ICloudHmeSession,
+    parse_hme_request,
     parse_hme_session_import,
 )
 
@@ -81,6 +82,50 @@ class ICloudHmeTests(unittest.TestCase):
         self.assertEqual(session.host, "p217-maildomainws.icloud.com.cn")
         self.assertEqual(session.origin, "https://www.icloud.com.cn")
         self.assertIn("X-APPLE-DS-WEB-SESSION-TOKEN=", session.cookie)
+
+    def test_parse_browser_request_uses_headers_or_context_cookies(self):
+        china_url = URL.replace(
+            "p68-maildomainws.icloud.com", "p217-maildomainws.icloud.com.cn"
+        )
+        session = parse_hme_request(
+            china_url,
+            {
+                "Origin": "https://www.icloud.com.cn",
+                "Referer": "https://www.icloud.com.cn/",
+                "User-Agent": "Captured Browser",
+            },
+            cookies=[
+                {"name": name, "value": f"captured-{index}"}
+                for index, name in enumerate(
+                    (
+                        "X-APPLE-DS-WEB-SESSION-TOKEN",
+                        "X-APPLE-WEBAUTH-USER",
+                        "X-APPLE-WEBAUTH-TOKEN",
+                    )
+                )
+            ],
+        )
+
+        self.assertEqual(session.host, "p217-maildomainws.icloud.com.cn")
+        self.assertEqual(session.origin, "https://www.icloud.com.cn")
+        self.assertEqual(session.user_agent, "Captured Browser")
+        self.assertIn("X-APPLE-WEBAUTH-TOKEN=captured-2", session.cookie)
+
+        header_session = parse_hme_request(
+            URL,
+            {"Cookie": COOKIE, "User-Agent": "Header Browser"},
+            cookies={"X-APPLE-WEBAUTH-TOKEN": "ignored-fallback"},
+        )
+        self.assertEqual(header_session.cookie, COOKIE)
+        self.assertEqual(header_session.user_agent, "Header Browser")
+
+    def test_parse_browser_request_keeps_the_hme_allowlist(self):
+        for invalid in (
+            URL.replace("icloud.com", "icloud.com.attacker.invalid"),
+            URL.replace("/v2/hme/list", "/v1/hme/delete"),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(HmeSessionError):
+                parse_hme_request(invalid, {"Cookie": COOKIE})
 
     def test_import_rejects_host_injection_path_and_incomplete_cookie(self):
         cases = (

@@ -10,6 +10,8 @@ from team_protocol.sub2api import (
     Sub2APIError,
     _totp_code,
     build_sub2api_account,
+    build_sub2api_export,
+    build_sub2api_filename,
 )
 
 
@@ -91,8 +93,48 @@ class Sub2APIAccountTests(unittest.TestCase):
         self.assertEqual(account["credentials"]["openai_auth_mode"], "personal_access_token")
         self.assertEqual(account["credentials"]["chatgpt_account_id"], "workspace-1")
         self.assertEqual(account["credentials"]["email"], "user@example.com")
+        self.assertEqual(account["extra"]["email_key"], "user_example_com")
+        self.assertEqual(account["extra"]["source"], "chatgpt_web_session")
+        self.assertIn("expires_at", account["credentials"])
+        self.assertIsInstance(account["credentials"]["expires_in"], int)
+        self.assertNotIn("auto_pause_on_expired", account)
         self.assertEqual(account["concurrency"], 10)
         self.assertEqual(account["priority"], 1)
+        self.assertNotIn("session-token", json.dumps(account))
+
+    def test_builds_reference_sub2api_export_with_pat_credentials(self):
+        now = datetime(2026, 7, 12, 9, 0, tzinfo=timezone.utc)
+        session = {
+            "accessToken": access_token(),
+            "sessionToken": "must-not-leak",
+            "user": {"id": "user-1", "email": "user@example.com"},
+            "account": {"id": "workspace-1", "planType": "team"},
+        }
+
+        document = build_sub2api_export(
+            session,
+            personal_access_token="Bearer at-team-pat",
+            personal_access_token_expires_at=1_900_000_000,
+            now=now,
+        )
+
+        self.assertEqual(list(document), ["exported_at", "proxies", "accounts"])
+        self.assertEqual(document["exported_at"], "2026-07-12T09:00:00.000Z")
+        self.assertEqual(document["proxies"], [])
+        self.assertEqual(len(document["accounts"]), 1)
+        credentials = document["accounts"][0]["credentials"]
+        self.assertEqual(credentials["access_token"], "at-team-pat")
+        self.assertEqual(credentials["auth_mode"], "personalAccessToken")
+        self.assertEqual(credentials["chatgpt_account_id"], "workspace-1")
+        self.assertNotIn("must-not-leak", json.dumps(document))
+
+    def test_sub2api_filename_matches_converter_download_shape(self):
+        local_time = datetime(2026, 7, 12, 9, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            build_sub2api_filename("user@example.com", local_time=local_time),
+            "user@example.sub2api.2026-07-12_09-00-00.json",
+        )
 
     def test_api_key_auth_skips_login_and_sets_admin_header(self):
         session = QueueSession(

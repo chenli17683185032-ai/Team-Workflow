@@ -106,6 +106,48 @@ def parse_hme_session_import(text: str) -> ICloudHmeSession:
     return _parse_har(document)
 
 
+def parse_hme_request(
+    url: str,
+    headers: Mapping[str, Any],
+    *,
+    cookies: Any = None,
+) -> ICloudHmeSession:
+    """Build a validated HME session from one captured browser request."""
+
+    if _validated_hme_url(str(url or "")).path != "/v2/hme/list":
+        raise HmeSessionError("captured iCloud HME request is not the list endpoint")
+    normalized_headers = {
+        str(name).strip().casefold(): str(value).strip()
+        for name, value in dict(headers or {}).items()
+        if str(name).strip() and str(value).strip()
+    }
+    cookie = normalized_headers.get("cookie", "")
+    if not cookie:
+        pairs: list[str] = []
+        if isinstance(cookies, Mapping) and not {
+            "name",
+            "value",
+        }.issubset(cookies):
+            iterable: Any = [
+                {"name": name, "value": value}
+                for name, value in cookies.items()
+            ]
+        elif isinstance(cookies, Mapping):
+            iterable = [cookies]
+        else:
+            iterable = cookies or ()
+        for item in iterable:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "").strip()
+            if name:
+                pairs.append(f"{name}={value}")
+        cookie = "; ".join(pairs)
+    normalized_headers["cookie"] = cookie
+    return _session_from_request(str(url or ""), cookie, normalized_headers)
+
+
 def _parse_curl(text: str) -> ICloudHmeSession:
     try:
         tokens = shlex.split(text, posix=True)

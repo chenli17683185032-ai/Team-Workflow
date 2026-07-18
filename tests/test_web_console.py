@@ -13,7 +13,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from team_protocol.database import Database, StateConflictError
-from team_protocol.icloud_hme import HmeError, HmeSessionError
+from team_protocol.icloud_hme import HmeError, HmeSessionError, parse_hme_request
+from team_protocol.icloud_hme_capture import HmeCaptureSessionRejectedError
 from team_protocol.migration import CleanupFailure, CleanupResult, cleanup_plaintext
 from team_protocol.proxy_chain import (
     LokiProxyEndpoint,
@@ -25,6 +26,7 @@ from team_protocol.web_console import (
     WebConsoleController,
     _ConsoleInstanceLock,
     _event_stream,
+    _next_icloud_child_label,
     create_app,
     serve_web_console,
 )
@@ -128,6 +130,20 @@ class FakeTaskQueue:
 
 
 class WebConsoleTests(unittest.TestCase):
+    def test_next_icloud_child_label_increments_the_existing_group_sequence(self):
+        self.assertEqual(
+            _next_icloud_child_label("组 1-7", "组 1", 0),
+            "组 1-8",
+        )
+        self.assertEqual(
+            _next_icloud_child_label("group_2_7", "group 2", 0),
+            "group_2_8",
+        )
+        self.assertEqual(
+            _next_icloud_child_label("Current child", "Owner one team", 2),
+            "Owner one team child 3",
+        )
+
     def setUp(self):
         self.temp_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_directory.cleanup)
@@ -466,6 +482,160 @@ class WebConsoleTests(unittest.TestCase):
                 if path.is_file():
                     self.assertNotIn(secret.encode(), path.read_bytes())
 
+    def test_icloud_hme_capture_api_updates_only_the_encrypted_session(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        before = self.database.get_icloud_mailbox_secrets(profile["id"])
+        china_url = (
+            "https://p217-maildomainws.icloud.com.cn/v2/hme/list?"
+            "clientBuildNumber=2536Project32&clientMasteringNumber=2536B20&"
+            "clientId=captured-client&dsid=captured-dsid"
+        )
+        captured_cookie = (
+            "X-APPLE-DS-WEB-SESSION-TOKEN=captured-session-secret; "
+            "X-APPLE-WEBAUTH-USER=captured-user-secret; "
+            "X-APPLE-WEBAUTH-TOKEN=captured-auth-secret"
+        )
+        captured = parse_hme_request(
+            china_url,
+            {
+                "Cookie": captured_cookie,
+                "Origin": "https://www.icloud.com.cn",
+                "Referer": "https://www.icloud.com.cn/",
+                "User-Agent": "Captured Browser",
+            },
+        )
+        validated = []
+
+        class ValidatingClient:
+            @staticmethod
+            def list_aliases():
+                validated.append(True)
+                return [{"hme": "validated@icloud.com"}]
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: ValidatingClient()
+        )
+
+        self.controller._save_captured_hme_session(profile["id"], captured)
+
+        self.assertEqual(validated, [True])
+        after = self.database.get_icloud_mailbox_secrets(profile["id"])
+        self.assertEqual(after["session"]["host"], "p217-maildomainws.icloud.com.cn")
+        self.assertEqual(after["session"]["client_id"], "captured-client")
+        self.assertEqual(after["imap"], before["imap"])
+        self.assertEqual(after["proxy"], before["proxy"])
+        self.assertEqual(
+            self.database.get_icloud_mailbox(profile["id"])["status"],
+            "unchecked",
+        )
+        for path in self.root.glob("console.db*"):
+            if path.is_file():
+                self.assertNotIn(b"captured-session-secret", path.read_bytes())
+
+        class FakeCaptureManager:
+            def __init__(self):
+                self.value = {
+                    "mailbox_id": profile["id"],
+                    "state": "idle",
+                    "active": False,
+                    "message": "idle",
+                    "started_at": None,
+                    "finished_at": None,
+                    "error_code": None,
+                }
+
+            def start(self, mailbox_id):
+                self.value = {
+                    **self.value,
+                    "mailbox_id": mailbox_id,
+                    "state": "waiting_login",
+                    "active": True,
+                    "message": "waiting",
+                }
+                return dict(self.value)
+
+            def status(self, mailbox_id):
+                return {**self.value, "mailbox_id": mailbox_id}
+
+            def cancel(self, mailbox_id):
+                self.value = {
+                    **self.value,
+                    "mailbox_id": mailbox_id,
+                    "state": "cancelled",
+                    "active": False,
+                    "message": "cancelled",
+                }
+                return dict(self.value)
+
+        self.controller.hme_capture = FakeCaptureManager()
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as client:
+            started = client.post(
+                f"/api/icloud-mailboxes/{profile['id']}/hme-capture",
+                headers=self.origin_headers,
+            )
+            status = client.get(
+                f"/api/icloud-mailboxes/{profile['id']}/hme-capture",
+                headers=self.origin_headers,
+            )
+            cancelled = client.post(
+                f"/api/icloud-mailboxes/{profile['id']}/hme-capture/cancel",
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(started.status_code, 202, started.text)
+        self.assertEqual(started.json()["state"], "waiting_login")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["active"])
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["state"], "cancelled")
+        serialized = started.text + status.text + cancelled.text
+        self.assertNotIn("captured-session-secret", serialized)
+
+    def test_rejected_captured_hme_session_does_not_replace_existing_secret(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        before = self.database.get_icloud_mailbox_secrets(profile["id"])
+        captured = parse_hme_request(
+            (
+                "https://p217-maildomainws.icloud.com.cn/v2/hme/list?"
+                "clientBuildNumber=2536Project32&clientMasteringNumber=2536B20&"
+                "clientId=rejected-client&dsid=rejected-dsid"
+            ),
+            {
+                "Cookie": (
+                    "X-APPLE-DS-WEB-SESSION-TOKEN=rejected-session-secret; "
+                    "X-APPLE-WEBAUTH-USER=rejected-user-secret; "
+                    "X-APPLE-WEBAUTH-TOKEN=rejected-auth-secret"
+                ),
+                "Origin": "https://www.icloud.com.cn",
+                "Referer": "https://www.icloud.com.cn/",
+                "User-Agent": "Rejected Browser",
+            },
+        )
+
+        class RejectingClient:
+            @staticmethod
+            def list_aliases():
+                raise HmeSessionError("rejected-secret-must-not-leak")
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: RejectingClient()
+        )
+
+        with self.assertRaises(HmeCaptureSessionRejectedError):
+            self.controller._save_captured_hme_session(profile["id"], captured)
+
+        self.assertEqual(
+            self.database.get_icloud_mailbox_secrets(profile["id"]),
+            before,
+        )
+        self.assertEqual(
+            self.database.get_icloud_mailbox(profile["id"])["status"],
+            "ready",
+        )
+
     def test_icloud_generation_reports_partial_success_and_session_failure_safely(self):
         profile = self.controller.create_icloud_mailbox(self.icloud_payload())
         self.database.set_icloud_mailbox_status(profile["id"], "ready")
@@ -531,13 +701,13 @@ class WebConsoleTests(unittest.TestCase):
                 "hme": "current-one@icloud.com",
                 "anonymousId": "remote-current-one-secret",
                 "isActive": True,
-                "label": "Current one",
+                "label": "组 1-7",
             },
             {
                 "hme": "current-two@icloud.com",
                 "anonymousId": "remote-current-two-secret",
                 "isActive": True,
-                "label": "Current two",
+                "label": "组 2-7",
             },
             {
                 "hme": "obsolete@icloud.com",
@@ -633,7 +803,7 @@ class WebConsoleTests(unittest.TestCase):
             created_workspace = client.post(
                 "/api/workspaces",
                 json={
-                    "name": "Owner one team",
+                    "name": "组 1",
                     "workspace_uid": "owner-one-team-uid",
                     "owner_alias_id": owner_one["id"],
                     "current_account_id": current_one["account_id"],
@@ -657,7 +827,7 @@ class WebConsoleTests(unittest.TestCase):
             second_workspace_response = client.post(
                 "/api/workspaces",
                 json={
-                    "name": "Owner two team",
+                    "name": "组 2",
                     "workspace_uid": "owner-two-team-uid",
                     "owner_alias_id": owner_two["id"],
                     "current_account_id": current_two["account_id"],
@@ -692,6 +862,7 @@ class WebConsoleTests(unittest.TestCase):
             self.assertNotIn("malformed-remote-secret", malformed.text)
 
         self.assertEqual(len(generated), 1)
+        self.assertEqual(generated[0]["label"], "组 1-8")
         self.assertEqual(compensated, ["malformed-remote-secret"])
         self.assertEqual(len(self.database.list_icloud_aliases(profile["id"])), 5)
         fresh = self.database.get_icloud_alias(handoff_payload["alias"]["id"])

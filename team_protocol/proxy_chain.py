@@ -175,6 +175,22 @@ def validate_generator_url(value: str) -> str:
     return urllib.parse.urlunsplit(parsed)
 
 
+def validate_lokiproxy_source(value: str) -> str:
+    """Accept either a Loki generator URL or a fixed Loki SOCKS5 endpoint."""
+
+    text = str(value or "").strip()
+    try:
+        scheme = urllib.parse.urlsplit(text).scheme.casefold()
+    except ValueError:
+        raise ValueError("LokiProxy source URL is invalid") from None
+    if scheme in {"socks", "socks5", "socks5h", "s5", "s5h"}:
+        normalized = validate_proxy_url(text)
+        if _parse_proxy_address(normalized, label="LokiProxy source").scheme != "socks5":
+            raise ValueError("fixed LokiProxy source must use SOCKS5")
+        return normalized
+    return validate_generator_url(text)
+
+
 @dataclass(frozen=True)
 class LokiProxyEndpoint:
     host: str
@@ -369,8 +385,25 @@ class LokiProxyFetcher:
         self.timeout = timeout
 
     def fetch(self, source_url: str, bootstrap_proxy: str) -> LokiProxyEndpoint:
-        normalized_url = validate_generator_url(source_url)
+        normalized_url = validate_lokiproxy_source(source_url)
         proxy = validate_bootstrap_proxy(bootstrap_proxy)
+        if urllib.parse.urlsplit(normalized_url).scheme.casefold() in {
+            "socks",
+            "socks5",
+            "socks5h",
+            "s5",
+            "s5h",
+        }:
+            source_address = _parse_proxy_address(
+                normalized_url, label="LokiProxy source"
+            )
+            return LokiProxyEndpoint(
+                host=source_address.host,
+                port=source_address.port,
+                scheme="socks5",
+                username=source_address.username,
+                password=source_address.password,
+            )
         request_kwargs = {
             "proxies": {"http": proxy, "https": proxy},
             "headers": {"Accept": "application/json, text/plain", "Cache-Control": "no-cache"},
@@ -450,7 +483,7 @@ class OwnerChainConfig:
         owner_id = str(value.get("owner_id") or value.get("alias_id") or "").strip()
         if not owner_id:
             raise ValueError("owner proxy chain config has no owner")
-        source_url = validate_generator_url(str(value.get("source_url") or ""))
+        source_url = validate_lokiproxy_source(str(value.get("source_url") or ""))
         # `bootstrap_name` and `bootstrap_port` are accepted only as a migration
         # bridge for the old Mihomo-config implementation.  A node name is never
         # used as a route; it falls back to the one configured local Clash URL.
@@ -998,7 +1031,7 @@ class ProxyChainManager:
         normalized_owner = str(owner_id or "").strip()
         if not normalized_owner:
             raise ProxyConfigurationError("Team owner is required")
-        source = validate_generator_url(source_url)
+        source = validate_lokiproxy_source(source_url)
         bootstrap = self._assert_shared_bootstrap(bootstrap_proxy)
         existing = {item.owner_id: item for item in self.configs()}
         previous = existing.get(normalized_owner)
@@ -1204,5 +1237,6 @@ __all__ = [
     "parse_lokiproxy_response",
     "validate_bootstrap_proxy",
     "validate_generator_url",
+    "validate_lokiproxy_source",
     "validate_proxy_url",
 ]

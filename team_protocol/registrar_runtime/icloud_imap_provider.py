@@ -72,7 +72,11 @@ class ImapMailboxConfig:
                 username=str(payload.get("imap_username") or "").strip(),
                 password=str(payload.get("imap_password") or ""),
                 folder=str(payload.get("imap_folder") or "INBOX").strip(),
-                proxy=str(payload.get("mailbox_proxy") or fallback_proxy or "").strip(),
+                proxy=str(
+                    payload.get("mailbox_proxy")
+                    if "mailbox_proxy" in payload
+                    else fallback_proxy or ""
+                ).strip(),
             )
         except (TypeError, ValueError) as exc:
             raise MailboxCredentialsInvalidError("iCloud IMAP credential is invalid") from exc
@@ -228,12 +232,23 @@ class ICloudImapProvider:
         poll_interval: float = 1.0,
         **_: Any,
     ) -> None:
-        del accounts
+        self._mailboxes = list(accounts)
         self._state = _normalize_state(initial_state)
         self._state_callback = state_callback
         self.reader_factory = reader_factory
         self.poll_interval = max(0.05, min(float(poll_interval), 5.0))
         self._lock = threading.RLock()
+
+    def create_mailbox(self, **_: Any) -> tuple[str, str]:
+        with self._lock:
+            if not self._mailboxes:
+                return "", ""
+            mailbox = self._mailboxes.pop(0)
+        email_address = str(getattr(mailbox, "registration_email", "") or "").strip()
+        credential_builder = getattr(mailbox, "as_auth_credential", None)
+        if not email_address or not callable(credential_builder):
+            return "", ""
+        return email_address, str(credential_builder() or "")
 
     def snapshot_state(self) -> dict[str, Any]:
         with self._lock:

@@ -1,15 +1,24 @@
 "use strict";
 
-const STEP_DEFINITIONS = [
-  ["old_login", "旧号登录"],
-  ["new_login", "新号注册"],
-  ["invite", "邀请新号"],
-  ["old_leave", "旧号退出"],
-  ["pat", "创建令牌"],
-  ["cpa", "生成 CPA"],
-  ["push", "推送管理端"],
-  ["push_sub2api", "推送 Sub2API"],
+const STEP_GROUPS = [
+  ["账号接力", [
+    ["old_login", "旧子号登录"],
+    ["invite", "旧子号邀请新号"],
+    ["old_leave", "旧子号退出 Team"],
+    ["new_login", "新子号注册入组"],
+  ]],
+  ["凭据导出", [
+    ["pat", "新子号创建 PAT"],
+    ["cpa", "导出 CPA"],
+    ["sub2api_export", "导出 Sub2 JSON"],
+  ]],
+  ["可选交付", [
+    ["push", "推送 CPA"],
+    ["push_sub2api", "推送 Sub2API"],
+  ]],
 ];
+
+const STEP_DEFINITIONS = STEP_GROUPS.flatMap(([, steps]) => steps);
 
 const STEP_LABELS = Object.fromEntries(STEP_DEFINITIONS);
 const STEP_STATE_LABELS = {
@@ -163,6 +172,10 @@ const state = {
   proxyChainNodes: [],
   sharedClashProxy: DEFAULT_LOCAL_CLASH_PROXY,
   activeIcloudMailboxId: "",
+  activeIcloudCaptureMailboxId: "",
+  icloudHmeCaptureStatus: null,
+  icloudHmeCapturePollTimer: null,
+  icloudHmeCaptureHandled: new Set(),
   activeRunId: null,
   activeRun: null,
   activeRunEvents: [],
@@ -609,8 +622,20 @@ function renderWorkspaceTable() {
       row.append(labeledCell("下一账号", element("span", {className: next === "未分配" ? "empty-value" : "cell-primary", text: next, attrs: {title: next}})));
       row.append(labeledCell("状态", statusBadge(status, WORKSPACE_STATUS)));
 
-      const lastState = safeString(firstValue(workspace, ["last_run_state", "last_state", "last_result"]));
-      const lastTime = firstValue(workspace, ["last_run_at", "last_finished_at", "updated_at"]);
+      const lastRunId = safeString(firstValue(workspace, ["last_run_id"]));
+      const lastRunRecord = state.runs.find((run) => runId(run) === lastRunId);
+      const lastState = safeString(
+        firstValue(
+          workspace,
+          ["last_run_state", "last_state", "last_result"],
+          firstValue(lastRunRecord, ["state", "status"]),
+        ),
+      );
+      const lastTime = firstValue(
+        workspace,
+        ["last_run_at", "last_finished_at"],
+        firstValue(lastRunRecord, ["finished_at", "updated_at"], firstValue(workspace, ["updated_at"])),
+      );
       const lastRun = primarySecondary(lastState ? (RUN_STATUS[lastState]?.[0] || lastState) : "尚未运行", lastState ? formatDate(lastTime) : "");
       const lastError = safeString(firstValue(workspace, ["last_error", "redacted_error"]));
       if (lastError) lastRun.append(element("span", {className: "cell-error", text: lastError, attrs: {title: lastError}}));
@@ -626,7 +651,6 @@ function renderWorkspaceTable() {
         actions.append(actionButton("额度用完", "advance-workspace", {workspaceId: id}));
       }
       if (status === "failed") actions.append(actionButton("重试", "retry-workspace", {workspaceId: id}));
-      const lastRunId = safeString(firstValue(workspace, ["last_run_id"]));
       if (lastRunId) actions.append(actionButton("详情", "open-run-detail", {runId: lastRunId}));
       row.append(labeledCell("操作", actions, "actions-cell"));
       fragment.append(row);
@@ -939,6 +963,9 @@ function renderIcloudMailboxTable() {
     const check = actionButton("检测", "check-icloud-mailbox", {mailboxId: id});
     check.disabled = mailboxStatus === "disabled";
     actions.append(check);
+    const capture = actionButton("登录更新 HME", "open-icloud-hme-capture", {mailboxId: id});
+    capture.disabled = mailboxStatus === "disabled";
+    actions.append(capture);
     const sync = actionButton("同步 Alias", "open-icloud-sync", {mailboxId: id});
     sync.disabled = mailboxStatus !== "ready";
     actions.append(sync);
@@ -1037,7 +1064,7 @@ function renderIcloudSyncRows() {
         placeholder: item.imported
           ? "已接管"
           : item.ownerProxyMode === "lokiproxy_generator"
-            ? "https://gen.lokiproxy.com/gen?..."
+            ? "生成链接或 socks5://..."
             : "socks5h://...",
         autocomplete: "new-password",
         spellcheck: "false",
@@ -1119,7 +1146,7 @@ async function handleIcloudSync(form) {
       fieldError(
         "icloud-sync-error",
         item.ownerProxyMode === "lokiproxy_generator"
-          ? `请填写母号 ${safeString(item.email)} 对应的 LokiProxy 生成链接`
+          ? `请填写母号 ${safeString(item.email)} 对应的 LokiProxy 生成链接或 SOCKS5 端点`
           : `请填写母号 ${safeString(item.email)} 名下子号的固定 S5`,
       );
       return;
@@ -2039,7 +2066,18 @@ function stageStatesFromRun(run, events) {
   const runState = safeString(firstValue(run, ["state", "status"]));
   if (current && result[current] === "pending" && ACTIVE_RUN_STATES.has(runState)) result[current] = "running";
   if (runState === "succeeded") {
-    for (const [step] of STEP_DEFINITIONS) if (result[step] === "pending") result[step] = "done";
+    const output = runResultObject(run);
+    for (const [step] of STEP_DEFINITIONS) {
+      if (step === "sub2api_export") {
+        result[step] = firstValue(output, ["sub2api_path", "sub2api_export_path"]) ? "done" : "skipped";
+      } else if (step === "push") {
+        result[step] = output.push ? "done" : "skipped";
+      } else if (step === "push_sub2api") {
+        result[step] = output.sub2api ? "done" : "skipped";
+      } else {
+        result[step] = "done";
+      }
+    }
   }
   return result;
 }
@@ -2053,6 +2091,16 @@ function runResultObject(run) {
   } catch (_) {
     return {};
   }
+}
+
+function deliveryResultText(value) {
+  if (!value) return "未启用";
+  if (typeof value !== "object") return safeString(value, "-");
+  const action = safeString(firstValue(value, ["action", "status"], "已执行"));
+  const verified = firstValue(value, ["verified"], null);
+  if (verified === true) return `${action} · 已验证`;
+  if (verified === false) return `${action} · 未验证`;
+  return action;
 }
 
 function renderRunDetail(run, events = []) {
@@ -2080,18 +2128,28 @@ function renderRunDetail(run, events = []) {
   }
   container.append(identity);
 
-  const stageSection = element("section", {className: "stage-section"}, [element("h3", {text: "8 阶段进度"})]);
-  const stageList = element("ol", {className: "stage-list"});
+  const stageSection = element("section", {className: "stage-section"}, [element("h3", {text: "自动化闭环"})]);
+  const stageGroups = element("div", {className: "stage-groups"});
   const stageStates = stageStatesFromRun(run, events);
-  STEP_DEFINITIONS.forEach(([step, label], index) => {
-    const stageState = stageStates[step];
-    stageList.append(element("li", {className: "stage-item", dataset: {state: stageState}}, [
-      element("span", {className: "stage-index", text: String(index + 1).padStart(2, "0")}),
-      element("span", {className: "stage-name", text: label}),
-      element("span", {className: "stage-state", text: STEP_STATE_LABELS[stageState] || stageState}),
-    ]));
-  });
-  stageSection.append(stageList);
+  let stageIndex = 0;
+  for (const [groupLabel, steps] of STEP_GROUPS) {
+    const group = element("section", {className: "stage-group"}, [
+      element("h4", {text: groupLabel}),
+    ]);
+    const stageList = element("ol", {className: "stage-list"});
+    for (const [step, label] of steps) {
+      const stageState = stageStates[step];
+      stageIndex += 1;
+      stageList.append(element("li", {className: "stage-item", dataset: {state: stageState}}, [
+        element("span", {className: "stage-index", text: String(stageIndex).padStart(2, "0")}),
+        element("span", {className: "stage-name", text: label}),
+        element("span", {className: "stage-state", text: STEP_STATE_LABELS[stageState] || stageState}),
+      ]));
+    }
+    group.append(stageList);
+    stageGroups.append(group);
+  }
+  stageSection.append(stageGroups);
   container.append(stageSection);
 
   const redactedError = safeString(firstValue(run, ["redacted_error", "error"]));
@@ -2133,8 +2191,9 @@ function renderRunDetail(run, events = []) {
   const result = runResultObject(run);
   const outputs = [
     ["CPA 文件", firstValue(result, ["cpa_path", "output_path"], firstValue(run, ["cpa_path"]))],
-    ["CPA 管理端", firstValue(result, ["management_status", "push_status"], "-")],
-    ["Sub2API", firstValue(result, ["sub2api_status"], "-")],
+    ["Sub2API 文件", firstValue(result, ["sub2api_path", "sub2api_export_path"], firstValue(run, ["sub2api_path"]))],
+    ["CPA 推送", deliveryResultText(firstValue(result, ["push", "management_status", "push_status"], null))],
+    ["Sub2API 推送", deliveryResultText(firstValue(result, ["sub2api", "sub2api_status"], null))],
   ];
   const outputSection = element("section", {className: "output-section"}, [element("h3", {text: "输出"})]);
   const outputList = element("dl", {className: "run-output"});
@@ -2526,11 +2585,135 @@ async function checkIcloudMailbox(id) {
       body: {},
       timeout: 45000,
     });
-    showToast(`母号检测通过，iCloud 当前有 ${numberFormatter.format(Number(result.remote_alias_count || 0))} 个 Alias`, "success");
+    showToast(`资源池检测通过，iCloud 当前有 ${numberFormatter.format(Number(result.remote_alias_count || 0))} 个 Alias`, "success");
   } finally {
     state.icloudMailboxesLoaded = false;
     await loadIcloudMailboxes({force: true});
   }
+}
+
+const ICLOUD_HME_CAPTURE_STATE = {
+  idle: "尚未启动",
+  starting: "正在启动",
+  waiting_login: "等待登录",
+  verifying: "正在验证",
+  cancelling: "正在取消",
+  captured: "捕获成功",
+  failed: "捕获失败",
+  cancelled: "已取消",
+};
+
+function stopIcloudHmeCapturePolling() {
+  if (state.icloudHmeCapturePollTimer !== null) {
+    window.clearTimeout(state.icloudHmeCapturePollTimer);
+    state.icloudHmeCapturePollTimer = null;
+  }
+}
+
+function renderIcloudHmeCaptureStatus(status) {
+  const source = status && typeof status === "object" ? status : {};
+  const captureState = safeString(source.state, "idle");
+  const active = Boolean(source.active);
+  state.icloudHmeCaptureStatus = source;
+  byId("icloud-hme-capture-state").textContent = ICLOUD_HME_CAPTURE_STATE[captureState] || captureState;
+  byId("icloud-hme-capture-message").textContent = safeString(source.message, "等待启动登录窗口");
+  byId("icloud-hme-capture-progress").dataset.state = captureState;
+  byId("icloud-hme-capture-loader").hidden = !active;
+  byId("icloud-hme-capture-cancel").hidden = !active;
+  const error = captureState === "failed" ? safeString(source.message) : "";
+  fieldError("icloud-hme-capture-error", error);
+}
+
+async function validateCapturedIcloudSession(mailboxId) {
+  try {
+    const result = await api(`/api/icloud-mailboxes/${encodeURIComponent(mailboxId)}/check`, {
+      method: "POST",
+      body: {},
+      timeout: 45000,
+    });
+    showToast(
+      `HME Session 已更新，iCloud 当前有 ${numberFormatter.format(Number(result.remote_alias_count || 0))} 个 Alias`,
+      "success",
+    );
+  } catch (error) {
+    showToast(`HME Session 已保存，但资源池检测失败：${error?.message || String(error)}`, "error");
+  } finally {
+    state.icloudMailboxesLoaded = false;
+    await loadIcloudMailboxes({force: true});
+  }
+}
+
+async function handleIcloudHmeCaptureCompletion(mailboxId, status) {
+  const key = `${mailboxId}:${safeString(status.finished_at, status.state)}`;
+  if (state.icloudHmeCaptureHandled.has(key)) return;
+  state.icloudHmeCaptureHandled.add(key);
+  if (status.state === "captured") {
+    await validateCapturedIcloudSession(mailboxId);
+  } else if (status.state === "failed") {
+    showToast(status.message || "HME Session 自动捕获失败", "error");
+  }
+}
+
+function scheduleIcloudHmeCapturePoll(mailboxId) {
+  stopIcloudHmeCapturePolling();
+  state.icloudHmeCapturePollTimer = window.setTimeout(() => {
+    state.icloudHmeCapturePollTimer = null;
+    pollIcloudHmeCapture(mailboxId).catch((error) => {
+      fieldError("icloud-hme-capture-error", error?.message || String(error));
+    });
+  }, 700);
+}
+
+async function pollIcloudHmeCapture(mailboxId) {
+  if (state.activeIcloudCaptureMailboxId !== safeString(mailboxId)) return;
+  const status = await api(`/api/icloud-mailboxes/${encodeURIComponent(mailboxId)}/hme-capture`);
+  renderIcloudHmeCaptureStatus(status);
+  if (status.active) {
+    scheduleIcloudHmeCapturePoll(mailboxId);
+  } else {
+    await handleIcloudHmeCaptureCompletion(mailboxId, status);
+  }
+}
+
+async function openIcloudHmeCapture(mailbox) {
+  if (!ensureMutable() || !mailbox) return;
+  const mailboxId = icloudMailboxId(mailbox);
+  state.activeIcloudCaptureMailboxId = mailboxId;
+  stopIcloudHmeCapturePolling();
+  byId("icloud-hme-capture-mailbox").textContent = safeString(mailbox.name);
+  fieldError("icloud-hme-capture-error", "");
+  renderIcloudHmeCaptureStatus({state: "starting", active: true, message: "正在打开 iCloud 登录窗口"});
+  byId("icloud-hme-capture-dialog").showModal();
+  try {
+    let status = await api(`/api/icloud-mailboxes/${encodeURIComponent(mailboxId)}/hme-capture`);
+    if (!status.active) {
+      status = await api(`/api/icloud-mailboxes/${encodeURIComponent(mailboxId)}/hme-capture`, {
+        method: "POST",
+        body: {},
+      });
+    }
+    renderIcloudHmeCaptureStatus(status);
+    if (status.active) scheduleIcloudHmeCapturePoll(mailboxId);
+    else await handleIcloudHmeCaptureCompletion(mailboxId, status);
+  } catch (error) {
+    renderIcloudHmeCaptureStatus({
+      state: "failed",
+      active: false,
+      message: error?.message || String(error),
+    });
+    throw error;
+  }
+}
+
+async function cancelIcloudHmeCapture() {
+  const mailboxId = state.activeIcloudCaptureMailboxId;
+  if (!mailboxId) return;
+  const status = await api(`/api/icloud-mailboxes/${encodeURIComponent(mailboxId)}/hme-capture/cancel`, {
+    method: "POST",
+    body: {},
+  });
+  renderIcloudHmeCaptureStatus(status);
+  if (status.active) scheduleIcloudHmeCapturePoll(mailboxId);
 }
 
 async function toggleIcloudMailbox(id, nextStatus) {
@@ -2732,7 +2915,7 @@ async function openIcloudOwnerProxyDialog(aliasId) {
     : "socks5h://user:password@host:port";
   form.elements.namedItem("source_url").placeholder = generated
     ? "未更改"
-    : "https://gen.lokiproxy.com/gen?...";
+    : "生成链接或 socks5://user:password@host:port";
   form.elements.namedItem("bootstrap").value = state.sharedClashProxy;
   setIcloudOwnerProxyMode(form, generated ? "lokiproxy_generator" : "direct");
   fieldError("icloud-owner-proxy-error", "");
@@ -2756,7 +2939,7 @@ async function handleIcloudOwnerProxySubmit(form) {
     return;
   }
   if (mode === "lokiproxy_generator" && !sourceUrl && !existingGenerated) {
-    fieldError("icloud-owner-proxy-error", "请输入该母号对应的 LokiProxy 生成链接");
+    fieldError("icloud-owner-proxy-error", "请输入该母号对应的 LokiProxy 生成链接或 SOCKS5 端点");
     return;
   }
   if (mode === "lokiproxy_generator" && !bootstrap) {
@@ -2787,7 +2970,7 @@ async function handleIcloudOwnerProxySubmit(form) {
   }
   showToast(
     mode === "lokiproxy_generator"
-      ? "已保存独立 LokiProxy 源，统一使用本地 Clash 前置"
+      ? "已保存独立 LokiProxy 来源，统一使用本地 Clash 前置"
       : "子号固定 S5 已保存，母号不会参与工作流",
     "success",
   );
@@ -3000,6 +3183,12 @@ document.addEventListener("click", (event) => {
     }
     if (action === "check-icloud-mailbox") {
       return checkIcloudMailbox(button.dataset.mailboxId);
+    }
+    if (action === "open-icloud-hme-capture") {
+      return openIcloudHmeCapture(findIcloudMailbox(button.dataset.mailboxId));
+    }
+    if (action === "cancel-icloud-hme-capture") {
+      return cancelIcloudHmeCapture();
     }
     if (action === "open-icloud-sync") {
       return openIcloudSync(findIcloudMailbox(button.dataset.mailboxId));
@@ -3247,6 +3436,7 @@ for (const dialog of document.querySelectorAll("dialog")) {
       dialog.querySelector("form")?.reset();
     }
     if (dialog.id === "icloud-sync-dialog") state.remoteIcloudAliases = [];
+    if (dialog.id === "icloud-hme-capture-dialog") stopIcloudHmeCapturePolling();
   });
 }
 

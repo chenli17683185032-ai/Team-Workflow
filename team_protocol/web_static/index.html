@@ -287,18 +287,18 @@
         </section>
 
         <section class="settings-section" aria-labelledby="cpa-settings-title">
-          <header><h2 id="cpa-settings-title">CPA 管理端</h2></header>
+          <header><h2 id="cpa-settings-title">CPA 可选推送</h2></header>
           <div class="settings-fields">
             <label class="field field--wide"><span>管理端地址</span><input name="management_url" type="url" placeholder="https://example.com…" autocomplete="url" spellcheck="false"></label>
             <label class="field"><span>远端文件名</span><input name="management_filename" type="text" placeholder="留空使用自动名称…" autocomplete="off" spellcheck="false"></label>
             <div class="field"><label for="settings-management-key">Management API Key</label><input id="settings-management-key" name="management_api_key" type="password" placeholder="未更改" autocomplete="new-password"><span class="secret-state-row"><small id="management-secret-state">未设置</small><button type="button" class="text-action" data-action="toggle-secret-clear" data-secret="management_api_key">清除已保存值</button></span></div>
-            <label class="switch-field"><input name="management_push" type="checkbox"><span aria-hidden="true"></span><b>生成后推送</b></label>
+            <label class="switch-field"><input name="management_push" type="checkbox"><span aria-hidden="true"></span><b>同时推送管理端</b></label>
             <label class="switch-field"><input name="management_overwrite" type="checkbox"><span aria-hidden="true"></span><b>允许覆盖远端同名文件</b></label>
           </div>
         </section>
 
         <section class="settings-section" aria-labelledby="sub2api-settings-title">
-          <header><h2 id="sub2api-settings-title">Sub2API</h2></header>
+          <header><h2 id="sub2api-settings-title">Sub2API 导出与推送</h2></header>
           <div class="settings-fields">
             <label class="field field--wide"><span>服务地址</span><input name="sub2api_url" type="url" placeholder="https://sub2api.example.com…" autocomplete="url" spellcheck="false"></label>
             <div class="field"><label for="settings-sub2api-api-key">管理员 API Key（普通管理接口）</label><input id="settings-sub2api-api-key" name="sub2api_api_key" type="password" placeholder="未更改" autocomplete="new-password"><span class="secret-state-row"><small id="sub2api-api-key-secret-state">未设置</small><button type="button" class="text-action" data-action="toggle-secret-clear" data-secret="sub2api_api_key">清除已保存值</button></span></div>
@@ -308,7 +308,7 @@
             <label class="field"><span>并发数</span><input name="sub2api_concurrency" type="number" min="1" step="1" inputmode="numeric" autocomplete="off"></label>
             <label class="field"><span>优先级</span><input name="sub2api_priority" type="number" step="1" inputmode="numeric" autocomplete="off"></label>
             <label class="field"><span>目标分组</span><select name="sub2api_group_id"><option value="">默认分组</option></select></label>
-            <label class="switch-field"><input name="sub2api_push" type="checkbox"><span aria-hidden="true"></span><b>生成后推送</b></label>
+            <label class="switch-field"><input name="sub2api_push" type="checkbox"><span aria-hidden="true"></span><b>同时推送 Sub2API</b></label>
           </div>
         </section>
 
@@ -501,6 +501,30 @@
     </form>
   </dialog>
 
+  <dialog class="modal-dialog" id="icloud-hme-capture-dialog" aria-labelledby="icloud-hme-capture-title">
+    <div class="dialog-shell">
+      <header class="dialog-header">
+        <div><p class="eyebrow">ICLOUD SESSION CAPTURE</p><h2 id="icloud-hme-capture-title">自动更新 HME Session</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭 HME 自动捕获">×</button>
+      </header>
+      <div class="dialog-content">
+        <dl class="allocation-preview">
+          <div><dt>资源池</dt><dd id="icloud-hme-capture-mailbox">-</dd></div>
+          <div><dt>当前状态</dt><dd id="icloud-hme-capture-state">准备启动</dd></div>
+        </dl>
+        <div class="hme-capture-progress" id="icloud-hme-capture-progress" data-state="idle" role="status" aria-live="polite">
+          <span class="inline-loader" id="icloud-hme-capture-loader" aria-hidden="true" hidden></span>
+          <span id="icloud-hme-capture-message">等待启动登录窗口</span>
+        </div>
+        <div class="form-error" id="icloud-hme-capture-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button button--danger" id="icloud-hme-capture-cancel" data-action="cancel-icloud-hme-capture" hidden>取消捕获</button>
+        <button type="button" class="button" data-action="close-dialog">关闭</button>
+      </footer>
+    </div>
+  </dialog>
+
   <dialog class="modal-dialog" id="icloud-generate-dialog" aria-labelledby="icloud-generate-title">
     <form method="dialog" class="dialog-shell" id="icloud-generate-form" novalidate>
       <header class="dialog-header">
@@ -593,7 +617,7 @@
         </div>
         <label class="field" id="icloud-owner-direct-field" hidden><span>子号固定 S5 / SOCKS5 代理</span><input name="proxy" type="password" maxlength="4096" placeholder="socks5h://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
         <div class="form-grid form-grid--two" id="icloud-owner-generator-fields">
-          <label class="field field--wide"><span>LokiProxy 生成链接</span><input name="source_url" type="password" maxlength="8192" placeholder="https://gen.lokiproxy.com/gen?..." autocomplete="new-password" spellcheck="false"></label>
+          <label class="field field--wide"><span>LokiProxy 来源</span><input name="source_url" type="password" maxlength="8192" placeholder="生成链接或 socks5://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
           <label class="field field--wide"><span>统一 Clash 前置</span><input name="bootstrap" type="text" maxlength="4096" value="http://127.0.0.1:7897" readonly autocomplete="off" spellcheck="false"></label>
         </div>
         <div class="form-error" id="icloud-owner-proxy-error" role="alert" hidden></div>

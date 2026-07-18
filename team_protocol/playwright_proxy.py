@@ -25,7 +25,8 @@ def _server_url(parts: urllib.parse.SplitResult) -> str:
     host = f"[{hostname}]" if ":" in hostname else hostname
     if parts.port is None:
         raise ValueError("proxy port is required")
-    return f"{parts.scheme}://{host}:{parts.port}"
+    scheme = "socks5" if parts.scheme.casefold() == "socks5h" else parts.scheme
+    return f"{scheme}://{host}:{parts.port}"
 
 
 def _connect_target(value: str) -> tuple[str, int]:

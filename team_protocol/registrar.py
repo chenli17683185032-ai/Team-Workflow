@@ -545,3 +545,56 @@ class RegistrarAdapter:
             token_data.pop("account_password", None)
             token_data.pop("password", None)
         return token_data
+
+    def register(
+        self,
+        *,
+        email: str,
+        account_password: str,
+        mailbox: MailboxCredentials,
+        proxy: str | None = None,
+        workspace_id: str | None = None,
+        session_profile: Any = None,
+        provider_initial_state: Mapping[str, Any] | None = None,
+        provider_state_callback: Callable[[dict[str, Any]], None] | None = None,
+        verbose: bool = True,
+        stop_event: threading.Event | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        del email, account_password, workspace_id
+        if provider_initial_state is not None and not isinstance(
+            provider_initial_state, Mapping
+        ):
+            raise TypeError("provider_initial_state must be a mapping")
+        provider_name = str(mailbox.provider or "appleemail_hotmail").strip().casefold()
+        if provider_name != "icloud_hme_imap":
+            raise ValueError("registration is only supported for iCloud HME accounts")
+        provider_class = self._icloud_provider_class
+        provider = provider_class(
+            accounts=[mailbox],
+            initial_state=dict(provider_initial_state or {}),
+            state_callback=provider_state_callback,
+        )
+        emitter_queue = (
+            _CallbackEventQueue(event_callback) if event_callback is not None else None
+        )
+        emitter = self._event_emitter(q=emitter_queue, cli_mode=verbose)
+        token_json = self._register_module.run(
+            proxy,
+            emitter=emitter,
+            stop_event=stop_event,
+            mail_provider=provider,
+            mail_provider_name=provider_name,
+            session_profile=session_profile,
+        )
+        if not token_json:
+            raise RuntimeError("registrar registration failed")
+        try:
+            token_data = json.loads(str(token_json))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("registrar registration result is invalid") from exc
+        if not isinstance(token_data, dict):
+            raise RuntimeError("registrar registration result is invalid")
+        token_data.pop("account_password", None)
+        token_data.pop("password", None)
+        return token_data

@@ -26,6 +26,12 @@ from .workflow_display import STEP_IDS, is_routine_log, log_level
 _AUTHENTICATED_URL_RE = re.compile(
     r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<userinfo>[^\s/@]+)@"
 )
+_SENSITIVE_QUERY_VALUE_RE = re.compile(
+    r"(?P<prefix>(?:[?&]|&amp;)(?:access_token|code|code_challenge|"
+    r"code_verifier|id_token|nonce|refresh_token|session_token|state|token)=)"
+    r"(?P<value>[^&#\s\"']+)",
+    re.IGNORECASE,
+)
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", ""})
 
@@ -34,7 +40,8 @@ def redact_text(value: Any, secrets: tuple[str, ...] | list[str] = ()) -> str:
     clean = str(value)
     for secret in sorted({str(item) for item in secrets if str(item)}, key=len, reverse=True):
         clean = clean.replace(secret, "***")
-    return _AUTHENTICATED_URL_RE.sub(r"\g<scheme>***@", clean)
+    clean = _AUTHENTICATED_URL_RE.sub(r"\g<scheme>***@", clean)
+    return _SENSITIVE_QUERY_VALUE_RE.sub(r"\g<prefix>***", clean)
 
 
 def redact_value(value: Any, secrets: tuple[str, ...] | list[str] = ()) -> Any:

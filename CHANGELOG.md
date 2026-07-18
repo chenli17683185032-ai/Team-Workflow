@@ -1,5 +1,33 @@
 # 更新日志
 
+## 2026-07-19
+
+### 新增
+
+- 支持在控制台点击“登录更新 HME”，打开一次性可见 Chrome 窗口；用户完成中国区 iCloud 登录和双重验证后，应用自动捕获 `GET /v2/hme/list` 并更新资源池 Session。
+- 登录验证成功后增加 Cookie 回退：当 Apple Hide My Email 子应用无法载入时，使用内存中的核心会话 Cookie 构造候选 Session，并先执行 HME 只读列表验证再保存。
+- 保留手动粘贴 HME cURL/HAR 作为浏览器不可用时的降级路径。
+- 接力顺序调整为“旧号登录 -> 邀请新号 -> 旧号退出 -> 新号登录入组 -> 令牌/推送”；现场生成的下一子号沿用当前标签序号递增，例如 `组 1-7` 生成 `组 1-8`。
+- LokiProxy 子号默认链路同时支持生成 URL 与固定 SOCKS5 端点，两者均由本地中继经统一 Clash 前置连接。
+- iCloud 现场新子号使用真正的 OpenAI 注册流程；旧子号和非 iCloud 账号继续使用已有账号登录。
+- PAT 创建后无条件导出 CPA 与 Sub2API JSON；Sub2API 管理端未配置时仍能得到可导入文件。
+- Sub2API 导出对齐 `GPTSession2CPAandSub2API` 的 `exported_at / proxies / accounts` 结构，使用新建 Team PAT 作为账号令牌，并由 Session 补齐账号身份。
+- 运行详情按“账号接力 / 凭据导出 / 可选交付”重排，分别展示 CPA 与 Sub2API 文件路径及两种推送结果。
+
+### 稳定性与安全
+
+- 自动捕获只接受白名单 iCloud HME host、`GET /v2/hme/list` 和认证成功的 iCloud setup 响应；候选 Session 必须通过 HME 只读列表验证，失败时不覆盖旧密文，且只替换加密 Session，保留 IMAP、S5、Alias 与母号配置。
+- macOS 使用独立可见的 Chrome for Testing + 本地 CDP，不读取现有 Chrome profile；捕获结束、取消或超时后终止临时浏览器并删除 profile，不保存 HAR、截图或 storage state。
+- iCloud 转发 OTP 等待窗口放宽到 90 秒；资源池显式留空代理时 IMAP 保持直连，不继承子号工作流代理。
+- Chromium 端将本地 `socks5h` 中继规范化为兼容的 `socks5`；CPA/PAT 产物从创建起即使用 `0600` 权限。
+- CPA 与 Sub2API 文件改为原子写入并保持 `0600`；Sub2API 文件不包含 Web `sessionToken`，断点恢复只重建缺失文件，不重复创建 PAT。
+
+### 验证
+
+- macOS：全量 262 项测试中 256 项通过，6 项 Windows DPAPI 测试按平台跳过；Python、JavaScript 语法与 `git diff --check` 通过。
+- `组2-9` 真实 Sub2API 文件与既有可用样本的顶层、账号、credentials 和 extra 字段结构完全一致；PAT、workspace、session 排除及 `0600` 权限校验通过。
+- 控制台在 `1600×1000` 和 `390×844` 验证九阶段、四项输出及长路径展示，无横向溢出或文字裁切；历史 OAuth `state/code/token` 查询参数在 API/日志中统一脱敏。
+
 ## 2026-07-18
 
 ### 新增

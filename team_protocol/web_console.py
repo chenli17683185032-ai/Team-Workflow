@@ -45,6 +45,12 @@ from .icloud_hme import (
     ICloudHmeSession,
     parse_hme_session_import,
 )
+from .icloud_hme_capture import (
+    HmeCaptureBusyError,
+    HmeCaptureError,
+    HmeCaptureSessionRejectedError,
+    ICloudHmeCaptureManager,
+)
 from .migration import (
     CleanupResult,
     MigrationBackupError,
@@ -74,7 +80,7 @@ from .proxy_chain import (
     ProxyChainManager,
     ProxyConfigurationError,
     validate_bootstrap_proxy,
-    validate_generator_url,
+    validate_lokiproxy_source,
 )
 from .sub2api import Sub2APIClient, Sub2APIError
 from .task_queue import TaskQueue, redact_value
@@ -114,6 +120,9 @@ _VISIBLE_TEXT_SETTING_KEYS = _TEXT_SETTING_KEYS | {
     "last_backup_path",
     "last_backup_at",
 }
+_CHILD_LABEL_NUMBER_RE = re.compile(
+    r"^(?P<prefix>.*?)(?P<separator>[-_ ]+)(?P<number>[0-9]+)$"
+)
 
 
 def _configured_local_clash_proxy() -> str:
@@ -127,6 +136,25 @@ def _configured_local_clash_proxy() -> str:
         raise DatabaseConfigurationError(
             "TEAM_WORKFLOW_LOCAL_CLASH_PROXY is invalid"
         ) from exc
+
+
+def _next_icloud_child_label(
+    current_label: str,
+    workspace_name: str,
+    rotation_count: int,
+) -> str:
+    """Increment the sequence already carried by the current child label."""
+
+    current = str(current_label or "").strip()
+    match = _CHILD_LABEL_NUMBER_RE.fullmatch(current)
+    if match is not None:
+        return (
+            f"{match.group('prefix')}{match.group('separator')}"
+            f"{int(match.group('number')) + 1}"
+        )
+
+    fallback = str(workspace_name or "").strip() or "Team Workflow"
+    return f"{fallback} child {max(0, int(rotation_count)) + 1}"
 _SENSITIVE_RESPONSE_KEYS = frozenset(
     {
         "credential_blob",
@@ -439,6 +467,7 @@ class WebConsoleController:
         hme_client_factory: Any = HmeClient,
         imap_checker: Any = check_imap_mailbox,
         proxy_chain_manager: Any | None = None,
+        hme_capture_manager: Any | None = None,
         enable_proxy_chains: bool = True,
         console_port: int = 8765,
     ) -> None:
@@ -478,6 +507,11 @@ class WebConsoleController:
             list_configs=self.database.list_icloud_owner_proxy_configs,
             get_config=self.database.get_icloud_owner_proxy_config,
             bootstrap_proxy=self.local_clash_proxy,
+        )
+        self.hme_capture = hme_capture_manager or ICloudHmeCaptureManager(
+            on_session=self._save_captured_hme_session,
+            on_status=self._publish_hme_capture_status,
+            get_session_template=self._get_hme_session_template,
         )
         self._proxy_chain_startup_error: str | None = None
         self._icloud_operation_lock = threading.Lock()
@@ -546,6 +580,12 @@ class WebConsoleController:
 
     def shutdown(self) -> bool:
         with self._lifecycle_lock:
+            shutdown_hme_capture = getattr(self.hme_capture, "shutdown", None)
+            hme_capture_stopped = (
+                bool(shutdown_hme_capture())
+                if callable(shutdown_hme_capture)
+                else True
+            )
             queue_stopped = self.task_queue.shutdown()
             shutdown_proxy_chains = getattr(self.proxy_chains, "shutdown", None)
             relay_stopped = (
@@ -554,7 +594,7 @@ class WebConsoleController:
                 else True
             )
             self._started = False
-            return bool(queue_stopped and relay_stopped)
+            return bool(hme_capture_stopped and queue_stopped and relay_stopped)
 
     def health(self) -> dict[str, Any]:
         return {
@@ -984,6 +1024,66 @@ class WebConsoleController:
     def list_icloud_mailboxes(self) -> list[dict[str, Any]]:
         return _safe_payload(self.database.list_icloud_mailboxes())
 
+    def _publish_hme_capture_status(self, _: Mapping[str, Any]) -> None:
+        self.task_queue.notify_change()
+
+    def _get_hme_session_template(self, mailbox_id: str) -> ICloudHmeSession:
+        secret = self.database.get_icloud_mailbox_secrets(str(mailbox_id))
+        try:
+            return ICloudHmeSession.from_mapping(secret["session"])
+        except (KeyError, HmeSessionError, TypeError) as exc:
+            raise StateConflictError(
+                "iCloud mailbox has no reusable HME session template"
+            ) from exc
+
+    def _save_captured_hme_session(
+        self, mailbox_id: str, session: ICloudHmeSession
+    ) -> dict[str, Any]:
+        if not isinstance(session, ICloudHmeSession):
+            try:
+                session = ICloudHmeSession.from_mapping(session)
+            except (HmeSessionError, TypeError) as exc:
+                raise StateConflictError(
+                    "captured iCloud HME session is invalid"
+                ) from exc
+        if not self._icloud_operation_lock.acquire(timeout=10.0):
+            raise StateConflictError("another iCloud mailbox operation is running")
+        try:
+            secret = self.database.get_icloud_mailbox_secrets(str(mailbox_id))
+            try:
+                self.hme_client_factory(
+                    session,
+                    proxy=str(secret.get("proxy") or "").strip(),
+                ).list_aliases()
+            except HmeError as exc:
+                raise HmeCaptureSessionRejectedError(
+                    "自动捕获的 HME Session 未通过 Apple 只读列表验证"
+                ) from exc
+            updated_secret = dict(secret)
+            updated_secret["session"] = session.as_secret_dict()
+            mailbox = self.database.update_icloud_mailbox(
+                str(mailbox_id),
+                secrets=updated_secret,
+            )
+            self.task_queue.notify_change()
+            return _safe_payload(mailbox)
+        finally:
+            self._icloud_operation_lock.release()
+
+    def start_icloud_hme_capture(self, mailbox_id: str) -> dict[str, Any]:
+        mailbox = self.database.get_icloud_mailbox(str(mailbox_id))
+        if mailbox["status"] == "disabled":
+            raise StateConflictError("iCloud mailbox is disabled")
+        return _safe_payload(self.hme_capture.start(str(mailbox_id)))
+
+    def get_icloud_hme_capture_status(self, mailbox_id: str) -> dict[str, Any]:
+        self.database.get_icloud_mailbox(str(mailbox_id))
+        return _safe_payload(self.hme_capture.status(str(mailbox_id)))
+
+    def cancel_icloud_hme_capture(self, mailbox_id: str) -> dict[str, Any]:
+        self.database.get_icloud_mailbox(str(mailbox_id))
+        return _safe_payload(self.hme_capture.cancel(str(mailbox_id)))
+
     def _icloud_alias_with_proxy_status(
         self, alias: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -1129,7 +1229,7 @@ class WebConsoleController:
                     or self.local_clash_proxy
                 ).strip()
                 try:
-                    source_url = validate_generator_url(source_url)
+                    source_url = validate_lokiproxy_source(source_url)
                     bootstrap = validate_bootstrap_proxy(bootstrap)
                 except ValueError as exc:
                     raise FieldInputError({"items": str(exc)}) from exc
@@ -1237,7 +1337,7 @@ class WebConsoleController:
                 payload.get("bootstrap") or ""
             ).strip():
                 raise FieldInputError(
-                    {"mode": "generator source and first hop require generator mode"}
+                    {"mode": "LokiProxy source and first hop require LokiProxy mode"}
                 )
             updated = self.database.set_icloud_owner_proxy(
                 alias_id, str(payload.get("proxy") or "")
@@ -1367,9 +1467,17 @@ class WebConsoleController:
         client: Any = None
         try:
             _secret, client = self._icloud_client(owner["mailbox_id"])
-            label = (
-                f"{workspace['name']} child "
-                f"{int(workspace['rotation_count']) + 1}"
+            current_label = ""
+            for alias in self.database.list_icloud_aliases(owner["mailbox_id"]):
+                if str(alias.get("account_id") or "") == str(
+                    workspace["current_account_id"]
+                ):
+                    current_label = str(alias.get("label") or "").strip()
+                    break
+            label = _next_icloud_child_label(
+                current_label,
+                str(workspace["name"]),
+                int(workspace["rotation_count"]),
             )
             try:
                 remote = client.create_alias(
@@ -2278,6 +2386,30 @@ def create_app(
     async def check_icloud_mailbox(mailbox_id: str):
         return await _call_controller(controller.check_icloud_mailbox, mailbox_id)
 
+    @app.post(
+        "/api/icloud-mailboxes/{mailbox_id}/hme-capture",
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_icloud_hme_capture(mailbox_id: str):
+        return await _call_controller(
+            controller.start_icloud_hme_capture,
+            mailbox_id,
+        )
+
+    @app.get("/api/icloud-mailboxes/{mailbox_id}/hme-capture")
+    async def get_icloud_hme_capture_status(mailbox_id: str):
+        return await _call_controller(
+            controller.get_icloud_hme_capture_status,
+            mailbox_id,
+        )
+
+    @app.post("/api/icloud-mailboxes/{mailbox_id}/hme-capture/cancel")
+    async def cancel_icloud_hme_capture(mailbox_id: str):
+        return await _call_controller(
+            controller.cancel_icloud_hme_capture,
+            mailbox_id,
+        )
+
     @app.get("/api/icloud-mailboxes/{mailbox_id}/remote-aliases")
     async def preview_remote_icloud_aliases(mailbox_id: str):
         return await _call_controller(
@@ -2457,6 +2589,16 @@ async def _call_controller(function, *args, **kwargs):
     except (BindingConflictError, StaleVersionError, StateConflictError, ConflictError) as exc:
         raise HTTPException(
             status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except HmeCaptureBusyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except HmeCaptureError as exc:
+        raise HTTPException(
+            status_code=503,
             detail={"code": exc.code, "message": str(exc)},
         ) from exc
     except ValidationError as exc:

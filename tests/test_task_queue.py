@@ -801,10 +801,14 @@ class TaskQueueTests(unittest.TestCase):
         })
 
     def test_redact_text_removes_known_secrets_and_url_userinfo(self):
-        value = "token=canary https://name:password@example.invalid/path"
+        value = (
+            "token=canary https://name:password@example.invalid/path"
+            "?screen_hint=signup&state=oauth-state-secret&code=callback-code"
+        )
         self.assertEqual(
             redact_text(value, ("canary",)),
-            "token=*** https://***@example.invalid/path",
+            "token=*** https://***@example.invalid/path"
+            "?screen_hint=signup&state=***&code=***",
         )
 
 

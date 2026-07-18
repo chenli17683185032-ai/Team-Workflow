@@ -20,6 +20,7 @@ from team_protocol.proxy_chain import (
     ProxySourceNotWhitelistedError,
     parse_lokiproxy_response,
     validate_generator_url,
+    validate_lokiproxy_source,
 )
 
 
@@ -231,6 +232,22 @@ class ProxyChainTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 validate_generator_url(invalid)
+
+    def test_fixed_socks_source_bypasses_generator_request(self):
+        source = "socks5://fixed-user:fixed-pass@proxy.example:3010"
+        fetcher = LokiProxyFetcher(
+            requester=lambda *_args, **_kwargs: self.fail(
+                "fixed SOCKS source must not call the generator"
+            )
+        )
+
+        endpoint = fetcher.fetch(source, "http://127.0.0.1:7897")
+
+        self.assertEqual(validate_lokiproxy_source(source), source)
+        self.assertEqual(
+            (endpoint.host, endpoint.port, endpoint.username, endpoint.password),
+            ("proxy.example", 3010, "fixed-user", "fixed-pass"),
+        )
 
     def test_lokiproxy_parser_accepts_json_and_plain_text(self):
         endpoint = parse_lokiproxy_response(

@@ -25,6 +25,8 @@ output/
 *.twbackup
 *.har
 *.cpa.json
+*.sub2api.json
+*.sub2api.*.json
 *.session.json
 *.pat.json
 workflow*.json

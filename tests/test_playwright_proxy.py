@@ -29,6 +29,13 @@ class PlaywrightProxyTests(unittest.TestCase):
                 },
             )
 
+    def test_unauthenticated_socks5h_is_normalized_for_chromium(self):
+        with PlaywrightProxyLease("socks5h://127.0.0.1:19280") as lease:
+            self.assertEqual(
+                lease.playwright_proxy,
+                {"server": "socks5://127.0.0.1:19280"},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

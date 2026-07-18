@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import re
 import struct
 import time
 from dataclasses import dataclass
@@ -11,7 +12,12 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from .cpa import OPENAI_AUTH_CLAIM, build_cpa, decode_jwt_payload
+from .cpa import (
+    OPENAI_AUTH_CLAIM,
+    build_cpa,
+    decode_jwt_payload,
+    sanitize_file_token,
+)
 
 
 class Sub2APIError(RuntimeError):
@@ -61,6 +67,73 @@ def _without_empty(values: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, bool) or value is None:
+        return None
+    elif isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp <= 0:
+            return None
+        if timestamp > 100_000_000_000:
+            timestamp /= 1000
+        try:
+            return datetime.fromtimestamp(timestamp, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return _as_utc_datetime(numeric)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _jwt_expiry(token: str) -> datetime | None:
+    payload = decode_jwt_payload(_clean_token(token))
+    return _as_utc_datetime(payload.get("exp"))
+
+
+def _session_expiry(session: Mapping[str, Any]) -> datetime | None:
+    nested_tokens = (
+        session.get("tokens") if isinstance(session.get("tokens"), dict) else {}
+    )
+    session_access_token = str(
+        session.get("accessToken")
+        or session.get("access_token")
+        or nested_tokens.get("accessToken")
+        or nested_tokens.get("access_token")
+        or ""
+    )
+    return _jwt_expiry(session_access_token) or _as_utc_datetime(
+        session.get("expired")
+        or session.get("expiresAt")
+        or session.get("expires_at")
+        or session.get("expires")
+    )
+
+
+def _email_key(email: str) -> str:
+    return re.sub(r"^_+|_+$", "", re.sub(r"[^a-z0-9]+", "_", email.casefold()))
+
+
 def build_sub2api_account(
     session: Mapping[str, Any],
     *,
@@ -68,6 +141,7 @@ def build_sub2api_account(
     concurrency: int = 10,
     priority: int = 1,
     group_id: int | None = None,
+    personal_access_token_expires_at: Any = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     token = _clean_token(personal_access_token)
@@ -102,7 +176,17 @@ def build_sub2api_account(
     ).strip()
     plan_type = str(cpa.get("plan_type") or "").strip()
     name = email or str(cpa.get("name") or "ChatGPT Account").strip()
-    exported_at = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    exported_at = _iso_utc(now)
+    expires_at = (
+        _as_utc_datetime(personal_access_token_expires_at)
+        or _jwt_expiry(token)
+        or _session_expiry(session)
+    )
+    expires_in = (
+        max(0, int((expires_at - now).total_seconds()))
+        if expires_at is not None
+        else None
+    )
 
     credentials = _without_empty(
         {
@@ -113,16 +197,19 @@ def build_sub2api_account(
             "chatgpt_account_id": account_id,
             "chatgpt_user_id": user_id,
             "email": email,
+            "expires_at": _iso_utc(expires_at) if expires_at is not None else None,
+            "expires_in": expires_in,
             "plan_type": plan_type,
         }
     )
     extra = _without_empty(
         {
             "email": email,
-            "email_key": email.casefold(),
+            "email_key": _email_key(email),
             "name": name,
             "auth_provider": "codex_personal_access_token",
             "import_source": "codex_personal_access_token",
+            "source": "chatgpt_web_session",
             "last_refresh": exported_at,
         }
     )
@@ -130,7 +217,6 @@ def build_sub2api_account(
         "name": name,
         "platform": "openai",
         "type": "oauth",
-        "auto_pause_on_expired": True,
         "concurrency": int(concurrency),
         "priority": int(priority),
         "credentials": credentials,
@@ -139,6 +225,41 @@ def build_sub2api_account(
     if group_id is not None:
         account["group_ids"] = [int(group_id)]
     return account
+
+
+def build_sub2api_export(
+    session: Mapping[str, Any],
+    *,
+    personal_access_token: str,
+    concurrency: int = 10,
+    priority: int = 1,
+    group_id: int | None = None,
+    personal_access_token_expires_at: Any = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    exported_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    account = build_sub2api_account(
+        session,
+        personal_access_token=personal_access_token,
+        concurrency=concurrency,
+        priority=priority,
+        group_id=group_id,
+        personal_access_token_expires_at=personal_access_token_expires_at,
+        now=exported_at,
+    )
+    return {
+        "exported_at": _iso_utc(exported_at),
+        "proxies": [],
+        "accounts": [account],
+    }
+
+
+def build_sub2api_filename(
+    email: str, *, local_time: datetime | None = None
+) -> str:
+    local_time = local_time or datetime.now().astimezone()
+    timestamp = local_time.strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{sanitize_file_token(email)}.sub2api.{timestamp}.json"
 
 
 class Sub2APIClient:

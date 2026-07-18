@@ -3,13 +3,14 @@ from __future__ import annotations
 
 STEP_DEFINITIONS = (
     ("old_login", "旧号登录"),
-    ("new_login", "新号注册"),
     ("invite", "邀请新号"),
     ("old_leave", "旧号退出"),
+    ("new_login", "新号注册"),
     ("pat", "创建令牌"),
-    ("cpa", "生成 CPA"),
-    ("push", "推送 CPA"),
-    ("push_sub2api", "推送 Sub2API"),
+    ("cpa", "导出 CPA"),
+    ("sub2api_export", "导出 Sub2 JSON"),
+    ("push", "推送 CPA（可选）"),
+    ("push_sub2api", "推送 Sub2API（可选）"),
 )
 
 STEP_STATE_TEXT = {

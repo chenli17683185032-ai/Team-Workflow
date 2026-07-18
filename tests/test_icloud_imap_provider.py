@@ -20,6 +20,7 @@ from team_protocol.registrar_runtime.icloud_imap_provider import (
     _ProxyIMAP4SSL,
     _proxy_spec,
 )
+from team_protocol.registrar import MailboxCredentials
 
 
 class FakeImap:
@@ -93,6 +94,26 @@ def credential(**overrides):
 
 
 class ICloudImapProviderTests(unittest.TestCase):
+    def test_provider_supplies_one_precreated_hme_mailbox_to_registration(self):
+        mailbox = MailboxCredentials(
+            primary_email="forwarding@example.com",
+            registration_email="target@icloud.com",
+            client_id="",
+            refresh_token="",
+            provider="icloud_hme_imap",
+            forwarding_email="forwarding@example.com",
+            imap_host="imap.example.com",
+            imap_username="forwarding@example.com",
+            imap_password="imap-secret",
+        )
+        provider = ICloudImapProvider(accounts=[mailbox])
+
+        email_address, auth_credential = provider.create_mailbox()
+
+        self.assertEqual(email_address, "target@icloud.com")
+        self.assertEqual(json.loads(auth_credential)["provider"], "icloud_hme_imap")
+        self.assertEqual(provider.create_mailbox(), ("", ""))
+
     def test_reader_matches_exact_alias_and_ignores_other_alias(self):
         connection = FakeImap(
             {
@@ -282,6 +303,15 @@ class ICloudImapProviderTests(unittest.TestCase):
             states[-1]["seen_uids"]["target@icloud.com"], ["55", "56"]
         )
         self.assertNotIn("imap-secret", json.dumps(states))
+
+    def test_explicit_empty_mailbox_proxy_does_not_inherit_workflow_proxy(self):
+        config = ImapMailboxConfig.from_auth_credential(
+            credential(mailbox_proxy=""),
+            "target@icloud.com",
+            fallback_proxy="socks5h://workflow:secret@proxy.invalid:1080",
+        )
+
+        self.assertEqual(config.proxy, "")
 
     def test_provider_empty_polling_stops_at_the_requested_timeout(self):
         class Reader:

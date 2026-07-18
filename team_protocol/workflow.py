@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -17,7 +19,11 @@ from .registrar import (
     RegistrarProxyLease,
     proxy_region_code,
 )
-from .sub2api import Sub2APIClient, build_sub2api_account
+from .sub2api import (
+    Sub2APIClient,
+    build_sub2api_export,
+    build_sub2api_filename,
+)
 
 
 _FINGERPRINT_STATE_STEP = "_fingerprint_profile"
@@ -579,7 +585,16 @@ class WorkflowRunner:
         login_kwargs["provider_initial_state"] = dict(provider_state or {})
         login_kwargs["provider_state_callback"] = self._checkpoint_provider_state
         try:
-            session = self.registrar.login(**login_kwargs)
+            operation = (
+                getattr(self.registrar, "register", None)
+                if step == "new_login"
+                and mailbox is not None
+                and mailbox.provider == "icloud_hme_imap"
+                else None
+            )
+            if not callable(operation):
+                operation = self.registrar.login
+            session = operation(**login_kwargs)
         except RegistrarIdentityError as exc:
             self._check_cancel()
             role = "current" if step == "old_login" else "next"
@@ -703,6 +718,30 @@ class WorkflowRunner:
         self.state.set("pat", result)
         return result
 
+    @staticmethod
+    def _write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(json.dumps(dict(payload), ensure_ascii=False, indent=2) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+            os.chmod(path, 0o600)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
     def _write_cpa(self, new_session: Mapping[str, Any], pat: Mapping[str, Any]) -> Path:
         self._check_cancel()
         cached = self.state.get("cpa")
@@ -714,10 +753,151 @@ class WorkflowRunner:
         payload = build_cpa(new_session, personal_access_token=str(pat.get("access_token") or ""))
         filename = build_cpa_filename(str(payload.get("email") or self.config.new_account.email))
         path = self.config.output_dir / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write_private_json(path, payload)
         self.state.set("cpa", {"path": str(path.resolve()), "filename": filename})
         self._log(f"[cpa] {path.resolve()}")
+        return path
+
+    @staticmethod
+    def _has_forbidden_sub2api_material(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                normalized = str(key).replace("_", "").casefold()
+                if normalized in {
+                    "authorization",
+                    "cookie",
+                    "cookies",
+                    "headers",
+                    "sessiontoken",
+                }:
+                    return True
+                if WorkflowRunner._has_forbidden_sub2api_material(item):
+                    return True
+        elif isinstance(value, list):
+            return any(
+                WorkflowRunner._has_forbidden_sub2api_material(item)
+                for item in value
+            )
+        return False
+
+    @staticmethod
+    def _sub2api_account_from_file(path: Path) -> dict[str, Any]:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            raise RuntimeError("Sub2API export is not a JSON object")
+        if WorkflowRunner._has_forbidden_sub2api_material(document):
+            raise RuntimeError("Sub2API export contains forbidden session material")
+        if set(document) != {"exported_at", "proxies", "accounts"}:
+            raise RuntimeError("Sub2API export has an invalid top-level structure")
+        if document.get("proxies") != []:
+            raise RuntimeError("Sub2API export contains unexpected proxies")
+        accounts = document.get("accounts")
+        if not isinstance(accounts, list) or len(accounts) != 1:
+            raise RuntimeError("Sub2API export must contain exactly one account")
+        account = accounts[0]
+        if not isinstance(account, dict):
+            raise RuntimeError("Sub2API export account is invalid")
+        return account
+
+    @staticmethod
+    def _sub2api_accounts_match(
+        cached: Mapping[str, Any], expected: Mapping[str, Any]
+    ) -> bool:
+        for key in (
+            "name",
+            "platform",
+            "type",
+            "concurrency",
+            "priority",
+            "group_ids",
+        ):
+            if cached.get(key) != expected.get(key):
+                return False
+        cached_credentials = cached.get("credentials")
+        expected_credentials = expected.get("credentials")
+        cached_extra = cached.get("extra")
+        expected_extra = expected.get("extra")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                cached_credentials,
+                expected_credentials,
+                cached_extra,
+                expected_extra,
+            )
+        ):
+            return False
+        for key in (
+            "access_token",
+            "auth_mode",
+            "openai_auth_mode",
+            "token_type",
+            "chatgpt_account_id",
+            "chatgpt_user_id",
+            "email",
+            "expires_at",
+            "plan_type",
+        ):
+            if cached_credentials.get(key) != expected_credentials.get(key):
+                return False
+        for key in (
+            "email",
+            "email_key",
+            "name",
+            "auth_provider",
+            "import_source",
+            "source",
+        ):
+            if cached_extra.get(key) != expected_extra.get(key):
+                return False
+        return True
+
+    def _write_sub2api_export(
+        self,
+        new_session: Mapping[str, Any],
+        pat: Mapping[str, Any],
+    ) -> Path:
+        self._check_cancel()
+        token = str(pat.get("access_token") or "").strip()
+        expected = build_sub2api_export(
+            new_session,
+            personal_access_token=token,
+            concurrency=self.config.sub2api_concurrency,
+            priority=self.config.sub2api_priority,
+            group_id=self.config.sub2api_group_id,
+            personal_access_token_expires_at=pat.get("expires_at"),
+        )
+        expected_account = expected["accounts"][0]
+        cached = self.state.get("sub2api_export")
+        cached_path: Path | None = None
+        if isinstance(cached, dict):
+            raw_cached_path = str(cached.get("path") or "").strip()
+            cached_path = Path(raw_cached_path) if raw_cached_path else None
+            if cached_path is not None and cached_path.exists():
+                try:
+                    cached_account = self._sub2api_account_from_file(cached_path)
+                except (OSError, ValueError, RuntimeError):
+                    pass
+                else:
+                    if self._sub2api_accounts_match(
+                        cached_account, expected_account
+                    ):
+                        os.chmod(cached_path, 0o600)
+                        self._log("[resume] sub2api_export")
+                        return cached_path
+        if cached_path is None:
+            filename = build_sub2api_filename(
+                str(expected_account.get("name") or self.config.new_account.email)
+            )
+            path = self.config.output_dir / filename
+        else:
+            path = cached_path
+            filename = str(cached.get("filename") or path.name)
+        self._write_private_json(path, expected)
+        self.state.set(
+            "sub2api_export", {"path": str(path.resolve()), "filename": filename}
+        )
+        self._log(f"[sub2api-export] {path.resolve()}")
         return path
 
     def _push(self, cpa_path: Path) -> dict[str, Any] | None:
@@ -751,8 +931,7 @@ class WorkflowRunner:
 
     def _push_sub2api(
         self,
-        new_session: Mapping[str, Any],
-        pat: Mapping[str, Any],
+        export_path: Path,
     ) -> dict[str, Any] | None:
         self._check_cancel()
         if not self.config.sub2api_push:
@@ -770,14 +949,7 @@ class WorkflowRunner:
             raise RuntimeError(
                 "Sub2API push requires administrator email, password, and TOTP secret"
             )
-        token = str(pat.get("access_token") or "").strip()
-        account = build_sub2api_account(
-            new_session,
-            personal_access_token=token,
-            concurrency=self.config.sub2api_concurrency,
-            priority=self.config.sub2api_priority,
-            group_id=self.config.sub2api_group_id,
-        )
+        account = self._sub2api_account_from_file(export_path)
         owns_client = self.sub2api is None
         client_options = {}
         if self.config.sub2api_api_key:
@@ -838,6 +1010,10 @@ class WorkflowRunner:
                 return self._switch_workspace(login, "old_workspace")
 
             old_workspace = self._run_stage("old_login", old_login_stage)
+            invite = self._run_stage("invite", lambda: self._ensure_invited(old_workspace))
+            old_leave = self._run_stage(
+                "old_leave", lambda: self._leave_old_account(old_workspace)
+            )
             new_login = self._run_stage(
                 "new_login",
                 lambda: self._login(
@@ -845,10 +1021,6 @@ class WorkflowRunner:
                     "new_login",
                     select_workspace=False,
                 ),
-            )
-            invite = self._run_stage("invite", lambda: self._ensure_invited(old_workspace))
-            old_leave = self._run_stage(
-                "old_leave", lambda: self._leave_old_account(old_workspace)
             )
 
             def pat_stage() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -870,9 +1042,13 @@ class WorkflowRunner:
             cpa_path = self._run_stage(
                 "cpa", lambda: self._write_cpa(new_workspace, pat)
             )
+            sub2api_path = self._run_stage(
+                "sub2api_export",
+                lambda: self._write_sub2api_export(new_workspace, pat),
+            )
             push = self._run_stage("push", lambda: self._push(cpa_path))
             sub2api = self._run_stage(
-                "push_sub2api", lambda: self._push_sub2api(new_workspace, pat)
+                "push_sub2api", lambda: self._push_sub2api(sub2api_path)
             )
             self._check_cancel()
             summary = {
@@ -882,6 +1058,7 @@ class WorkflowRunner:
                 "invite": invite.get("action"),
                 "old_leave": old_leave.get("action"),
                 "cpa_path": str(cpa_path.resolve()),
+                "sub2api_path": str(sub2api_path.resolve()),
                 "push": push,
                 "sub2api": sub2api,
             }

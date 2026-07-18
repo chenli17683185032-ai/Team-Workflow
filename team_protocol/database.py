@@ -45,11 +45,12 @@ ICLOUD_ALIAS_STATES = frozenset({"active", "inactive"})
 ICLOUD_ALIAS_ROLES = frozenset({"team_owner", "rotating_child"})
 WORKFLOW_STEPS = (
     "old_login",
-    "new_login",
     "invite",
     "old_leave",
+    "new_login",
     "pat",
     "cpa",
+    "sub2api_export",
     "push",
     "push_sub2api",
 )

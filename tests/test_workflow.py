@@ -209,7 +209,11 @@ class FakeChatGPT:
     def create_personal_access_token(self, access_token_value, account_id, *, name, ttl):
         del access_token_value
         self.calls.append(("pat", account_id, name, ttl))
-        return {"access_token": "at-test", "workspace_id": account_id}
+        return {
+            "access_token": "at-test",
+            "workspace_id": account_id,
+            "expires_at": 1_900_000_000,
+        }
 
 
 class FakeManagement:
@@ -425,7 +429,7 @@ class WorkflowTests(unittest.TestCase):
                 runner.close()
         self.assertNotIsInstance(caught.exception, WorkflowIdentityError)
 
-    def test_new_account_preflight_precedes_invite_and_old_account_leave(self):
+    def test_old_account_invites_and_leaves_before_new_account_login(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_workflow_config(
                 Path(directory),
@@ -474,9 +478,97 @@ class WorkflowTests(unittest.TestCase):
             ("login", config.old_account.email, config.workspace_id),
             timeline,
         )
-        self.assertLess(timeline.index(new_login), timeline.index(invite))
         self.assertLess(timeline.index(invite), timeline.index(leave))
         self.assertLess(timeline.index(leave), timeline.index(new_workspace))
+        self.assertLess(timeline.index(leave), timeline.index(new_login))
+        self.assertLess(timeline.index(new_login), timeline.index(new_workspace))
+
+    def test_new_account_uses_registration_when_adapter_supports_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+            )
+
+            class RegisteringRegistrar(FakeRegistrar):
+                def __init__(self):
+                    super().__init__()
+                    self.registered = []
+
+                def register(self, **kwargs):
+                    self.registered.append(kwargs["email"])
+                    return {
+                        "email": kwargs["email"],
+                        "session_token": "new-login-session",
+                    }
+
+            registrar = RegisteringRegistrar()
+            dependencies = run_dependencies(config)
+            dependencies["new_mailbox"] = MailboxCredentials(
+                primary_email="forwarding@example.com",
+                registration_email=config.new_account.email,
+                client_id="",
+                refresh_token="",
+                provider="icloud_hme_imap",
+                forwarding_email="forwarding@example.com",
+                imap_host="imap.example.com",
+                imap_username="forwarding@example.com",
+                imap_password="imap-secret",
+            )
+            WorkflowRunner(
+                config,
+                **dependencies,
+                registrar=registrar,
+                chatgpt=FakeChatGPT(
+                    config.workspace_id,
+                    config.old_account.email,
+                    config.new_account.email,
+                ),
+                verbose=False,
+            ).run()
+
+        self.assertEqual(registrar.registered, [config.new_account.email])
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+
+    def test_existing_non_icloud_new_account_still_uses_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+            )
+
+            class RegistrarWithRegistration(FakeRegistrar):
+                def __init__(self):
+                    super().__init__()
+                    self.registered = []
+
+                def register(self, **kwargs):
+                    self.registered.append(kwargs["email"])
+                    return super().login(**kwargs)
+
+            registrar = RegistrarWithRegistration()
+            WorkflowRunner(
+                config,
+                **run_dependencies(config),
+                registrar=registrar,
+                chatgpt=FakeChatGPT(
+                    config.workspace_id,
+                    config.old_account.email,
+                    config.new_account.email,
+                ),
+                verbose=False,
+            ).run()
+
+        self.assertEqual(registrar.registered, [])
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email, config.new_account.email],
+        )
 
     def test_personal_workspace_refresh_reauthenticates_new_account_after_invite(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -557,7 +649,7 @@ class WorkflowTests(unittest.TestCase):
             2,
         )
 
-    def test_new_account_identity_failure_stops_before_invite_and_leave(self):
+    def test_new_account_identity_failure_happens_after_invite_and_leave(self):
         for code in ("alias_disabled", "mailbox_credentials_invalid"):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 config = make_workflow_config(
@@ -604,14 +696,13 @@ class WorkflowTests(unittest.TestCase):
                         (config.new_account.email, None),
                     ],
                 )
-                self.assertFalse(
-                    any(call[0] in {"invite", "leave"} for call in chatgpt.calls)
-                )
-                self.assertIsNone(checkpoint.get("invite"))
-                self.assertIsNone(checkpoint.get("old_leave"))
+                self.assertTrue(any(call[0] == "invite" for call in chatgpt.calls))
+                self.assertTrue(any(call[0] == "leave" for call in chatgpt.calls))
+                self.assertIsInstance(checkpoint.get("invite"), dict)
+                self.assertIsInstance(checkpoint.get("old_leave"), dict)
                 self.assertIsNone(checkpoint.get("new_login"))
 
-    def test_invalid_cached_new_login_stops_before_invite_and_leave(self):
+    def test_invalid_cached_new_login_is_checked_after_invite_and_leave(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_workflow_config(
                 Path(directory),
@@ -639,11 +730,10 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no session_token"):
                 runner.run()
 
-        self.assertFalse(
-            any(call[0] in {"invite", "leave"} for call in chatgpt.calls)
-        )
-        self.assertIsNone(checkpoint.get("invite"))
-        self.assertIsNone(checkpoint.get("old_leave"))
+        self.assertTrue(any(call[0] == "invite" for call in chatgpt.calls))
+        self.assertTrue(any(call[0] == "leave" for call in chatgpt.calls))
+        self.assertIsInstance(checkpoint.get("invite"), dict)
+        self.assertIsInstance(checkpoint.get("old_leave"), dict)
 
     def test_complete_flow_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -695,11 +785,29 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(result["invite"], "invited")
             self.assertEqual(result["old_leave"], "left")
             self.assertTrue(Path(result["cpa_path"]).exists())
+            self.assertEqual(Path(result["cpa_path"]).stat().st_mode & 0o777, 0o600)
             cpa = json.loads(Path(result["cpa_path"]).read_text(encoding="utf-8"))
             self.assertEqual(cpa["access_token"], "at-test")
             self.assertNotIn("session_token", cpa)
             self.assertNotIn("expired", cpa)
             self.assertNotIn("headers", cpa)
+            self.assertTrue(Path(result["sub2api_path"]).exists())
+            self.assertEqual(
+                Path(result["sub2api_path"]).stat().st_mode & 0o777,
+                0o600,
+            )
+            sub2api_export = json.loads(
+                Path(result["sub2api_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                list(sub2api_export), ["exported_at", "proxies", "accounts"]
+            )
+            self.assertEqual(sub2api_export["proxies"], [])
+            self.assertEqual(
+                sub2api_export["accounts"][0]["credentials"]["access_token"],
+                "at-test",
+            )
+            self.assertNotIn("session-token", json.dumps(sub2api_export))
             self.assertEqual(result["push"]["action"], "uploaded")
             self.assertEqual(result["sub2api"]["action"], "created")
             self.assertEqual(len(sub2api.calls), 1)
@@ -713,6 +821,11 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(f"[login] {old_email}", logs)
             self.assertIn(f"[register] {new_email}", logs)
             self.assertTrue(any(message.startswith("[cpa]") for message in logs))
+            self.assertTrue(
+                any(message.startswith("[sub2api-export]") for message in logs)
+            )
+
+            Path(result["sub2api_path"]).unlink()
 
             second_registrar = FakeRegistrar()
             second_chatgpt = FakeChatGPT(workspace_id, old_email, new_email)
@@ -728,6 +841,8 @@ class WorkflowTests(unittest.TestCase):
                 verbose=False,
             ).run()
             self.assertEqual(resumed["cpa_path"], result["cpa_path"])
+            self.assertEqual(resumed["sub2api_path"], result["sub2api_path"])
+            self.assertTrue(Path(resumed["sub2api_path"]).exists())
             self.assertEqual(second_registrar.calls, [])
             self.assertEqual(second_management.calls, [])
             self.assertEqual(second_sub2api.calls, [])
@@ -737,7 +852,7 @@ class WorkflowTests(unittest.TestCase):
                 registrar.resolved_profiles[0].profile_id,
             )
 
-    def test_eight_stage_event_order_marks_disabled_pushes_skipped(self):
+    def test_nine_stage_event_order_marks_disabled_pushes_skipped(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_workflow_config(
                 Path(directory),
@@ -764,16 +879,18 @@ class WorkflowTests(unittest.TestCase):
             [
                 ("old_login", "active"),
                 ("old_login", "done"),
-                ("new_login", "active"),
-                ("new_login", "done"),
                 ("invite", "active"),
                 ("invite", "done"),
                 ("old_leave", "active"),
                 ("old_leave", "done"),
+                ("new_login", "active"),
+                ("new_login", "done"),
                 ("pat", "active"),
                 ("pat", "done"),
                 ("cpa", "active"),
                 ("cpa", "done"),
+                ("sub2api_export", "active"),
+                ("sub2api_export", "done"),
                 ("push", "active"),
                 ("push", "skipped"),
                 ("push_sub2api", "active"),
@@ -782,6 +899,28 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIsNone(result["push"])
         self.assertIsNone(result["sub2api"])
+
+    def test_sub2api_export_rejects_embedded_session_material(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unsafe.sub2api.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "exported_at": "2026-07-19T00:00:00.000Z",
+                        "proxies": [],
+                        "accounts": [
+                            {
+                                "credentials": {"access_token": "at-test"},
+                                "extra": {"sessionToken": "must-not-leak"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "forbidden session material"):
+                WorkflowRunner._sub2api_account_from_file(path)
 
     def test_sub2api_push_passes_totp_session_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -871,7 +1010,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(resumed_chatgpt.calls, [])
         self.assertEqual(resumed_management.calls, [])
         self.assertEqual(resumed_sub2api.calls, [])
-        for name in ("invite", "old_leave", "pat", "push", "push_sub2api"):
+        for name in (
+            "invite",
+            "old_leave",
+            "pat",
+            "sub2api_export",
+            "push",
+            "push_sub2api",
+        ):
             self.assertIsInstance(checkpoint.get(name), dict)
 
     def test_one_fingerprint_and_one_expanded_proxy_cover_the_full_flow(self):
@@ -1158,7 +1304,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(resumed_registrar.profile_geo_hints, [stored_geo])
         self.assertTrue(resumed_registrar.restored_profile)
 
-    def test_injected_run_dependencies_create_only_explicit_cpa_file(self):
+    def test_injected_run_dependencies_create_only_explicit_export_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = make_workflow_config(
@@ -1235,7 +1381,12 @@ class WorkflowTests(unittest.TestCase):
             self.assertFalse((config.output_dir / ".registrar").exists())
             self.assertEqual(
                 created,
-                {Path(result["cpa_path"]).resolve().relative_to(root.resolve())},
+                {
+                    Path(result["cpa_path"]).resolve().relative_to(root.resolve()),
+                    Path(result["sub2api_path"])
+                    .resolve()
+                    .relative_to(root.resolve()),
+                },
             )
             self.assertFalse(
                 any(
@@ -1304,12 +1455,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(stop_event.wait_calls, [9.5])
         self.assertEqual(checkpoint.get("invite")["action"], "invited")
         self.assertIsNone(checkpoint.get("old_leave"))
-        self.assertIsInstance(checkpoint.get("new_login"), dict)
+        self.assertIsNone(checkpoint.get("new_login"))
         self.assertEqual(
             registrar.calls,
             [
                 (config.old_account.email, None),
-                (config.new_account.email, None),
             ],
         )
         self.assertNotIn(("leave", config.workspace_id, "user-old"), chatgpt.calls)
@@ -1319,8 +1469,6 @@ class WorkflowTests(unittest.TestCase):
             [
                 ("old_login", "active"),
                 ("old_login", "done"),
-                ("new_login", "active"),
-                ("new_login", "done"),
                 ("invite", "active"),
                 ("invite", "cancelled"),
             ],
