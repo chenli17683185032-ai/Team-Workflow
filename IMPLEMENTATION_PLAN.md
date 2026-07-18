@@ -127,7 +127,7 @@
 - [x] 由用户在本地控制台输入自己的 IMAP 授权码后创建资源池并完成首次 HME / IMAP 检测。
 - [x] 安装 macOS LaunchAgent，确保本地控制台登录后自动运行并在异常退出后自动拉起。
 - [x] 重新登录并刷新失效的 HME Session；列表接口再次返回 `200`，远端 Alias 预览成功。
-- [ ] 处理 LokiProxy 生成 API URL：在不把生成链接误当直连 S5 的前提下，解析或改填实际 `host:port` 代理后再接管 Alias。
+- [x] 处理 LokiProxy 生成 API URL：在不把生成链接误当直连 S5 的前提下，通过对应 Clash 第一跳请求生成 API，解析 JSON `data[].ip/port` 并动态发布 provider。
 - [ ] 分别配置两个母号的独立 S5、绑定空间，并验证当前子号归属和已用完统计。
 - [ ] 完成正式数据库完整性、敏感信息和运行状态检查；不触发真实 Alias 创建、停用或删除。
 
@@ -156,7 +156,7 @@
 - 2026-07-18：完成 schema v6、母号/子号归属、独立 S5、按需创建、接力提交和已用完池闭环。
 - 2026-07-18：完成选择性同步、空间母号绑定、Alias 管理和宽屏对话框实现。
 - 2026-07-18：修复 iCloud 关联字段对普通邮箱库存账号视图的兼容性回归；数据库与控制台 80 项聚焦测试通过。
-- 2026-07-18：全量 226 项测试完成，220 项通过，6 项 Windows DPAPI 测试按 macOS 平台预期跳过；JS 与 Python 语法检查通过。
+- 2026-07-18：全量 238 项测试完成，232 项通过，6 项 Windows DPAPI 测试按 macOS 平台预期跳过；JS 与 Python 语法检查通过。
 - 2026-07-18：在 1600×1000 视口验证 23 条远端 Alias、7 列 Alias 表、空间母号绑定和独立 S5；页面无横向溢出，未调用真实 Apple 创建接口。
 - 2026-07-18：修复 SSE 长连接阻塞服务退出；保持浏览器连接时实测正常停止在 2 秒内释放进程和实例锁。
 - 2026-07-18：完成 staged 敏感信息扫描，主实现提交 `9d0f5f2` 已推送 GitHub `main`。
@@ -167,4 +167,59 @@
 - 2026-07-18：远端 47 条 Alias 默认全部忽略；已在同步表中选择两条母号及 `组 1-7`、`组 2-7` 两个当前子号并设置归属，尚未提交接管。
 - 2026-07-18：Alias 接管请求返回 `409 state_conflict`，数据库测得 HME Session 已失效；未写入任何 Alias，当前同步窗口的四条选择与两条 S5 暂存于本地页面。
 - 2026-07-18：用户重新登录中国区 iCloud 后，刷新 HME Session 并再次检测通过；接管请求随后返回 `422`，原因是两条母号 S5 为 `gen.lokiproxy.com/gen` 生成链接，缺少直连端口；未写入任何 Alias。
-- 当前节点：节点 G 等待确定 LokiProxy 生成链接的解析方式或改填两条实际 `socks5/http://host:port` 代理，再提交四条 Alias。
+- 当前节点：节点 G 已完成生成链接适配；等待 HME Session 恢复和用户确认两条生成链接的 US/JP 第一跳映射，再提交四条 Alias。
+
+### 节点 H：单个 Clash 的双白名单代理链（进行中）
+
+#### H.1 目标与性能指标
+
+把两个母号的代理抽象成同一个 Mihomo 进程内的两条独立动态链：
+
+```text
+Team Workflow 本地入口 A -> LokiProxy A -> dialer-proxy: US 33 -> 目标
+Team Workflow 本地入口 B -> LokiProxy B -> dialer-proxy: JP 22 -> 目标
+```
+
+- 不切换 Clash 全局选择器，不让两条母号争抢同一出口。
+- LokiProxy `/gen` 请求也必须经对应的 US 33 / JP 22 listener。
+- 远端 SOCKS5 的实际拨号必须经同一 `dialer-proxy`，满足白名单入口。
+- 每条链使用固定本地 listener 和短期缓存；单条链刷新不得中断另一条链。
+- 代理源、代理账号和生成接口参数不进入日志、前端响应或计划文件。
+
+#### H.2 参考实现与采用结论
+
+- `MetaCubeX/Meta-Docs` 的 `dialer-proxy` 文档：远端 proxy 通过指定 outbound 建立底层连接，适合白名单两跳链。
+- `MetaCubeX/Meta-Docs` 的 `listeners` 文档：listener 可用 `proxy` 直接绑定某个 proxy 或 proxy group，适合为两个母号提供独立本地入口。
+- 本机 Mihomo Meta `v1.19.21` 已验证支持上述字段；本机现有配置中确认存在 `US 33` 和 `JP 22`。
+- 采用一个 Clash/Mihomo 进程、两个 bootstrap listener、两个 owner listener、两个 provider，不创建第二个 Clash 实例，不修改全局当前出口。
+
+#### H.3 实施节点
+
+- [x] 增加 LokiProxy `/gen` 源解析与 JSON `data[].ip/port` 校验，生成 provider YAML，不把生成 URL 当直连 S5。
+- [x] 增加本地 provider API，仅允许 loopback 访问；按母号保存缓存和刷新锁。
+- [x] 增加 Clash 合并配置：US 33 / JP 22 bootstrap listener、两个 `dialer-proxy` provider、两个 owner listener。
+- [x] 母号 S5 字段支持“生成链接 + Clash 第一跳”两种输入；直连 `socks5/http://host:port` 保持兼容。
+- [x] 子号继承母号的本地 listener 地址；运行期刷新 provider 不改变既有任务的母号归属。
+- [x] 代理链失败时只标记对应母号/运行，保留另一条链；不触发 Apple Alias 写操作。
+- [x] 覆盖源解析、缓存、双链配置、白名单出口和服务重启恢复测试；临时 Mihomo 实例完成真实 REST reload 验证。
+
+#### H.4 验收场景
+
+1. 同一个 Clash 进程同时监听两个本地端口，A/B 请求分别从 US 33/JP 22 出口发出。
+2. LokiProxy 生成 API 在错误出口下失败，在对应白名单出口下成功。
+3. 两个 provider 同时刷新时互不切换全局 Clash 选择器。
+4. Clash 或 Team Workflow 重启后，源配置和本地 listener 可恢复；缓存失效时只刷新对应链。
+5. 四个 iCloud Alias 接管请求只在资源池检测为 `ready` 且两条链健康时提交。
+
+#### H.5 安全与回滚
+
+- 先备份 Clash Verge 合并配置和当前 Team Workflow 数据库；所有生成配置文件权限设为用户可读写。
+- 只改本地 Clash 合并层和 Team Workflow 本地配置，不调用 Apple 生成、停用或删除接口。
+- 若 Mihomo 合并校验失败，恢复原合并配置，保持现有 Clash 全局出口和 Team Workflow 数据不变。
+- 当前节点：代理源适配器、加密配置、双链测试和临时 Mihomo reload 已完成；等待真实 HME Session 与用户映射确认，不触发 Apple Alias 写操作。
+
+#### H.6 当前阻塞
+
+- 临时 Mihomo 已验证双链结构、US/JP `dialer-proxy` 绑定、两个 listener 和 Unix REST reload。
+- 本地 LaunchAgent 已恢复固定 `http://127.0.0.1:8765/`；重启竞态通过等待首选端口释放处理。
+- 真实数据库仍无已接管 Alias，iCloud HME Session 当前为 `session_invalid`。等待用户在 `icloud.com.cn` 完成重新登录后刷新 Session，再由用户确认两条生成链接与 US/JP 映射，之后才提交四条 Alias 接管。

@@ -15,6 +15,11 @@ from fastapi.testclient import TestClient
 from team_protocol.database import Database, StateConflictError
 from team_protocol.icloud_hme import HmeError, HmeSessionError
 from team_protocol.migration import CleanupFailure, CleanupResult, cleanup_plaintext
+from team_protocol.proxy_chain import (
+    LokiProxyEndpoint,
+    OwnerChainConfig,
+    ProxyConfigurationError,
+)
 from team_protocol.web_console import (
     ConsoleAlreadyRunningError,
     WebConsoleController,
@@ -703,6 +708,159 @@ class WebConsoleTests(unittest.TestCase):
             "owner-two-secret",
         ):
             self.assertNotIn(secret, serialized)
+
+    def test_generated_owner_proxy_api_applies_chain_without_echoing_source(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        owner = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "generated-api-owner@icloud.com",
+                    "role": "team_owner",
+                    "remote_metadata": {
+                        "hme": "generated-api-owner@icloud.com",
+                        "anonymousId": "generated-api-remote-secret",
+                    },
+                }
+            ],
+        )[0]
+
+        class FakeProxyChains:
+            provider_token = "local-provider-token"
+
+            def __init__(self):
+                self.applied = 0
+                self.refreshed = []
+
+            def prepare(self, owner_id, source_url, bootstrap):
+                return OwnerChainConfig(
+                    owner_id,
+                    source_url,
+                    bootstrap,
+                    18781,
+                    18881,
+                    "socks5://127.0.0.1:18881",
+                )
+
+            def apply(self, cleanup=False):
+                del cleanup
+                self.applied += 1
+                return {"applied": True}
+
+            def refresh(self, owner_id, force=False):
+                self.refreshed.append((owner_id, force))
+                return LokiProxyEndpoint("203.0.113.44", 1080)
+
+            def status(self, owner_id):
+                return {
+                    "configured": True,
+                    "healthy": bool(self.refreshed),
+                    "error": None,
+                    "listener": "127.0.0.1:18881",
+                    "bootstrap": "US 33 AI",
+                }
+
+            def available_nodes(self):
+                return ["US 33 AI", "JP 22 GMO"]
+
+            def provider_payload(self, owner_id):
+                return json.dumps(
+                    {
+                        "proxies": [
+                            {
+                                "name": f"dynamic-{owner_id}",
+                                "type": "socks5",
+                                "server": "203.0.113.44",
+                                "port": 1080,
+                            }
+                        ]
+                    }
+                ).encode()
+
+        chains = FakeProxyChains()
+        self.controller.proxy_chains = chains
+        source_url = (
+            "https://gen.lokiproxy.com/gen?region=PH&token=web-source-secret"
+        )
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as client:
+            configured = client.put(
+                f"/api/icloud-team-owners/{owner['id']}/proxy",
+                headers=self.origin_headers,
+                json={
+                    "mode": "lokiproxy_generator",
+                    "source_url": source_url,
+                    "bootstrap": "US 33 AI",
+                },
+            )
+            status_response = client.get(
+                f"/api/icloud-team-owners/{owner['id']}/proxy/status",
+                headers={"X-Workflow-Token": self.controller.request_token},
+            )
+            nodes = client.get(
+                "/api/proxy-chains/nodes",
+                headers={"X-Workflow-Token": self.controller.request_token},
+            )
+            provider = client.get(
+                f"/internal/proxy-chain/{owner['id']}/provider"
+                "?token=local-provider-token"
+            )
+            denied = client.get(
+                f"/internal/proxy-chain/{owner['id']}/provider?token=wrong"
+            )
+
+        serialized = configured.text + status_response.text + nodes.text + provider.text
+        self.assertEqual(configured.status_code, 200, configured.text)
+        self.assertEqual(configured.json()["proxy_mode"], "lokiproxy_generator")
+        self.assertEqual(status_response.status_code, 200)
+        self.assertTrue(status_response.json()["chain"]["healthy"])
+        self.assertEqual(nodes.json()["nodes"], ["US 33 AI", "JP 22 GMO"])
+        self.assertEqual(provider.status_code, 200)
+        self.assertEqual(denied.status_code, 502)
+        self.assertEqual(chains.applied, 2)  # startup plus saved chain
+        self.assertEqual(chains.refreshed, [(owner["id"], True)])
+        self.assertEqual(
+            self.database.get_icloud_owner_proxy(owner["id"]),
+            "socks5://127.0.0.1:18881",
+        )
+        self.assertEqual(
+            self.database.get_icloud_owner_proxy_config(owner["id"])["source_url"],
+            source_url,
+        )
+        self.assertNotIn("web-source-secret", serialized)
+        self.assertNotIn("gen.lokiproxy.com", serialized)
+
+    def test_proxy_chain_nodes_retries_a_failed_startup_application(self):
+        class FailingOnceProxyChains:
+            provider_token = "local-provider-token"
+
+            def __init__(self):
+                self.applied = 0
+
+            def apply(self, cleanup=False):
+                del cleanup
+                self.applied += 1
+                if self.applied == 1:
+                    raise ProxyConfigurationError("temporary startup failure")
+                return {"applied": True}
+
+            def available_nodes(self):
+                return ["US 33 AI", "JP 22 GMO"]
+
+        chains = FailingOnceProxyChains()
+        self.controller.proxy_chains = chains
+        self.controller.startup()
+        self.assertEqual(
+            self.controller.health()["proxy_chains"]["error"],
+            "proxy_chain_configuration",
+        )
+        self.assertEqual(
+            self.controller.list_proxy_chain_nodes()["nodes"],
+            ["US 33 AI", "JP 22 GMO"],
+        )
+        self.assertEqual(chains.applied, 2)
+        self.assertIsNone(self.controller.health()["proxy_chains"]["error"])
 
     def test_large_inventory_is_absent_from_bootstrap_and_sse_reset(self):
         before = len(json.dumps(self.controller.bootstrap(), sort_keys=True))

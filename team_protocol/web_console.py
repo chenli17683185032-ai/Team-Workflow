@@ -8,6 +8,7 @@ import re
 import secrets
 import socket
 import threading
+import time
 import webbrowser
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -66,6 +67,12 @@ from .registrar_runtime.icloud_imap_provider import (
     ImapMailboxConfig,
     ImapMailboxError,
     check_imap_mailbox,
+)
+from .proxy_chain import (
+    ProxyChainError,
+    ProxyChainManager,
+    ProxyConfigurationError,
+    validate_generator_url,
 )
 from .sub2api import Sub2APIClient, Sub2APIError
 from .task_queue import TaskQueue, redact_value
@@ -126,6 +133,8 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
         "session_import",
         "imap_password",
         "mailbox_proxy",
+        "source_url",
+        "provider_token",
         "remote_metadata",
         "anonymousid",
         "recipientmailid",
@@ -322,6 +331,9 @@ class ICloudAliasImportItem(StrictModel):
     role: Literal["team_owner", "rotating_child"]
     parent_owner_email: str | None = Field(default=None, min_length=3, max_length=320)
     owner_proxy: str = Field(default="", max_length=4096)
+    owner_proxy_mode: Literal["direct", "lokiproxy_generator"] = "direct"
+    owner_proxy_source_url: str = Field(default="", max_length=8192)
+    owner_proxy_bootstrap: str = Field(default="", max_length=160)
 
 
 class ICloudAliasImportRequest(StrictModel):
@@ -330,6 +342,9 @@ class ICloudAliasImportRequest(StrictModel):
 
 class ICloudOwnerProxyRequest(StrictModel):
     proxy: str = Field(default="", max_length=4096)
+    mode: Literal["direct", "lokiproxy_generator"] = "direct"
+    source_url: str = Field(default="", max_length=8192)
+    bootstrap: str = Field(default="", max_length=160)
 
 
 class ICloudWorkspaceHandoffRequest(StrictModel):
@@ -407,6 +422,8 @@ class WebConsoleController:
         inventory_expected_count: int | None = None,
         hme_client_factory: Any = HmeClient,
         imap_checker: Any = check_imap_mailbox,
+        proxy_chain_manager: Any | None = None,
+        console_port: int = 8765,
     ) -> None:
         self.app_dir = (
             Path(app_dir).expanduser().resolve()
@@ -436,6 +453,13 @@ class WebConsoleController:
         self.request_token = secrets.token_urlsafe(32)
         self.hme_client_factory = hme_client_factory
         self.imap_checker = imap_checker
+        self.proxy_chains = proxy_chain_manager or ProxyChainManager(
+            app_dir=self.app_dir,
+            console_port=int(console_port),
+            list_configs=self.database.list_icloud_owner_proxy_configs,
+            get_config=self.database.get_icloud_owner_proxy_config,
+        )
+        self._proxy_chain_startup_error: str | None = None
         self._icloud_operation_lock = threading.Lock()
         self._dialog_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
@@ -462,6 +486,11 @@ class WebConsoleController:
                 self._prepare_inventory_backfill()
             if self._migration_status == "ready":
                 self.database.prune_unreferenced_legacy_accounts()
+                try:
+                    self.proxy_chains.apply()
+                    self._proxy_chain_startup_error = None
+                except ProxyChainError as exc:
+                    self._proxy_chain_startup_error = exc.code
                 self.task_queue.start()
             self._started = True
             return self.health()
@@ -477,6 +506,10 @@ class WebConsoleController:
             "ready": self._migration_status == "ready",
             "started": self._started,
             "migration": self.migration_status(),
+            "proxy_chains": {
+                "ready": self._proxy_chain_startup_error is None,
+                "error": self._proxy_chain_startup_error,
+            },
         }
 
     def migration_status(self) -> dict[str, Any]:
@@ -895,12 +928,35 @@ class WebConsoleController:
     def list_icloud_mailboxes(self) -> list[dict[str, Any]]:
         return _safe_payload(self.database.list_icloud_mailboxes())
 
+    def _icloud_alias_with_proxy_status(
+        self, alias: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        result = dict(alias)
+        if result.get("role") != "team_owner":
+            return result
+        config = self.database.get_icloud_owner_proxy_config(str(result["id"]))
+        mode = str(config.get("mode") or "direct")
+        result["proxy_mode"] = mode
+        if mode == "lokiproxy_generator":
+            result["proxy_chain"] = self.proxy_chains.status(str(result["id"]))
+        return result
+
     def list_icloud_aliases(self, mailbox_id: str) -> list[dict[str, Any]]:
         self.database.get_icloud_mailbox(str(mailbox_id))
-        return _safe_payload(self.database.list_icloud_aliases(str(mailbox_id)))
+        return _safe_payload(
+            [
+                self._icloud_alias_with_proxy_status(alias)
+                for alias in self.database.list_icloud_aliases(str(mailbox_id))
+            ]
+        )
 
     def list_icloud_team_owners(self) -> list[dict[str, Any]]:
-        return _safe_payload(self.database.list_icloud_team_owners())
+        return _safe_payload(
+            [
+                self._icloud_alias_with_proxy_status(alias)
+                for alias in self.database.list_icloud_team_owners()
+            ]
+        )
 
     @staticmethod
     def _normalize_remote_icloud_aliases(
@@ -992,13 +1048,37 @@ class WebConsoleController:
         if not isinstance(selected, list) or not selected:
             raise FieldInputError({"items": "select at least one iCloud alias"})
         requested: dict[str, Mapping[str, Any]] = {}
+        generated_owners: dict[str, dict[str, str]] = {}
         for value in selected:
             if not isinstance(value, Mapping):
                 raise FieldInputError({"items": "iCloud alias selection is invalid"})
             email = str(value.get("email") or "").strip().casefold()
             if not email or email in requested:
                 raise FieldInputError({"items": "iCloud alias selection has duplicates"})
-            requested[email] = value
+            normalized = dict(value)
+            mode = str(normalized.get("owner_proxy_mode") or "direct")
+            role = str(normalized.get("role") or "")
+            if role == "team_owner" and mode == "lokiproxy_generator":
+                source_url = str(
+                    normalized.get("owner_proxy_source_url")
+                    or normalized.get("owner_proxy")
+                    or ""
+                ).strip()
+                bootstrap = str(normalized.get("owner_proxy_bootstrap") or "").strip()
+                try:
+                    source_url = validate_generator_url(source_url)
+                except ValueError as exc:
+                    raise FieldInputError({"items": str(exc)}) from exc
+                if not bootstrap:
+                    raise FieldInputError(
+                        {"items": "select a Clash first-hop node for each LokiProxy source"}
+                    )
+                generated_owners[email] = {
+                    "source_url": source_url,
+                    "bootstrap": bootstrap,
+                }
+                normalized["owner_proxy"] = ""
+            requested[email] = normalized
         mailbox = self.database.get_icloud_mailbox(mailbox_id)
         if mailbox["status"] != "ready":
             raise StateConflictError("iCloud mailbox must pass detection before import")
@@ -1044,15 +1124,133 @@ class WebConsoleController:
                     for email in requested
                 ],
             )
+            if generated_owners:
+                imported_by_email = {
+                    str(item["email"]).casefold(): item for item in imported
+                }
+                configured_owner_ids: list[str] = []
+                for email, proxy_source in generated_owners.items():
+                    owner = imported_by_email.get(email)
+                    if owner is None or owner.get("role") != "team_owner":
+                        raise StateConflictError(
+                            "imported iCloud Team owner could not be configured"
+                        )
+                    try:
+                        chain = self.proxy_chains.prepare(
+                            str(owner["id"]),
+                            proxy_source["source_url"],
+                            proxy_source["bootstrap"],
+                        )
+                    except ValueError as exc:
+                        raise FieldInputError({"items": str(exc)}) from exc
+                    self.database.set_icloud_owner_proxy_config(
+                        str(owner["id"]), chain.as_secret_dict()
+                    )
+                    configured_owner_ids.append(str(owner["id"]))
+                self.proxy_chains.apply()
+                for owner_id in configured_owner_ids:
+                    self.proxy_chains.refresh(owner_id, force=True)
             self.task_queue.notify_change()
-            return _safe_payload(imported)
+            return _safe_payload(
+                [
+                    self._icloud_alias_with_proxy_status(
+                        self.database.get_icloud_alias(str(item["id"]))
+                    )
+                    for item in imported
+                ]
+            )
         finally:
             self._icloud_operation_lock.release()
 
-    def set_icloud_owner_proxy(self, alias_id: str, proxy: str) -> dict[str, Any]:
-        updated = self.database.set_icloud_owner_proxy(str(alias_id), str(proxy or ""))
+    def set_icloud_owner_proxy(
+        self, alias_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        alias_id = str(alias_id)
+        previous = self.database.get_icloud_owner_proxy_config(alias_id)
+        mode = str(payload.get("mode") or "direct")
+        if mode == "direct":
+            if str(payload.get("source_url") or "").strip() or str(
+                payload.get("bootstrap") or ""
+            ).strip():
+                raise FieldInputError(
+                    {"mode": "generator source and first hop require generator mode"}
+                )
+            updated = self.database.set_icloud_owner_proxy(
+                alias_id, str(payload.get("proxy") or "")
+            )
+            if previous.get("mode") == "lokiproxy_generator":
+                self.proxy_chains.apply(cleanup=True)
+        elif mode == "lokiproxy_generator":
+            source_url = str(
+                payload.get("source_url")
+                or payload.get("proxy")
+                or (
+                    previous.get("source_url")
+                    if previous.get("mode") == "lokiproxy_generator"
+                    else ""
+                )
+                or ""
+            ).strip()
+            bootstrap = str(
+                payload.get("bootstrap")
+                or (
+                    previous.get("bootstrap_name")
+                    if previous.get("mode") == "lokiproxy_generator"
+                    else ""
+                )
+                or ""
+            ).strip()
+            try:
+                chain = self.proxy_chains.prepare(alias_id, source_url, bootstrap)
+            except ValueError as exc:
+                raise FieldInputError({"source_url": str(exc)}) from exc
+            updated = self.database.set_icloud_owner_proxy_config(
+                alias_id, chain.as_secret_dict()
+            )
+            self.proxy_chains.apply()
+            self.proxy_chains.refresh(alias_id, force=True)
+        else:
+            raise FieldInputError({"mode": "unsupported iCloud Team owner proxy mode"})
         self.task_queue.notify_change()
-        return _safe_payload(updated)
+        return _safe_payload(self._icloud_alias_with_proxy_status(updated))
+
+    def get_icloud_owner_proxy_status(self, alias_id: str) -> dict[str, Any]:
+        alias = self.database.get_icloud_alias(str(alias_id))
+        if alias["role"] != "team_owner":
+            raise StateConflictError("iCloud alias is not a Team owner")
+        config = self.database.get_icloud_owner_proxy_config(str(alias_id))
+        mode = str(config.get("mode") or "direct")
+        return _safe_payload(
+            {
+                "configured": bool(alias["proxy_configured"]),
+                "mode": mode,
+                "chain": (
+                    self.proxy_chains.status(str(alias_id))
+                    if mode == "lokiproxy_generator"
+                    else None
+                ),
+            }
+        )
+
+    def list_proxy_chain_nodes(self) -> dict[str, Any]:
+        # Retry only after a failed startup application. A successful startup
+        # already installed the listeners, so a read-only node query should
+        # not reload the user's active Mihomo configuration.
+        if self._proxy_chain_startup_error is not None:
+            try:
+                self.proxy_chains.apply()
+                self._proxy_chain_startup_error = None
+            except ProxyChainError as exc:
+                self._proxy_chain_startup_error = exc.code
+                raise
+        return {"nodes": self.proxy_chains.available_nodes()}
+
+    def proxy_chain_provider(self, owner_id: str, token: str) -> bytes:
+        if not secrets.compare_digest(
+            str(token or ""), str(self.proxy_chains.provider_token)
+        ):
+            raise ProxyConfigurationError("proxy provider token is invalid")
+        return self.proxy_chains.provider_payload(str(owner_id))
 
     def replace_icloud_workspace_child(
         self, workspace_id: str, payload: Mapping[str, Any]
@@ -1074,6 +1272,11 @@ class WebConsoleController:
             raise StateConflictError("workspace iCloud Team owner is unavailable")
         if not owner["proxy_configured"]:
             raise StateConflictError("iCloud Team owner S5 is not configured")
+        owner_proxy_config = self.database.get_icloud_owner_proxy_config(
+            str(owner["id"])
+        )
+        if owner_proxy_config.get("mode") == "lokiproxy_generator":
+            self.proxy_chains.ensure_ready(str(owner["id"]))
         mailbox = self.database.get_icloud_mailbox(owner["mailbox_id"])
         if mailbox["status"] != "ready":
             raise StateConflictError("iCloud mailbox must pass detection before handoff")
@@ -1849,6 +2052,21 @@ def create_app(
     async def index():
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/internal/proxy-chain/{owner_id}/provider", include_in_schema=False)
+    async def proxy_chain_provider(owner_id: str, request: Request, token: str = ""):
+        client_host = "" if request.client is None else str(request.client.host or "")
+        allowed = {"127.0.0.1", "::1"}
+        if testing:
+            allowed.add("testclient")
+        if client_host not in allowed:
+            return _error_response(403, "loopback_required", "loopback access is required")
+        payload = await _call_controller(
+            controller.proxy_chain_provider,
+            owner_id,
+            token,
+        )
+        return Response(content=payload, media_type="application/yaml")
+
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon():
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1970,6 +2188,10 @@ def create_app(
     async def list_icloud_team_owners():
         return await _call_controller(controller.list_icloud_team_owners)
 
+    @app.get("/api/proxy-chains/nodes")
+    async def list_proxy_chain_nodes():
+        return await _call_controller(controller.list_proxy_chain_nodes)
+
     @app.post("/api/icloud-mailboxes", status_code=status.HTTP_201_CREATED)
     async def create_icloud_mailbox(request: ICloudMailboxCreateRequest):
         return await _call_controller(
@@ -2053,7 +2275,14 @@ def create_app(
         return await _call_controller(
             controller.set_icloud_owner_proxy,
             alias_id,
-            request.proxy,
+            request.model_dump(),
+        )
+
+    @app.get("/api/icloud-team-owners/{alias_id}/proxy/status")
+    async def get_icloud_owner_proxy_status(alias_id: str):
+        return await _call_controller(
+            controller.get_icloud_owner_proxy_status,
+            alias_id,
         )
 
     @app.get("/api/queue")
@@ -2189,6 +2418,11 @@ async def _call_controller(function, *args, **kwargs):
             status_code=502,
             detail={"code": "sub2api_error", "message": str(exc)},
         ) from exc
+    except ProxyChainError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
     except DatabaseError as exc:
         raise HTTPException(
             status_code=500,
@@ -2239,7 +2473,21 @@ def _sse(event_type: str, payload: Mapping[str, Any], event_id: int) -> str:
 
 
 def _available_port(preferred: int) -> int:
-    for port in range(preferred, preferred + 20):
+    preferred = int(preferred)
+    # Uvicorn allows up to ten seconds for SSE clients to close during a
+    # restart; keep the preferred URL stable across that handoff window.
+    deadline = time.monotonic() + 12.0
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", preferred))
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+                continue
+            return preferred
+    for port in range(preferred + 1, preferred + 20):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             try:
                 probe.bind(("127.0.0.1", port))
@@ -2283,6 +2531,7 @@ def serve_web_console(
             backup_dir=PROJECT_DIR / "backups",
             legacy_config_path=internal_legacy_path,
             inventory_expected_count=7_211,
+            console_port=selected_port,
         )
         app = create_app(controller)
         url = f"http://127.0.0.1:{selected_port}"

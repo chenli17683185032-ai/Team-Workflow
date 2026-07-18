@@ -608,6 +608,80 @@ class DatabaseTests(unittest.TestCase):
                 current_alias["account_id"], "available"
             )
 
+    def test_generated_owner_proxy_config_is_encrypted_and_updates_active_children(self):
+        profile = self.database.create_icloud_mailbox(
+            name="Generated source pool",
+            forwarding_email="generated-forward@example.com",
+            secrets=self.icloud_secret("generated-owner", proxy=""),
+            status="ready",
+        )
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "generated-owner@icloud.com",
+                    "role": "team_owner",
+                    "remote_metadata": {
+                        "hme": "generated-owner@icloud.com",
+                        "anonymousId": "generated-owner-remote",
+                    },
+                },
+                {
+                    "email": "generated-child@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "generated-owner@icloud.com",
+                    "remote_metadata": {
+                        "hme": "generated-child@icloud.com",
+                        "anonymousId": "generated-child-remote",
+                    },
+                },
+            ],
+        )
+        owner = next(item for item in imported if item["role"] == "team_owner")
+        child = next(item for item in imported if item["role"] == "rotating_child")
+        source_url = (
+            "https://gen.lokiproxy.com/gen?region=JP&token=owner-source-secret"
+        )
+        listener = "socks5://127.0.0.1:18881"
+
+        updated = self.database.set_icloud_owner_proxy_config(
+            owner["id"],
+            {
+                "version": 1,
+                "mode": "lokiproxy_generator",
+                "owner_id": owner["id"],
+                "source_url": source_url,
+                "bootstrap_name": "JP 22 GMO",
+                "bootstrap_port": 18781,
+                "listener_port": 18881,
+                "effective_proxy": listener,
+            },
+        )
+
+        self.assertTrue(updated["proxy_configured"])
+        self.assertEqual(self.database.get_icloud_owner_proxy(owner["id"]), listener)
+        self.assertEqual(self.database.get_account_proxy(child["account_id"]), listener)
+        config = self.database.get_icloud_owner_proxy_config(owner["id"])
+        self.assertEqual(config["mode"], "lokiproxy_generator")
+        self.assertEqual(config["source_url"], source_url)
+        self.assertEqual(len(self.database.list_icloud_owner_proxy_configs()), 1)
+        self.assertFalse(
+            any(
+                str(item["key"]).startswith("icloud-owner-proxy-config:")
+                for item in self.database.list_settings()
+            )
+        )
+        self.assert_secret_absent_from_database_files("owner-source-secret")
+
+        direct = "socks5://direct-user:direct-secret@proxy.invalid:1080"
+        self.database.set_icloud_owner_proxy(owner["id"], direct)
+        self.assertEqual(
+            self.database.get_icloud_owner_proxy_config(owner["id"])["mode"],
+            "direct",
+        )
+        self.assertEqual(self.database.get_account_proxy(child["account_id"]), direct)
+        self.assertEqual(self.database.list_icloud_owner_proxy_configs(), [])
+
     def test_icloud_team_owner_workspace_rejects_another_owners_child(self):
         profile = self.database.create_icloud_mailbox(
             name="Shared Apple pool",

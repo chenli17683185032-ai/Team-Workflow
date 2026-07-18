@@ -57,6 +57,7 @@ _UNSET = object()
 _ACCOUNT_RUNTIME_IDENTITY_VERSION = 1
 _RUN_PROXY_SNAPSHOT_VERSION = 1
 _RUN_PROXY_SOURCES = frozenset({"account", "global", "direct"})
+_ICLOUD_OWNER_PROXY_CONFIG_PREFIX = "icloud-owner-proxy-config:"
 _ACCOUNT_RUNTIME_IDENTITY_KEYS = frozenset(
     {
         "version",
@@ -800,7 +801,13 @@ class Database:
     def list_settings(self) -> list[dict[str, Any]]:
         with self._read_connection() as connection:
             rows = connection.execute(
-                "SELECT key, value_text, encrypted, updated_at FROM settings ORDER BY key"
+                """
+                SELECT key, value_text, encrypted, updated_at
+                FROM settings
+                WHERE key NOT LIKE ?
+                ORDER BY key
+                """,
+                (f"{_ICLOUD_OWNER_PROXY_CONFIG_PREFIX}%",),
             ).fetchall()
         return [
             {
@@ -1542,14 +1549,48 @@ class Database:
         except Exception as exc:
             raise DatabaseError("iCloud Team owner proxy is invalid") from exc
 
-    def set_icloud_owner_proxy(self, alias_id: str, proxy: str) -> dict[str, Any]:
-        clean_proxy = self._coerce_icloud_owner_proxy(proxy)
+    @staticmethod
+    def _icloud_owner_proxy_config_key(alias_id: str) -> str:
+        return f"{_ICLOUD_OWNER_PROXY_CONFIG_PREFIX}{alias_id}"
+
+    def set_icloud_owner_proxy_config(
+        self, alias_id: str, config: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if not isinstance(config, Mapping):
+            raise ValidationError("iCloud Team owner proxy config is invalid")
+        mode = str(config.get("mode") or "direct").strip()
+        stored_config: dict[str, Any] | None = None
+        if mode == "direct":
+            clean_proxy = self._coerce_icloud_owner_proxy(config.get("proxy"))
+        elif mode == "lokiproxy_generator":
+            from .proxy_chain import OwnerChainConfig
+
+            try:
+                chain = OwnerChainConfig.from_mapping(config)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+            if chain.owner_id != str(alias_id):
+                raise ValidationError("iCloud Team owner proxy config owner is invalid")
+            clean_proxy = self._coerce_icloud_owner_proxy(chain.effective_proxy)
+            stored_config = chain.as_secret_dict()
+        else:
+            raise ValidationError("iCloud Team owner proxy mode is invalid")
+
         purpose = f"icloud-owner:{alias_id}:proxy"
         blob = (
             None
             if not clean_proxy
             else self._require_secret_store().encrypt(
                 clean_proxy.encode("utf-8"), purpose
+            )
+        )
+        config_key = self._icloud_owner_proxy_config_key(alias_id)
+        config_purpose = f"setting:{config_key}"
+        config_blob = (
+            None
+            if stored_config is None
+            else self._require_secret_store().encrypt(
+                _json_bytes(stored_config), config_purpose
             )
         )
         with self._write_transaction() as connection:
@@ -1567,13 +1608,138 @@ class Database:
                     alias_id,
                 ),
             )
+            if config_blob is None:
+                connection.execute("DELETE FROM settings WHERE key = ?", (config_key,))
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO settings(
+                        key, value_text, value_blob, encrypted, updated_at
+                    ) VALUES(?, NULL, ?, 1, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_text = NULL,
+                        value_blob = excluded.value_blob,
+                        encrypted = 1,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        config_key,
+                        sqlite3.Binary(config_blob),
+                        _now(),
+                    ),
+                )
+            children = connection.execute(
+                """
+                SELECT account_id
+                FROM icloud_aliases
+                WHERE parent_owner_alias_id = ?
+                  AND role = 'rotating_child'
+                  AND used_at IS NULL
+                  AND account_id IS NOT NULL
+                """,
+                (alias_id,),
+            ).fetchall()
+            for child in children:
+                account_id = str(child["account_id"])
+                account_blob = (
+                    None
+                    if not clean_proxy
+                    else self._require_secret_store().encrypt(
+                        clean_proxy.encode("utf-8"),
+                        f"account:{account_id}:proxy",
+                    )
+                )
+                connection.execute(
+                    """
+                    UPDATE accounts
+                    SET proxy_blob = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        None
+                        if account_blob is None
+                        else sqlite3.Binary(account_blob),
+                        _now(),
+                        account_id,
+                    ),
+                )
         return self.get_icloud_alias(alias_id)
+
+    def set_icloud_owner_proxy(self, alias_id: str, proxy: str) -> dict[str, Any]:
+        return self.set_icloud_owner_proxy_config(
+            alias_id,
+            {"mode": "direct", "proxy": str(proxy or "")},
+        )
 
     def get_icloud_owner_proxy(self, alias_id: str) -> str | None:
         with self._read_connection() as connection:
             owner = self._icloud_owner_alias_tx(connection, alias_id)
             proxy = self._icloud_owner_proxy_tx(connection, owner)
         return proxy or None
+
+    def get_icloud_owner_proxy_config(self, alias_id: str) -> dict[str, Any]:
+        config_key = self._icloud_owner_proxy_config_key(alias_id)
+        with self._read_connection() as connection:
+            owner = connection.execute(
+                "SELECT * FROM icloud_aliases WHERE id = ?", (alias_id,)
+            ).fetchone()
+            if owner is None:
+                raise NotFoundError("iCloud Team owner not found")
+            if str(owner["role"]) != "team_owner":
+                raise StateConflictError("iCloud alias is not a Team owner")
+            effective_proxy = self._icloud_owner_proxy_tx(connection, owner)
+            row = connection.execute(
+                """
+                SELECT value_blob, encrypted
+                FROM settings
+                WHERE key = ?
+                """,
+                (config_key,),
+            ).fetchone()
+        if row is None:
+            return {
+                "version": 1,
+                "mode": "direct",
+                "owner_id": str(alias_id),
+                "proxy": effective_proxy,
+                "effective_proxy": effective_proxy,
+            }
+        if not row["encrypted"] or row["value_blob"] is None:
+            raise DatabaseError("iCloud Team owner proxy config is invalid")
+        try:
+            plaintext = self._require_secret_store().decrypt(
+                bytes(row["value_blob"]), f"setting:{config_key}"
+            )
+            value = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            raise DatabaseError("iCloud Team owner proxy config is invalid") from exc
+        if not isinstance(value, Mapping):
+            raise DatabaseError("iCloud Team owner proxy config is invalid")
+        result = dict(value)
+        if (
+            str(result.get("mode") or "") != "lokiproxy_generator"
+            or str(result.get("owner_id") or "") != str(alias_id)
+            or str(result.get("effective_proxy") or "") != effective_proxy
+        ):
+            raise DatabaseError("iCloud Team owner proxy config is invalid")
+        return result
+
+    def list_icloud_owner_proxy_configs(self) -> list[dict[str, Any]]:
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM icloud_aliases
+                WHERE role = 'team_owner'
+                  AND state = 'active'
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            config = self.get_icloud_owner_proxy_config(str(row["id"]))
+            if config.get("mode") == "lokiproxy_generator":
+                result.append(config)
+        return result
 
     @staticmethod
     def _icloud_alias_view(row: sqlite3.Row) -> dict[str, Any]:
