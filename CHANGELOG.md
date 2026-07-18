@@ -12,6 +12,7 @@
 - 控制台增加远端 Alias 同步、角色与归属选择、母号 S5、空间母号绑定、已用完筛选和按母号统计。
 - 支持在一个 Mihomo 进程内为两个母号建立独立 LokiProxy 动态链：各自固定本地 listener、缓存、刷新锁和 `dialer-proxy` 白名单出口，不切换全局 Clash 选择器。
 - LokiProxy 生成链接与实际动态 `ip/port` 分离处理，生成配置加密保存；增加 loopback-only provider、Mihomo Unix REST reload、重启恢复和分块响应解析。
+- 资源池 HME/IMAP 代理为空时改为强制直连，不再继承 LaunchAgent 的系统代理环境；支持直连中国区 iCloud 的稳定性排查。
 
 ### 稳定性与安全
 
@@ -25,7 +26,7 @@
 
 ### 验证
 
-- macOS：`python -B -m unittest discover -s tests -q`，232 项通过，6 项 Windows DPAPI 测试按平台跳过（共 238 项）。
+- macOS：`python -B -m unittest discover -s tests -q`，233 项通过，6 项 Windows DPAPI 测试按平台跳过（共 239 项）。
 - `node --check team_protocol/web_static/app.js` 与 Python `compileall`：通过。
 - 临时 Mihomo Meta `v1.19.21` 实例验证双动态节点分别绑定 US/JP `dialer-proxy`，两个本地 listener 实际监听；Unix REST `PUT /configs?force=true` reload 后进程与 listener 保持可用。
 - 使用模拟 Apple HME 数据验证 5 个远端 Alias 只接管所选 4 个、两个母号 S5 相互隔离、每次更换只创建 1 个新 Alias，且响应不含代理或远端标识。

@@ -2479,6 +2479,7 @@ def _available_port(preferred: int) -> int:
     deadline = time.monotonic() + 12.0
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("127.0.0.1", preferred))
             except OSError:
@@ -2489,6 +2490,7 @@ def _available_port(preferred: int) -> int:
             return preferred
     for port in range(preferred + 1, preferred + 20):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("127.0.0.1", port))
             except OSError:

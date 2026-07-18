@@ -156,7 +156,7 @@
 - 2026-07-18：完成 schema v6、母号/子号归属、独立 S5、按需创建、接力提交和已用完池闭环。
 - 2026-07-18：完成选择性同步、空间母号绑定、Alias 管理和宽屏对话框实现。
 - 2026-07-18：修复 iCloud 关联字段对普通邮箱库存账号视图的兼容性回归；数据库与控制台 80 项聚焦测试通过。
-- 2026-07-18：全量 238 项测试完成，232 项通过，6 项 Windows DPAPI 测试按 macOS 平台预期跳过；JS 与 Python 语法检查通过。
+- 2026-07-18：全量 239 项测试完成，233 项通过，6 项 Windows DPAPI 测试按 macOS 平台预期跳过；JS 与 Python 语法检查通过。
 - 2026-07-18：在 1600×1000 视口验证 23 条远端 Alias、7 列 Alias 表、空间母号绑定和独立 S5；页面无横向溢出，未调用真实 Apple 创建接口。
 - 2026-07-18：修复 SSE 长连接阻塞服务退出；保持浏览器连接时实测正常停止在 2 秒内释放进程和实例锁。
 - 2026-07-18：完成 staged 敏感信息扫描，主实现提交 `9d0f5f2` 已推送 GitHub `main`。
@@ -223,3 +223,4 @@ Team Workflow 本地入口 B -> LokiProxy B -> dialer-proxy: JP 22 -> 目标
 - 临时 Mihomo 已验证双链结构、US/JP `dialer-proxy` 绑定、两个 listener 和 Unix REST reload。
 - 本地 LaunchAgent 已恢复固定 `http://127.0.0.1:8765/`；重启竞态通过等待首选端口释放处理。
 - 真实数据库仍无已接管 Alias，iCloud HME Session 当前为 `session_invalid`。等待用户在 `icloud.com.cn` 完成重新登录后刷新 Session，再由用户确认两条生成链接与 US/JP 映射，之后才提交四条 Alias 接管。
+- 2026-07-18：按用户选择将资源池 HME/IMAP S5 清空；直连 `https://www.icloud.com.cn/` 返回 HTTP 200，并将空代理实现为强制忽略系统代理环境。当前资源池回到待检测，未写入或修改任何 Alias。

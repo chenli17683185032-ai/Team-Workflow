@@ -347,7 +347,14 @@ class HmeClient:
         )
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
         try:
-            response = self.requester(
+            requester = self.requester
+            if requester is requests.request:
+                # An empty HME proxy means an intentional direct connection;
+                # do not silently inherit the process-wide Clash environment.
+                session = requests.Session()
+                session.trust_env = False
+                requester = session.request
+            response = requester(
                 method,
                 f"https://{self.session.host}{path}?{params}",
                 headers={

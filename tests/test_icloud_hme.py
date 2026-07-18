@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 from team_protocol.icloud_hme import (
     HmeClient,
@@ -141,6 +142,27 @@ class ICloudHmeTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(requests[1][2]["data"])["hme"], "first@icloud.com")
         self.assertEqual(requests[0][2]["headers"]["Cookie"], COOKIE)
+
+    def test_empty_proxy_forces_direct_request_without_environment_proxy(self):
+        calls = []
+
+        class DirectSession:
+            def __init__(self):
+                self.trust_env = True
+
+            def request(self, method, url, **kwargs):
+                calls.append((self.trust_env, method, url, kwargs))
+                return FakeResponse(
+                    {"success": True, "result": {"hmeEmails": []}}
+                )
+
+        session = parse_hme_session_import(f"curl '{URL}' -H 'Cookie: {COOKIE}'")
+        with patch("team_protocol.icloud_hme.requests.Session", DirectSession):
+            self.assertEqual(HmeClient(session).list_aliases(), [])
+
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0][0])
+        self.assertIsNone(calls[0][3]["proxies"])
 
     def test_client_errors_never_include_cookie_or_response_text(self):
         secret_response = "response-secret-canary"
