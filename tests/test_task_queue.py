@@ -730,6 +730,76 @@ class TaskQueueTests(unittest.TestCase):
         self.assertIn("icloud-imap-secret", secrets)
         self.assertIn(parent_proxy, secrets)
 
+    def test_team_owner_is_passive_and_never_enters_run_inputs(self):
+        parent_proxy = "socks5h://owner:owner-proxy-secret@proxy.invalid:1080"
+        profile = self.database.create_icloud_mailbox(
+            name="Passive owner pool",
+            forwarding_email="owner-forwarding@example.com",
+            secrets={
+                "session": {
+                    "host": "p68-maildomainws.icloud.com",
+                    "dsid": "owner-dsid",
+                    "client_id": "owner-client",
+                    "client_build_number": "2536Project32",
+                    "client_mastering_number": "2536B20",
+                    "cookie": "owner-icloud-session-secret",
+                },
+                "imap": {
+                    "host": "imap.example.com",
+                    "port": 993,
+                    "username": "owner-forwarding@example.com",
+                    "password": "owner-imap-secret",
+                    "folder": "INBOX",
+                },
+                "proxy": "",
+            },
+            status="ready",
+        )
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "passive-owner@icloud.com",
+                    "role": "team_owner",
+                    "owner_proxy": parent_proxy,
+                    "remote_metadata": {"anonymousId": "passive-owner-remote"},
+                },
+                {
+                    "email": "executing-child-a@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "passive-owner@icloud.com",
+                    "remote_metadata": {"anonymousId": "child-a-remote"},
+                },
+                {
+                    "email": "executing-child-b@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "passive-owner@icloud.com",
+                    "remote_metadata": {"anonymousId": "child-b-remote"},
+                },
+            ],
+        )
+        owner = next(item for item in imported if item["role"] == "team_owner")
+        children = [item for item in imported if item["role"] == "rotating_child"]
+        self.assertIsNone(owner["account_id"])
+        workspace = self.database.create_workspace(
+            name="Passive owner workspace",
+            workspace_uid="passive-owner-workspace",
+            owner_alias_id=owner["id"],
+            current_account_id=children[0]["account_id"],
+            next_account_id=children[1]["account_id"],
+        )
+        run = self.database.enqueue_workspace(workspace["id"])
+        queue = self.make_queue(RunnerHarness())
+
+        inputs = queue._build_run_inputs(run["id"])
+        old_mailbox, new_mailbox = inputs[1], inputs[2]
+        self.assertEqual(old_mailbox.registration_email, "executing-child-a@icloud.com")
+        self.assertEqual(new_mailbox.registration_email, "executing-child-b@icloud.com")
+        self.assertNotIn("passive-owner@icloud.com", {
+            old_mailbox.registration_email,
+            new_mailbox.registration_email,
+        })
+
     def test_redact_text_removes_known_secrets_and_url_userinfo(self):
         value = "token=canary https://name:password@example.invalid/path"
         self.assertEqual(

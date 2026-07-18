@@ -1205,6 +1205,8 @@ class Database:
             owner = self._icloud_owner_alias_tx(
                 connection, clean_parent_id, mailbox_id=mailbox_id
             )
+            # The Team owner is passive. Its encrypted proxy is a default
+            # network template copied to the child account being created.
             child_proxy = self._icloud_owner_proxy_tx(connection, owner)
         elif clean_role == "rotating_child":
             child_proxy = str(secrets.get("proxy") or "").strip()
@@ -1556,6 +1558,7 @@ class Database:
     def set_icloud_owner_proxy_config(
         self, alias_id: str, config: Mapping[str, Any]
     ) -> dict[str, Any]:
+        """Set the passive owner's default network for its active children."""
         if not isinstance(config, Mapping):
             raise ValidationError("iCloud Team owner proxy config is invalid")
         mode = str(config.get("mode") or "direct").strip()
@@ -3812,6 +3815,22 @@ class Database:
                     or next_account["status"] != "bound_next"
                 ):
                     raise StateConflictError("workspace account roles are inconsistent")
+                owner_alias_id = (
+                    None
+                    if workspace["owner_alias_id"] is None
+                    else str(workspace["owner_alias_id"])
+                )
+                if owner_alias_id is not None:
+                    # A Team owner is a passive anchor; only its child accounts
+                    # may enter the executable queue.
+                    self._validate_workspace_icloud_group_tx(
+                        connection,
+                        owner_alias_id=owner_alias_id,
+                        account_ids={
+                            str(workspace["current_account_id"]),
+                            str(workspace["next_account_id"]),
+                        },
+                    )
                 run_id = str(uuid.uuid4())
                 queue_item_id = str(uuid.uuid4())
                 connection.execute(

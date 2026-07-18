@@ -68,10 +68,12 @@ from .registrar_runtime.icloud_imap_provider import (
     ImapMailboxError,
     check_imap_mailbox,
 )
+from .registrar import validate_proxy_url
 from .proxy_chain import (
     ProxyChainError,
     ProxyChainManager,
     ProxyConfigurationError,
+    validate_bootstrap_proxy,
     validate_generator_url,
 )
 from .sub2api import Sub2APIClient, Sub2APIError
@@ -80,6 +82,7 @@ from .task_queue import TaskQueue, redact_value
 
 STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_LOCAL_CLASH_PROXY = "http://127.0.0.1:7897"
 _SECRET_SETTING_KEYS = frozenset(
     {
         "proxy",
@@ -111,6 +114,19 @@ _VISIBLE_TEXT_SETTING_KEYS = _TEXT_SETTING_KEYS | {
     "last_backup_path",
     "last_backup_at",
 }
+
+
+def _configured_local_clash_proxy() -> str:
+    value = str(
+        os.environ.get("TEAM_WORKFLOW_LOCAL_CLASH_PROXY")
+        or DEFAULT_LOCAL_CLASH_PROXY
+    ).strip()
+    try:
+        return validate_proxy_url(value)
+    except ValueError as exc:
+        raise DatabaseConfigurationError(
+            "TEAM_WORKFLOW_LOCAL_CLASH_PROXY is invalid"
+        ) from exc
 _SENSITIVE_RESPONSE_KEYS = frozenset(
     {
         "credential_blob",
@@ -333,7 +349,7 @@ class ICloudAliasImportItem(StrictModel):
     owner_proxy: str = Field(default="", max_length=4096)
     owner_proxy_mode: Literal["direct", "lokiproxy_generator"] = "direct"
     owner_proxy_source_url: str = Field(default="", max_length=8192)
-    owner_proxy_bootstrap: str = Field(default="", max_length=160)
+    owner_proxy_bootstrap: str = Field(default="", max_length=4096)
 
 
 class ICloudAliasImportRequest(StrictModel):
@@ -344,7 +360,7 @@ class ICloudOwnerProxyRequest(StrictModel):
     proxy: str = Field(default="", max_length=4096)
     mode: Literal["direct", "lokiproxy_generator"] = "direct"
     source_url: str = Field(default="", max_length=8192)
-    bootstrap: str = Field(default="", max_length=160)
+    bootstrap: str = Field(default="", max_length=4096)
 
 
 class ICloudWorkspaceHandoffRequest(StrictModel):
@@ -423,6 +439,7 @@ class WebConsoleController:
         hme_client_factory: Any = HmeClient,
         imap_checker: Any = check_imap_mailbox,
         proxy_chain_manager: Any | None = None,
+        enable_proxy_chains: bool = True,
         console_port: int = 8765,
     ) -> None:
         self.app_dir = (
@@ -453,11 +470,14 @@ class WebConsoleController:
         self.request_token = secrets.token_urlsafe(32)
         self.hme_client_factory = hme_client_factory
         self.imap_checker = imap_checker
+        self.local_clash_proxy = _configured_local_clash_proxy()
+        self.enable_proxy_chains = bool(enable_proxy_chains)
         self.proxy_chains = proxy_chain_manager or ProxyChainManager(
             app_dir=self.app_dir,
             console_port=int(console_port),
             list_configs=self.database.list_icloud_owner_proxy_configs,
             get_config=self.database.get_icloud_owner_proxy_config,
+            bootstrap_proxy=self.local_clash_proxy,
         )
         self._proxy_chain_startup_error: str | None = None
         self._icloud_operation_lock = threading.Lock()
@@ -467,6 +487,31 @@ class WebConsoleController:
         self._migration_status = "initializing"
         self._migration_error: str | None = None
         self._shutdown_probe: Callable[[], bool] = lambda: False
+
+    def _migrate_legacy_proxy_chains(self) -> int:
+        """Move old per-node Mihomo configs to the one shared Clash URL."""
+
+        if not self.enable_proxy_chains:
+            return 0
+        migrated = 0
+        for config in self.database.list_icloud_owner_proxy_configs():
+            owner_id = str(config.get("owner_id") or "").strip()
+            source_url = str(config.get("source_url") or "").strip()
+            if not owner_id or not source_url:
+                continue
+            chain = self.proxy_chains.prepare(
+                owner_id,
+                source_url,
+                self.local_clash_proxy,
+            )
+            if dict(config) == chain.as_secret_dict():
+                continue
+            self.database.set_icloud_owner_proxy_config(
+                owner_id,
+                chain.as_secret_dict(),
+            )
+            migrated += 1
+        return migrated
 
     def set_shutdown_probe(self, probe: Callable[[], bool]) -> None:
         if not callable(probe):
@@ -486,20 +531,30 @@ class WebConsoleController:
                 self._prepare_inventory_backfill()
             if self._migration_status == "ready":
                 self.database.prune_unreferenced_legacy_accounts()
-                try:
-                    self.proxy_chains.apply()
+                self._migrate_legacy_proxy_chains()
+                if self.enable_proxy_chains:
+                    try:
+                        self.proxy_chains.apply()
+                        self._proxy_chain_startup_error = None
+                    except ProxyChainError as exc:
+                        self._proxy_chain_startup_error = exc.code
+                else:
                     self._proxy_chain_startup_error = None
-                except ProxyChainError as exc:
-                    self._proxy_chain_startup_error = exc.code
                 self.task_queue.start()
             self._started = True
             return self.health()
 
     def shutdown(self) -> bool:
         with self._lifecycle_lock:
-            stopped = self.task_queue.shutdown()
+            queue_stopped = self.task_queue.shutdown()
+            shutdown_proxy_chains = getattr(self.proxy_chains, "shutdown", None)
+            relay_stopped = (
+                bool(shutdown_proxy_chains())
+                if callable(shutdown_proxy_chains)
+                else True
+            )
             self._started = False
-            return bool(stopped)
+            return bool(queue_stopped and relay_stopped)
 
     def health(self) -> dict[str, Any]:
         return {
@@ -507,6 +562,7 @@ class WebConsoleController:
             "started": self._started,
             "migration": self.migration_status(),
             "proxy_chains": {
+                "enabled": self.enable_proxy_chains,
                 "ready": self._proxy_chain_startup_error is None,
                 "error": self._proxy_chain_startup_error,
             },
@@ -1059,23 +1115,31 @@ class WebConsoleController:
             mode = str(normalized.get("owner_proxy_mode") or "direct")
             role = str(normalized.get("role") or "")
             if role == "team_owner" and mode == "lokiproxy_generator":
+                if not self.enable_proxy_chains:
+                    raise FieldInputError(
+                        {"items": "LokiProxy relay is disabled"}
+                    )
                 source_url = str(
                     normalized.get("owner_proxy_source_url")
                     or normalized.get("owner_proxy")
                     or ""
                 ).strip()
-                bootstrap = str(normalized.get("owner_proxy_bootstrap") or "").strip()
+                bootstrap = str(
+                    normalized.get("owner_proxy_bootstrap")
+                    or self.local_clash_proxy
+                ).strip()
                 try:
                     source_url = validate_generator_url(source_url)
+                    bootstrap = validate_bootstrap_proxy(bootstrap)
                 except ValueError as exc:
                     raise FieldInputError({"items": str(exc)}) from exc
-                if not bootstrap:
+                if bootstrap != self.local_clash_proxy:
                     raise FieldInputError(
-                        {"items": "select a Clash first-hop node for each LokiProxy source"}
+                        {"items": "both LokiProxy sources must use the shared local Clash proxy"}
                     )
                 generated_owners[email] = {
                     "source_url": source_url,
-                    "bootstrap": bootstrap,
+                    "bootstrap_proxy": bootstrap,
                 }
                 normalized["owner_proxy"] = ""
             requested[email] = normalized
@@ -1139,7 +1203,7 @@ class WebConsoleController:
                         chain = self.proxy_chains.prepare(
                             str(owner["id"]),
                             proxy_source["source_url"],
-                            proxy_source["bootstrap"],
+                            proxy_source["bootstrap_proxy"],
                         )
                     except ValueError as exc:
                         raise FieldInputError({"items": str(exc)}) from exc
@@ -1179,8 +1243,13 @@ class WebConsoleController:
                 alias_id, str(payload.get("proxy") or "")
             )
             if previous.get("mode") == "lokiproxy_generator":
-                self.proxy_chains.apply(cleanup=True)
+                if self.enable_proxy_chains:
+                    self.proxy_chains.apply()
         elif mode == "lokiproxy_generator":
+            if not self.enable_proxy_chains:
+                raise FieldInputError(
+                    {"mode": "LokiProxy relay is disabled"}
+                )
             source_url = str(
                 payload.get("source_url")
                 or payload.get("proxy")
@@ -1194,13 +1263,18 @@ class WebConsoleController:
             bootstrap = str(
                 payload.get("bootstrap")
                 or (
-                    previous.get("bootstrap_name")
+                    previous.get("bootstrap_proxy")
                     if previous.get("mode") == "lokiproxy_generator"
                     else ""
                 )
-                or ""
+                or self.local_clash_proxy
             ).strip()
             try:
+                bootstrap = validate_bootstrap_proxy(bootstrap)
+                if bootstrap != self.local_clash_proxy:
+                    raise ValueError(
+                        "both LokiProxy chains must use the shared local Clash proxy"
+                    )
                 chain = self.proxy_chains.prepare(alias_id, source_url, bootstrap)
             except ValueError as exc:
                 raise FieldInputError({"source_url": str(exc)}) from exc
@@ -1233,9 +1307,14 @@ class WebConsoleController:
         )
 
     def list_proxy_chain_nodes(self) -> dict[str, Any]:
-        # Retry only after a failed startup application. A successful startup
-        # already installed the listeners, so a read-only node query should
-        # not reload the user's active Mihomo configuration.
+        if not self.enable_proxy_chains:
+            return {
+                "enabled": False,
+                "nodes": [],
+                "local_proxy": self.local_clash_proxy,
+            }
+        # A retry only starts Team Workflow's loopback relays. It never calls a
+        # Mihomo API or modifies the user's Clash configuration.
         if self._proxy_chain_startup_error is not None:
             try:
                 self.proxy_chains.apply()
@@ -1243,14 +1322,16 @@ class WebConsoleController:
             except ProxyChainError as exc:
                 self._proxy_chain_startup_error = exc.code
                 raise
-        return {"nodes": self.proxy_chains.available_nodes()}
+        return {
+            "enabled": True,
+            "nodes": self.proxy_chains.available_nodes(),
+            "local_proxy": self.local_clash_proxy,
+            "shared": True,
+        }
 
     def proxy_chain_provider(self, owner_id: str, token: str) -> bytes:
-        if not secrets.compare_digest(
-            str(token or ""), str(self.proxy_chains.provider_token)
-        ):
-            raise ProxyConfigurationError("proxy provider token is invalid")
-        return self.proxy_chains.provider_payload(str(owner_id))
+        del owner_id, token
+        raise ProxyConfigurationError("legacy Mihomo provider endpoint is disabled")
 
     def replace_icloud_workspace_child(
         self, workspace_id: str, payload: Mapping[str, Any]
@@ -2051,21 +2132,6 @@ def create_app(
     @app.get("/")
     async def index():
         return FileResponse(STATIC_DIR / "index.html")
-
-    @app.get("/internal/proxy-chain/{owner_id}/provider", include_in_schema=False)
-    async def proxy_chain_provider(owner_id: str, request: Request, token: str = ""):
-        client_host = "" if request.client is None else str(request.client.host or "")
-        allowed = {"127.0.0.1", "::1"}
-        if testing:
-            allowed.add("testclient")
-        if client_host not in allowed:
-            return _error_response(403, "loopback_required", "loopback access is required")
-        payload = await _call_controller(
-            controller.proxy_chain_provider,
-            owner_id,
-            token,
-        )
-        return Response(content=payload, media_type="application/yaml")
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon():

@@ -475,6 +475,19 @@ class TaskQueue:
         ):
             raise StateConflictError("account identity no longer matches the run snapshot")
 
+        owner_alias_id = str(workspace["owner_alias_id"] or "").strip()
+        if owner_alias_id:
+            # The owner is deliberately absent from the runner inputs. The
+            # old/new identities must both be active children of that owner.
+            for account in (old_account, new_account):
+                if (
+                    account.get("icloud_role") != "rotating_child"
+                    or str(account.get("icloud_owner_alias_id") or "") != owner_alias_id
+                ):
+                    raise StateConflictError(
+                        "iCloud Team workflow requires two child accounts"
+                    )
+
         old_credentials = self.database.get_resolved_account_credentials(old_account["id"])
         new_credentials = self.database.get_resolved_account_credentials(new_account["id"])
         old_mailbox = self._mailbox(old_account, old_credentials)

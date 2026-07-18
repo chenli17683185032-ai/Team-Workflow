@@ -146,6 +146,14 @@ class WebConsoleTests(unittest.TestCase):
             "X-Workflow-Token": self.controller.request_token,
         }
 
+    def test_default_runtime_uses_local_relays_with_one_shared_clash_front(self):
+        self.assertTrue(self.controller.enable_proxy_chains)
+        payload = self.controller.list_proxy_chain_nodes()
+        self.assertTrue(payload["enabled"])
+        self.assertTrue(payload["shared"])
+        self.assertEqual(payload["local_proxy"], "http://127.0.0.1:7897")
+        self.assertEqual(payload["nodes"], ["http://127.0.0.1:7897"])
+
     def account(self, suffix, *, primary=None):
         primary_email = primary or f"primary-{suffix}@example.com"
         return self.database.create_account(
@@ -727,20 +735,17 @@ class WebConsoleTests(unittest.TestCase):
         )[0]
 
         class FakeProxyChains:
-            provider_token = "local-provider-token"
-
             def __init__(self):
                 self.applied = 0
                 self.refreshed = []
 
             def prepare(self, owner_id, source_url, bootstrap):
                 return OwnerChainConfig(
-                    owner_id,
-                    source_url,
-                    bootstrap,
-                    18781,
-                    18881,
-                    "socks5://127.0.0.1:18881",
+                    owner_id=owner_id,
+                    source_url=source_url,
+                    bootstrap_proxy=bootstrap,
+                    listener_port=18881,
+                    effective_proxy="socks5h://127.0.0.1:18881",
                 )
 
             def apply(self, cleanup=False):
@@ -756,30 +761,19 @@ class WebConsoleTests(unittest.TestCase):
                 return {
                     "configured": True,
                     "healthy": bool(self.refreshed),
+                    "relay_running": True,
                     "error": None,
                     "listener": "127.0.0.1:18881",
-                    "bootstrap": "US 33 AI",
+                    "bootstrap_proxy": "http://127.0.0.1:7897",
+                    "shared_bootstrap": True,
                 }
 
             def available_nodes(self):
-                return ["US 33 AI", "JP 22 GMO"]
-
-            def provider_payload(self, owner_id):
-                return json.dumps(
-                    {
-                        "proxies": [
-                            {
-                                "name": f"dynamic-{owner_id}",
-                                "type": "socks5",
-                                "server": "203.0.113.44",
-                                "port": 1080,
-                            }
-                        ]
-                    }
-                ).encode()
+                return ["http://127.0.0.1:7897"]
 
         chains = FakeProxyChains()
         self.controller.proxy_chains = chains
+        self.controller.enable_proxy_chains = True
         source_url = (
             "https://gen.lokiproxy.com/gen?region=PH&token=web-source-secret"
         )
@@ -791,7 +785,7 @@ class WebConsoleTests(unittest.TestCase):
                 json={
                     "mode": "lokiproxy_generator",
                     "source_url": source_url,
-                    "bootstrap": "US 33 AI",
+                    "bootstrap": "http://127.0.0.1:7897",
                 },
             )
             status_response = client.get(
@@ -802,27 +796,22 @@ class WebConsoleTests(unittest.TestCase):
                 "/api/proxy-chains/nodes",
                 headers={"X-Workflow-Token": self.controller.request_token},
             )
-            provider = client.get(
+            legacy_provider = client.get(
                 f"/internal/proxy-chain/{owner['id']}/provider"
-                "?token=local-provider-token"
-            )
-            denied = client.get(
-                f"/internal/proxy-chain/{owner['id']}/provider?token=wrong"
             )
 
-        serialized = configured.text + status_response.text + nodes.text + provider.text
+        serialized = configured.text + status_response.text + nodes.text
         self.assertEqual(configured.status_code, 200, configured.text)
         self.assertEqual(configured.json()["proxy_mode"], "lokiproxy_generator")
         self.assertEqual(status_response.status_code, 200)
         self.assertTrue(status_response.json()["chain"]["healthy"])
-        self.assertEqual(nodes.json()["nodes"], ["US 33 AI", "JP 22 GMO"])
-        self.assertEqual(provider.status_code, 200)
-        self.assertEqual(denied.status_code, 502)
+        self.assertEqual(nodes.json()["nodes"], ["http://127.0.0.1:7897"])
+        self.assertEqual(legacy_provider.status_code, 404)
         self.assertEqual(chains.applied, 2)  # startup plus saved chain
         self.assertEqual(chains.refreshed, [(owner["id"], True)])
         self.assertEqual(
             self.database.get_icloud_owner_proxy(owner["id"]),
-            "socks5://127.0.0.1:18881",
+            "socks5h://127.0.0.1:18881",
         )
         self.assertEqual(
             self.database.get_icloud_owner_proxy_config(owner["id"])["source_url"],
@@ -846,10 +835,11 @@ class WebConsoleTests(unittest.TestCase):
                 return {"applied": True}
 
             def available_nodes(self):
-                return ["US 33 AI", "JP 22 GMO"]
+                return ["http://127.0.0.1:7897"]
 
         chains = FailingOnceProxyChains()
         self.controller.proxy_chains = chains
+        self.controller.enable_proxy_chains = True
         self.controller.startup()
         self.assertEqual(
             self.controller.health()["proxy_chains"]["error"],
@@ -857,7 +847,7 @@ class WebConsoleTests(unittest.TestCase):
         )
         self.assertEqual(
             self.controller.list_proxy_chain_nodes()["nodes"],
-            ["US 33 AI", "JP 22 GMO"],
+            ["http://127.0.0.1:7897"],
         )
         self.assertEqual(chains.applied, 2)
         self.assertIsNone(self.controller.health()["proxy_chains"]["error"])

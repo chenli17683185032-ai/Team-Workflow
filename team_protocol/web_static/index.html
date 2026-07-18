@@ -360,7 +360,7 @@
         <input type="hidden" name="version">
         <label class="field"><span>空间名称</span><input name="name" type="text" required placeholder="例如 巴西 Team 01…" autocomplete="off"></label>
         <label class="field"><span>Workspace ID</span><input name="workspace_uid" type="text" required placeholder="输入 Workspace ID…" autocomplete="off" spellcheck="false"></label>
-        <label class="field"><span>Team 母号</span><select name="owner_alias_id"><option value="">普通空间（不绑定 iCloud 母号）</option></select></label>
+        <label class="field"><span>iCloud 归属母号（仅归属，不操作）</span><select name="owner_alias_id"><option value="">普通空间（不绑定 iCloud 母号）</option></select></label>
         <div class="field combobox-field" data-combobox="current">
           <label for="workspace-current-account">当前账号</label>
           <div class="account-combobox">
@@ -510,7 +510,7 @@
       <div class="dialog-content">
         <input type="hidden" name="mailbox_id">
         <dl class="allocation-preview">
-          <div><dt>母号</dt><dd id="icloud-generate-mailbox">-</dd></div>
+          <div><dt>资源池</dt><dd id="icloud-generate-mailbox">-</dd></div>
           <div><dt>转发邮箱</dt><dd id="icloud-generate-forwarding">-</dd></div>
         </dl>
         <div class="form-grid form-grid--two">
@@ -536,7 +536,7 @@
         <div class="table-frame table-frame--standalone">
           <table class="data-table icloud-alias-table">
             <caption class="sr-only">iCloud 隐藏邮箱列表</caption>
-            <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">角色 / 归属</th><th scope="col">空间 / 使用状态</th><th scope="col">远端</th><th scope="col">S5</th><th scope="col">创建时间</th><th class="actions-cell" scope="col">操作</th></tr></thead>
+            <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">角色 / 归属</th><th scope="col">空间 / 使用状态</th><th scope="col">远端</th><th scope="col">子号默认链路</th><th scope="col">创建时间</th><th class="actions-cell" scope="col">操作</th></tr></thead>
             <tbody id="icloud-alias-table-body"><tr class="loading-row"><td colspan="7"><span class="inline-loader" aria-hidden="true"></span>正在载入隐藏邮箱…</td></tr></tbody>
           </table>
         </div>
@@ -558,7 +558,7 @@
         <div class="table-frame table-frame--standalone">
           <table class="data-table icloud-sync-table">
             <caption class="sr-only">选择要接管的 iCloud 隐藏邮箱</caption>
-            <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">远端</th><th scope="col">接管为</th><th scope="col">归属母号</th><th scope="col">代理类型</th><th scope="col">代理配置</th><th scope="col">Clash 第一跳</th></tr></thead>
+            <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">远端</th><th scope="col">接管为</th><th scope="col">归属母号</th><th scope="col">链路类型</th><th scope="col">LokiProxy / 固定 S5</th><th scope="col">统一 Clash 前置</th></tr></thead>
             <tbody id="icloud-sync-table-body"><tr class="loading-row"><td colspan="7"><span class="inline-loader" aria-hidden="true"></span>正在读取 iCloud Alias…</td></tr></tbody>
           </table>
         </div>
@@ -574,34 +574,34 @@
   <dialog class="modal-dialog" id="icloud-owner-proxy-dialog" aria-labelledby="icloud-owner-proxy-title">
     <form method="dialog" class="dialog-shell" id="icloud-owner-proxy-form" novalidate>
       <header class="dialog-header">
-        <div><p class="eyebrow">TEAM OWNER NETWORK</p><h2 id="icloud-owner-proxy-title">母号 S5</h2></div>
-        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭母号 S5">×</button>
+        <div><p class="eyebrow">CHILD DEFAULT NETWORK</p><h2 id="icloud-owner-proxy-title">子号默认链路</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭子号默认链路">×</button>
       </header>
       <div class="dialog-content">
         <input type="hidden" name="alias_id">
-        <input type="hidden" name="mode" value="direct">
+        <input type="hidden" name="mode" value="lokiproxy_generator">
         <dl class="allocation-preview">
-          <div><dt>Team 母号</dt><dd id="icloud-owner-proxy-email">-</dd></div>
-          <div><dt>当前状态</dt><dd id="icloud-owner-proxy-state">未配置</dd></div>
+          <div><dt>归属母号（不参与操作）</dt><dd id="icloud-owner-proxy-email">-</dd></div>
+          <div><dt>子号默认链路</dt><dd id="icloud-owner-proxy-state">未配置</dd></div>
         </dl>
         <div class="field">
-          <span>代理类型</span>
-          <div class="segmented-control owner-proxy-mode-control" id="icloud-owner-proxy-mode" role="group" aria-label="母号代理类型">
-            <button type="button" class="is-active" data-action="select-icloud-owner-proxy-mode" data-mode="direct" aria-pressed="true">固定 S5</button>
-            <button type="button" data-action="select-icloud-owner-proxy-mode" data-mode="lokiproxy_generator" aria-pressed="false">LokiProxy</button>
+          <span>链路类型</span>
+          <div class="segmented-control owner-proxy-mode-control" id="icloud-owner-proxy-mode" role="group" aria-label="子号默认链路类型">
+            <button type="button" data-action="select-icloud-owner-proxy-mode" data-mode="direct" aria-pressed="false">固定 S5</button>
+            <button type="button" class="is-active" data-action="select-icloud-owner-proxy-mode" data-mode="lokiproxy_generator" aria-pressed="true">LokiProxy</button>
           </div>
         </div>
-        <label class="field" id="icloud-owner-direct-field"><span>S5 / SOCKS5 代理</span><input name="proxy" type="password" maxlength="4096" placeholder="socks5h://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
-        <div class="form-grid form-grid--two" id="icloud-owner-generator-fields" hidden>
+        <label class="field" id="icloud-owner-direct-field" hidden><span>子号固定 S5 / SOCKS5 代理</span><input name="proxy" type="password" maxlength="4096" placeholder="socks5h://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
+        <div class="form-grid form-grid--two" id="icloud-owner-generator-fields">
           <label class="field field--wide"><span>LokiProxy 生成链接</span><input name="source_url" type="password" maxlength="8192" placeholder="https://gen.lokiproxy.com/gen?..." autocomplete="new-password" spellcheck="false"></label>
-          <label class="field field--wide"><span>Clash 第一跳</span><select name="bootstrap"><option value="">选择节点</option></select></label>
+          <label class="field field--wide"><span>统一 Clash 前置</span><input name="bootstrap" type="text" maxlength="4096" value="http://127.0.0.1:7897" readonly autocomplete="off" spellcheck="false"></label>
         </div>
         <div class="form-error" id="icloud-owner-proxy-error" role="alert" hidden></div>
       </div>
       <footer class="dialog-footer">
-        <button type="button" class="text-action text-action--danger" data-action="clear-icloud-owner-proxy">清除母号 S5</button>
+        <button type="button" class="text-action text-action--danger" data-action="clear-icloud-owner-proxy">清除子号默认链路</button>
         <button type="button" class="button" data-action="close-dialog">取消</button>
-        <button type="submit" class="button button--primary">保存母号 S5</button>
+        <button type="submit" class="button button--primary">保存子号默认链路</button>
       </footer>
     </form>
   </dialog>

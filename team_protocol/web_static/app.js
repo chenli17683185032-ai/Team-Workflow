@@ -105,6 +105,7 @@ const ACCOUNT_PAGE_SIZE = 50;
 const MOBILE_ACCOUNT_PAGE_SIZE = 20;
 const INVENTORY_SEARCH_LIMIT = 20;
 const INVENTORY_SEARCH_DELAY = 300;
+const DEFAULT_LOCAL_CLASH_PROXY = "http://127.0.0.1:7897";
 
 const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
@@ -160,6 +161,7 @@ const state = {
   icloudTeamOwners: [],
   remoteIcloudAliases: [],
   proxyChainNodes: [],
+  sharedClashProxy: DEFAULT_LOCAL_CLASH_PROXY,
   activeIcloudMailboxId: "",
   activeRunId: null,
   activeRun: null,
@@ -593,7 +595,7 @@ function renderWorkspaceTable() {
       const rotationCount = Number(firstValue(workspace, ["rotation_count"], 0));
       const ownerEmail = safeString(firstValue(workspace, ["owner_email"]));
       const workspaceDetail = ownerEmail
-        ? `母号 ${ownerEmail} · 已用完 ${numberFormatter.format(Number(workspace.used_child_count || 0))} · 接力 ${numberFormatter.format(rotationCount)} 次`
+        ? `归属母号 ${ownerEmail}（母号不操作） · 已用完 ${numberFormatter.format(Number(workspace.used_child_count || 0))} · 接力 ${numberFormatter.format(rotationCount)} 次`
         : `轮换 ${numberFormatter.format(rotationCount)} 次`;
       row.append(labeledCell("空间", primarySecondary(workspaceName(workspace), workspaceDetail)));
 
@@ -850,12 +852,16 @@ async function loadIcloudTeamOwners() {
   return state.icloudTeamOwners;
 }
 
-async function loadProxyChainNodes() {
+async function loadProxyChainConfig() {
   const payload = await api("/api/proxy-chains/nodes");
   state.proxyChainNodes = asList(payload, ["nodes"])
     .map((value) => safeString(value))
     .filter(Boolean);
-  return state.proxyChainNodes;
+  state.sharedClashProxy = safeString(
+    firstValue(payload, ["local_proxy"]),
+    state.proxyChainNodes[0] || DEFAULT_LOCAL_CLASH_PROXY,
+  );
+  return payload;
 }
 
 function findIcloudTeamOwner(id) {
@@ -992,7 +998,7 @@ function renderIcloudSyncRows() {
       attrs: {"aria-label": `${safeString(item.email)} 接管角色`},
     }, [
       element("option", {text: "忽略", attrs: {value: "ignore"}}),
-      element("option", {text: "Team 母号", attrs: {value: "team_owner"}}),
+      element("option", {text: "Team 母号（仅归属）", attrs: {value: "team_owner"}}),
       element("option", {text: "当前子号", attrs: {value: "rotating_child"}}),
     ]);
     roleSelect.value = safeString(item.selectionRole, "ignore");
@@ -1010,18 +1016,18 @@ function renderIcloudSyncRows() {
     }
     parentSelect.value = safeString(item.parentOwnerEmail);
     parentSelect.disabled = item.selectionRole !== "rotating_child" || Boolean(item.imported);
-    row.append(labeledCell("归属母号", parentSelect));
+    row.append(labeledCell("归属母号（被动锚点）", parentSelect));
 
     const modeSelect = element("select", {
       dataset: {icloudOwnerProxyMode: safeString(item.email)},
-      attrs: {"aria-label": `${safeString(item.email)} 代理类型`},
+      attrs: {"aria-label": `${safeString(item.email)} 子号默认链路类型`},
     }, [
-      element("option", {text: "固定 S5", attrs: {value: "direct"}}),
       element("option", {text: "LokiProxy", attrs: {value: "lokiproxy_generator"}}),
+      element("option", {text: "固定 S5", attrs: {value: "direct"}}),
     ]);
-    modeSelect.value = safeString(item.ownerProxyMode, "direct");
+    modeSelect.value = safeString(item.ownerProxyMode, "lokiproxy_generator");
     modeSelect.disabled = item.selectionRole !== "team_owner" || Boolean(item.imported);
-    row.append(labeledCell("代理类型", modeSelect));
+    row.append(labeledCell("链路类型", modeSelect));
 
     const proxyInput = element("input", {
       dataset: {icloudOwnerProxy: safeString(item.email)},
@@ -1035,25 +1041,25 @@ function renderIcloudSyncRows() {
             : "socks5h://...",
         autocomplete: "new-password",
         spellcheck: "false",
-        "aria-label": `${safeString(item.email)} 母号 S5`,
+        "aria-label": `${safeString(item.email)} LokiProxy 或固定 S5`,
       },
     });
     proxyInput.value = safeString(item.ownerProxy);
     proxyInput.disabled = item.selectionRole !== "team_owner" || Boolean(item.imported);
-    row.append(labeledCell("代理配置", proxyInput));
+    row.append(labeledCell("LokiProxy / 固定 S5", proxyInput));
 
-    const bootstrapSelect = element("select", {
-      dataset: {icloudOwnerBootstrap: safeString(item.email)},
-      attrs: {"aria-label": `${safeString(item.email)} Clash 第一跳`},
-    }, [element("option", {text: "选择节点", attrs: {value: ""}})]);
-    for (const node of state.proxyChainNodes) {
-      bootstrapSelect.append(element("option", {text: node, attrs: {value: node}}));
-    }
-    bootstrapSelect.value = safeString(item.ownerProxyBootstrap);
-    bootstrapSelect.disabled = item.selectionRole !== "team_owner"
-      || item.ownerProxyMode !== "lokiproxy_generator"
-      || Boolean(item.imported);
-    row.append(labeledCell("Clash 第一跳", bootstrapSelect));
+    const sharedClash = element("input", {
+      attrs: {
+        type: "text",
+        value: item.ownerProxyMode === "lokiproxy_generator"
+          ? state.sharedClashProxy
+          : "不适用",
+        readonly: "",
+        "aria-label": `${safeString(item.email)} 统一 Clash 前置`,
+      },
+    });
+    sharedClash.disabled = item.selectionRole !== "team_owner";
+    row.append(labeledCell("统一 Clash 前置", sharedClash));
     fragment.append(row);
   }
   body.append(fragment);
@@ -1076,7 +1082,7 @@ async function openIcloudSync(mailbox) {
   ]));
   byId("icloud-sync-dialog").showModal();
   try {
-    await Promise.all([loadIcloudTeamOwners(), loadProxyChainNodes()]);
+    await Promise.all([loadIcloudTeamOwners(), loadProxyChainConfig()]);
     const payload = await api(`/api/icloud-mailboxes/${encodeURIComponent(state.activeIcloudMailboxId)}/remote-aliases`);
     const existingOwnerById = new Map(state.icloudTeamOwners.map((owner) => [safeString(owner.id), owner]));
     state.remoteIcloudAliases = asList(payload, ["aliases", "remote_aliases"]).map((item) => ({
@@ -1086,8 +1092,8 @@ async function openIcloudSync(mailbox) {
         ? safeString(existingOwnerById.get(safeString(item.parent_owner_alias_id))?.email)
         : "",
       ownerProxy: "",
-      ownerProxyMode: "direct",
-      ownerProxyBootstrap: "",
+      ownerProxyMode: "lokiproxy_generator",
+      ownerProxyBootstrap: state.sharedClashProxy,
     }));
     renderIcloudSyncRows();
   } catch (error) {
@@ -1110,15 +1116,12 @@ async function handleIcloudSync(form) {
   const items = [];
   for (const item of selected) {
     if (item.selectionRole === "team_owner" && !safeString(item.ownerProxy).trim()) {
-      fieldError("icloud-sync-error", `请填写母号 ${safeString(item.email)} 的代理配置`);
-      return;
-    }
-    if (
-      item.selectionRole === "team_owner"
-      && item.ownerProxyMode === "lokiproxy_generator"
-      && !safeString(item.ownerProxyBootstrap)
-    ) {
-      fieldError("icloud-sync-error", `请选择母号 ${safeString(item.email)} 的 Clash 第一跳`);
+      fieldError(
+        "icloud-sync-error",
+        item.ownerProxyMode === "lokiproxy_generator"
+          ? `请填写母号 ${safeString(item.email)} 对应的 LokiProxy 生成链接`
+          : `请填写母号 ${safeString(item.email)} 名下子号的固定 S5`,
+      );
       return;
     }
     if (item.selectionRole === "rotating_child" && !safeString(item.parentOwnerEmail)) {
@@ -1133,13 +1136,15 @@ async function handleIcloudSync(form) {
         ? safeString(item.ownerProxy).trim()
         : "",
       owner_proxy_mode: item.selectionRole === "team_owner"
-        ? safeString(item.ownerProxyMode, "direct")
+        ? safeString(item.ownerProxyMode, "lokiproxy_generator")
         : "direct",
-      owner_proxy_source_url: item.selectionRole === "team_owner" && item.ownerProxyMode === "lokiproxy_generator"
+      owner_proxy_source_url: item.selectionRole === "team_owner"
+        && item.ownerProxyMode === "lokiproxy_generator"
         ? safeString(item.ownerProxy).trim()
         : "",
-      owner_proxy_bootstrap: item.selectionRole === "team_owner" && item.ownerProxyMode === "lokiproxy_generator"
-        ? safeString(item.ownerProxyBootstrap)
+      owner_proxy_bootstrap: item.selectionRole === "team_owner"
+        && item.ownerProxyMode === "lokiproxy_generator"
+        ? state.sharedClashProxy
         : "",
     });
   }
@@ -2303,17 +2308,17 @@ async function handleWorkspaceSubmit(form) {
   const next = comboboxes.get("next").selected;
   const ownerAliasId = safeString(values.owner_alias_id).trim();
   if (!current || (!ownerAliasId && !next)) {
-    fieldError("workspace-form-error", ownerAliasId ? "请选择当前子号" : "请明确选择当前账号和下一账号");
+    fieldError("workspace-form-error", ownerAliasId ? "请选择当前子号（实际执行账号）" : "请明确选择当前账号和下一账号");
     comboboxInput(!current ? "current" : "next").focus();
     return;
   }
   if (ownerAliasId && current.kind !== "account") {
-    fieldError("workspace-form-error", "iCloud 母号空间的当前子号必须来自已接管 Alias");
+    fieldError("workspace-form-error", "iCloud 母号空间的当前执行账号必须来自已接管子号 Alias");
     comboboxInput("current").focus();
     return;
   }
   if (ownerAliasId && safeString(findAccount(current.id)?.icloud_owner_alias_id) !== ownerAliasId) {
-    fieldError("workspace-form-error", "当前子号不属于所选 Team 母号");
+    fieldError("workspace-form-error", "当前执行子号不属于所选归属母号");
     comboboxInput("current").focus();
     return;
   }
@@ -2606,8 +2611,8 @@ function renderIcloudAliases() {
     row.append(labeledCell("隐藏邮箱", primarySecondary(safeString(alias.email), safeString(alias.label))));
     const isOwner = alias.role === "team_owner";
     const role = primarySecondary(
-      isOwner ? "Team 母号" : "轮换子号",
-      isOwner ? "永久保护" : `归属 ${safeString(alias.owner_email, "未指定")}`,
+      isOwner ? "Team 母号（仅归属）" : "轮换子号（执行账号）",
+      isOwner ? "被动锚点，不参与工作流" : `归属 ${safeString(alias.owner_email, "未指定")}`,
     );
     row.append(labeledCell("角色 / 归属", role));
     const localStatus = isOwner ? "protected" : alias.used_at ? "used" : safeString(alias.account_status, "available");
@@ -2622,12 +2627,12 @@ function renderIcloudAliases() {
     const proxyState = alias.proxy_mode === "lokiproxy_generator"
       ? alias.proxy_chain?.healthy ? "dynamic" : "degraded"
       : alias.proxy_configured ? "configured" : "missing";
-    row.append(labeledCell("S5", statusBadge(proxyState, CONFIG_STATUS)));
+    row.append(labeledCell("子号默认链路", statusBadge(proxyState, CONFIG_STATUS)));
     row.append(labeledCell("创建时间", formatDate(alias.created_at)));
     const actions = element("div", {className: "row-actions"});
     const bound = ["bound_current", "bound_next"].includes(safeString(alias.account_status));
     if (isOwner) {
-      actions.append(actionButton("S5", "open-icloud-owner-proxy", {aliasId: safeString(alias.id)}));
+      actions.append(actionButton("子号链路", "open-icloud-owner-proxy", {aliasId: safeString(alias.id)}));
     }
     const target = alias.state === "active" ? "inactive" : "active";
     const button = actionButton(
@@ -2687,7 +2692,7 @@ async function setIcloudAliasState(aliasId, nextState) {
 }
 
 function setIcloudOwnerProxyMode(form, mode) {
-  const selected = mode === "lokiproxy_generator" ? mode : "direct";
+  const selected = mode === "direct" ? "direct" : "lokiproxy_generator";
   form.elements.namedItem("mode").value = selected;
   byId("icloud-owner-direct-field").hidden = selected !== "direct";
   byId("icloud-owner-generator-fields").hidden = selected !== "lokiproxy_generator";
@@ -2705,7 +2710,7 @@ async function openIcloudOwnerProxyDialog(aliasId) {
   const form = byId("icloud-owner-proxy-form");
   form.reset();
   try {
-    await loadProxyChainNodes();
+    await loadProxyChainConfig();
   } catch (error) {
     fieldError("icloud-owner-proxy-error", error?.message || String(error));
     return;
@@ -2714,22 +2719,21 @@ async function openIcloudOwnerProxyDialog(aliasId) {
   byId("icloud-owner-proxy-email").textContent = safeString(owner.email);
   const generated = owner.proxy_mode === "lokiproxy_generator";
   byId("icloud-owner-proxy-state").textContent = generated
-    ? owner.proxy_chain?.healthy ? "动态链已连接" : "动态链待刷新"
-    : owner.proxy_configured ? "固定 S5 已配置" : "未配置";
-  form.elements.namedItem("proxy").placeholder = owner.proxy_configured ? "未更改" : "socks5h://user:password@host:port";
+    ? owner.proxy_chain?.healthy
+      ? "统一 Clash -> LokiProxy 中继已连接"
+      : owner.proxy_chain?.relay_running
+        ? "中继已启动，LokiProxy 待刷新"
+        : "LokiProxy 中继未启动"
+    : owner.proxy_configured
+      ? "固定 S5 已配置"
+      : "未配置";
+  form.elements.namedItem("proxy").placeholder = owner.proxy_configured && !generated
+    ? "未更改"
+    : "socks5h://user:password@host:port";
   form.elements.namedItem("source_url").placeholder = generated
     ? "未更改"
     : "https://gen.lokiproxy.com/gen?...";
-  const bootstrap = form.elements.namedItem("bootstrap");
-  bootstrap.replaceChildren(element("option", {text: "选择节点", attrs: {value: ""}}));
-  const currentBootstrap = safeString(owner.proxy_chain?.bootstrap);
-  const nodes = currentBootstrap && !state.proxyChainNodes.includes(currentBootstrap)
-    ? [currentBootstrap, ...state.proxyChainNodes]
-    : state.proxyChainNodes;
-  for (const node of nodes) {
-    bootstrap.append(element("option", {text: node, attrs: {value: node}}));
-  }
-  bootstrap.value = currentBootstrap;
+  form.elements.namedItem("bootstrap").value = state.sharedClashProxy;
   setIcloudOwnerProxyMode(form, generated ? "lokiproxy_generator" : "direct");
   fieldError("icloud-owner-proxy-error", "");
   byId("icloud-owner-proxy-dialog").showModal();
@@ -2739,24 +2743,24 @@ async function handleIcloudOwnerProxySubmit(form) {
   if (!ensureMutable()) return;
   fieldError("icloud-owner-proxy-error", "");
   const aliasId = safeString(form.elements.namedItem("alias_id").value);
-  const mode = safeString(form.elements.namedItem("mode").value, "direct");
+  const mode = safeString(form.elements.namedItem("mode").value, "lokiproxy_generator");
   const proxy = safeString(form.elements.namedItem("proxy").value).trim();
   const sourceUrl = safeString(form.elements.namedItem("source_url").value).trim();
-  const bootstrap = safeString(form.elements.namedItem("bootstrap").value);
+  const bootstrap = safeString(form.elements.namedItem("bootstrap").value).trim();
   const owner = state.icloudAliases.find((item) => safeString(item.id) === aliasId)
     || findIcloudTeamOwner(aliasId);
   if (!aliasId || !owner) return;
   const existingGenerated = owner.proxy_mode === "lokiproxy_generator";
   if (mode === "direct" && !proxy && (!owner.proxy_configured || existingGenerated)) {
-    fieldError("icloud-owner-proxy-error", "请输入该母号自己的 S5");
+    fieldError("icloud-owner-proxy-error", "请输入该母号名下子号的固定 S5");
     return;
   }
   if (mode === "lokiproxy_generator" && !sourceUrl && !existingGenerated) {
-    fieldError("icloud-owner-proxy-error", "请输入 LokiProxy 生成链接");
+    fieldError("icloud-owner-proxy-error", "请输入该母号对应的 LokiProxy 生成链接");
     return;
   }
-  if (mode === "lokiproxy_generator" && !bootstrap && !existingGenerated) {
-    fieldError("icloud-owner-proxy-error", "请选择 Clash 第一跳");
+  if (mode === "lokiproxy_generator" && !bootstrap) {
+    fieldError("icloud-owner-proxy-error", "统一 Clash 前置不可用");
     return;
   }
   if (mode === "direct" && !proxy && owner.proxy_configured && !existingGenerated) {
@@ -2781,13 +2785,18 @@ async function handleIcloudOwnerProxySubmit(form) {
     state.icloudAliases = asList(payload, ["aliases", "icloud_aliases"]);
     renderIcloudAliases();
   }
-  showToast("母号 S5 已保存", "success");
+  showToast(
+    mode === "lokiproxy_generator"
+      ? "已保存独立 LokiProxy 源，统一使用本地 Clash 前置"
+      : "子号固定 S5 已保存，母号不会参与工作流",
+    "success",
+  );
 }
 
 async function clearIcloudOwnerProxy(form) {
   if (!ensureMutable()) return;
   const aliasId = safeString(form.elements.namedItem("alias_id").value);
-  if (!aliasId || !window.confirm("清除后无法现场创建下一子号，确认继续？")) return;
+  if (!aliasId || !window.confirm("清除后无法现场创建下一子号，且名下子号将失去默认链路，确认继续？")) return;
   await api(`/api/icloud-team-owners/${encodeURIComponent(aliasId)}/proxy`, {
     method: "PUT",
     body: {mode: "direct", proxy: ""},
@@ -2799,7 +2808,7 @@ async function clearIcloudOwnerProxy(form) {
     state.icloudAliases = asList(payload, ["aliases", "icloud_aliases"]);
     renderIcloudAliases();
   }
-  showToast("母号 S5 已清除", "success");
+  showToast("子号默认链路已清除", "success");
 }
 
 async function handleInventoryAllocation(form) {
@@ -2879,12 +2888,12 @@ async function replaceIcloudWorkspaceChild(id) {
   if (!ensureMutable()) return;
   const workspace = findWorkspace(id);
   if (!workspace?.owner_alias_id) {
-    throw new ApiError("空间未绑定 iCloud Team 母号", {code: "owner_missing"});
+    throw new ApiError("空间未绑定 iCloud 归属母号", {code: "owner_missing"});
   }
   const hasPreparedNext = Boolean(workspace.next_account_id);
   const message = hasPreparedNext
-    ? `下一子号 ${workspaceAccountLabel(workspace, "next")} 已准备好，立即开始接力？`
-    : `将立即为 ${safeString(workspace.owner_email)} 新建一个隐藏邮箱，并启动子号接力。确认继续？`;
+    ? `下一子号 ${workspaceAccountLabel(workspace, "next")} 已准备好，立即由当前子号开始接力？`
+    : `将通过 HME 资源池为 ${safeString(workspace.owner_email)} 名下新建一个隐藏邮箱，并由当前子号启动接力。母号不会登录或操作。确认继续？`;
   if (!window.confirm(message)) return;
   const result = await api(
     `/api/workspaces/${encodeURIComponent(id)}/replace-icloud-child`,
@@ -3137,37 +3146,38 @@ document.addEventListener("change", (event) => {
     if (item) {
       item.selectionRole = target.value;
       if (target.value !== "rotating_child") item.parentOwnerEmail = "";
-      if (target.value !== "team_owner") {
-        item.ownerProxy = "";
-        item.ownerProxyMode = "direct";
-        item.ownerProxyBootstrap = "";
-      }
+      item.ownerProxy = "";
+      item.ownerProxyMode = target.value === "team_owner"
+        ? "lokiproxy_generator"
+        : "direct";
+      item.ownerProxyBootstrap = target.value === "team_owner"
+        ? state.sharedClashProxy
+        : "";
       const owners = icloudSyncOwnerChoices().filter((email) => email !== item.email);
       if (target.value === "rotating_child" && !item.parentOwnerEmail && owners.length === 1) {
         item.parentOwnerEmail = owners[0];
       }
       renderIcloudSyncRows();
     }
-  } else if (target.matches("[data-icloud-owner-proxy-mode]")) {
-    const item = state.remoteIcloudAliases.find(
-      (candidate) => candidate.email === target.dataset.icloudOwnerProxyMode,
-    );
-    if (item) {
-      item.ownerProxyMode = target.value;
-      item.ownerProxy = "";
-      if (target.value !== "lokiproxy_generator") item.ownerProxyBootstrap = "";
-      renderIcloudSyncRows();
-    }
-  } else if (target.matches("[data-icloud-owner-bootstrap]")) {
-    const item = state.remoteIcloudAliases.find(
-      (candidate) => candidate.email === target.dataset.icloudOwnerBootstrap,
-    );
-    if (item) item.ownerProxyBootstrap = target.value;
   } else if (target.matches("[data-icloud-parent-owner]")) {
     const item = state.remoteIcloudAliases.find(
       (candidate) => candidate.email === target.dataset.icloudParentOwner,
     );
     if (item) item.parentOwnerEmail = target.value;
+  } else if (target.matches("[data-icloud-owner-proxy-mode]")) {
+    const item = state.remoteIcloudAliases.find(
+      (candidate) => candidate.email === target.dataset.icloudOwnerProxyMode,
+    );
+    if (item) {
+      item.ownerProxyMode = target.value === "direct"
+        ? "direct"
+        : "lokiproxy_generator";
+      item.ownerProxy = "";
+      item.ownerProxyBootstrap = item.ownerProxyMode === "lokiproxy_generator"
+        ? state.sharedClashProxy
+        : "";
+      renderIcloudSyncRows();
+    }
   } else if (target.id === "account-status-filter") {
     state.filters.accountStatus = target.value;
     state.accountPage = 1;
