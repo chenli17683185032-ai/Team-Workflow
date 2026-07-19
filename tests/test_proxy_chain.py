@@ -9,6 +9,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from team_protocol.proxy_chain import (
+    CHAIN_PROXY_MODE,
     ChainedProxyRelay,
     LokiProxyEndpoint,
     LokiProxyFetcher,
@@ -20,7 +21,7 @@ from team_protocol.proxy_chain import (
     ProxySourceNotWhitelistedError,
     parse_lokiproxy_response,
     validate_generator_url,
-    validate_lokiproxy_source,
+    validate_proxy_source,
 )
 
 
@@ -233,21 +234,38 @@ class ProxyChainTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_generator_url(invalid)
 
-    def test_fixed_socks_source_bypasses_generator_request(self):
-        source = "socks5://fixed-user:fixed-pass@proxy.example:3010"
+    def test_fixed_authenticated_proxy_sources_bypass_generator_request(self):
         fetcher = LokiProxyFetcher(
             requester=lambda *_args, **_kwargs: self.fail(
-                "fixed SOCKS source must not call the generator"
+                "fixed proxy source must not call the generator"
             )
         )
 
-        endpoint = fetcher.fetch(source, "http://127.0.0.1:7897")
+        for source, expected_scheme in (
+            ("socks5://fixed-user:fixed-pass@proxy.example:3010", "socks5"),
+            ("http://fixed-user:fixed-pass@proxy.example:3010", "http"),
+            ("http://proxy.example:3010", "http"),
+        ):
+            with self.subTest(source=source):
+                endpoint = fetcher.fetch(source, "http://127.0.0.1:7897")
 
-        self.assertEqual(validate_lokiproxy_source(source), source)
-        self.assertEqual(
-            (endpoint.host, endpoint.port, endpoint.username, endpoint.password),
-            ("proxy.example", 3010, "fixed-user", "fixed-pass"),
-        )
+                self.assertEqual(validate_proxy_source(source), source)
+                self.assertEqual(
+                    (
+                        endpoint.host,
+                        endpoint.port,
+                        endpoint.scheme,
+                        endpoint.username,
+                        endpoint.password,
+                    ),
+                    (
+                        "proxy.example",
+                        3010,
+                        expected_scheme,
+                        "" if source == "http://proxy.example:3010" else "fixed-user",
+                        "" if source == "http://proxy.example:3010" else "fixed-pass",
+                    ),
+                )
 
     def test_lokiproxy_parser_accepts_json_and_plain_text(self):
         endpoint = parse_lokiproxy_response(
@@ -352,7 +370,8 @@ class ProxyChainTests(unittest.TestCase):
         stored = config.as_secret_dict()
 
         self.assertEqual(config.bootstrap_proxy, "http://127.0.0.1:7897")
-        self.assertEqual(stored["version"], 2)
+        self.assertEqual(stored["version"], 3)
+        self.assertEqual(stored["mode"], CHAIN_PROXY_MODE)
         self.assertNotIn("bootstrap_name", stored)
         self.assertNotIn("bootstrap_port", stored)
 

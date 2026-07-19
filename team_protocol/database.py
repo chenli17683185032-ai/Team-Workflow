@@ -1582,9 +1582,11 @@ class Database:
         stored_config: dict[str, Any] | None = None
         if mode == "direct":
             clean_proxy = self._coerce_icloud_owner_proxy(config.get("proxy"))
-        elif mode == "lokiproxy_generator":
-            from .proxy_chain import OwnerChainConfig
+        else:
+            from .proxy_chain import OwnerChainConfig, is_chain_proxy_mode
 
+            if not is_chain_proxy_mode(mode):
+                raise ValidationError("iCloud Team owner proxy mode is invalid")
             try:
                 chain = OwnerChainConfig.from_mapping(config)
             except ValueError as exc:
@@ -1593,8 +1595,6 @@ class Database:
                 raise ValidationError("iCloud Team owner proxy config owner is invalid")
             clean_proxy = self._coerce_icloud_owner_proxy(chain.effective_proxy)
             stored_config = chain.as_secret_dict()
-        else:
-            raise ValidationError("iCloud Team owner proxy mode is invalid")
 
         purpose = f"icloud-owner:{alias_id}:proxy"
         blob = (
@@ -1735,13 +1735,16 @@ class Database:
             raise DatabaseError("iCloud Team owner proxy config is invalid") from exc
         if not isinstance(value, Mapping):
             raise DatabaseError("iCloud Team owner proxy config is invalid")
+        from .proxy_chain import CHAIN_PROXY_MODE, is_chain_proxy_mode
+
         result = dict(value)
         if (
-            str(result.get("mode") or "") != "lokiproxy_generator"
+            not is_chain_proxy_mode(result.get("mode"))
             or str(result.get("owner_id") or "") != str(alias_id)
             or str(result.get("effective_proxy") or "") != effective_proxy
         ):
             raise DatabaseError("iCloud Team owner proxy config is invalid")
+        result["mode"] = CHAIN_PROXY_MODE
         return result
 
     @staticmethod
@@ -1859,6 +1862,8 @@ class Database:
             return validated
 
     def list_icloud_owner_proxy_configs(self) -> list[dict[str, Any]]:
+        from .proxy_chain import is_chain_proxy_mode
+
         with self._read_connection() as connection:
             rows = connection.execute(
                 """
@@ -1871,7 +1876,7 @@ class Database:
         result: list[dict[str, Any]] = []
         for row in rows:
             config = self.get_icloud_owner_proxy_config(str(row["id"]))
-            if config.get("mode") == "lokiproxy_generator":
+            if is_chain_proxy_mode(config.get("mode")):
                 result.append(config)
         return result
 

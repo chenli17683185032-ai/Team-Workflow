@@ -644,15 +644,6 @@ input[readonly] {
   font-weight: 650;
 }
 
-.owner-proxy-mode-control {
-  display: flex;
-  width: 100%;
-}
-
-.owner-proxy-mode-control button {
-  flex: 1 1 0;
-}
-
 .selection-count {
   margin-left: auto;
   color: var(--ink-faint);

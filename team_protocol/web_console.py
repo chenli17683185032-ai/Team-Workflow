@@ -76,11 +76,14 @@ from .registrar_runtime.icloud_imap_provider import (
 )
 from .registrar import validate_proxy_url
 from .proxy_chain import (
+    CHAIN_PROXY_MODE,
     ProxyChainError,
     ProxyChainManager,
     ProxyConfigurationError,
+    is_chain_proxy_mode,
+    normalize_chain_proxy_mode,
     validate_bootstrap_proxy,
-    validate_lokiproxy_source,
+    validate_proxy_source,
 )
 from .sub2api import Sub2APIClient, Sub2APIError
 from .task_queue import TaskQueue, redact_value
@@ -382,7 +385,9 @@ class ICloudAliasImportItem(StrictModel):
     role: Literal["team_owner", "rotating_child"]
     parent_owner_email: str | None = Field(default=None, min_length=3, max_length=320)
     owner_proxy: str = Field(default="", max_length=4096)
-    owner_proxy_mode: Literal["direct", "lokiproxy_generator"] = "direct"
+    owner_proxy_mode: Literal["direct", "clash_chain", "lokiproxy_generator"] = (
+        "clash_chain"
+    )
     owner_proxy_source_url: str = Field(default="", max_length=8192)
     owner_proxy_bootstrap: str = Field(default="", max_length=4096)
 
@@ -397,7 +402,9 @@ class ICloudTeamImportRequest(StrictModel):
     workspace_uid: str = Field(min_length=1, max_length=500)
     owner_email: str = Field(min_length=3, max_length=320)
     current_child_email: str = Field(min_length=3, max_length=320)
-    owner_proxy_mode: Literal["direct", "lokiproxy_generator"] | None = None
+    owner_proxy_mode: Literal[
+        "direct", "clash_chain", "lokiproxy_generator"
+    ] | None = None
     owner_proxy: str = Field(default="", max_length=4096)
     owner_proxy_source_url: str = Field(default="", max_length=8192)
     owner_proxy_bootstrap: str = Field(default="", max_length=4096)
@@ -407,7 +414,9 @@ class ICloudTeamWorkspaceLookupRequest(StrictModel):
     mailbox_id: str = Field(min_length=1)
     owner_email: str = Field(min_length=3, max_length=320)
     current_child_email: str = Field(min_length=3, max_length=320)
-    owner_proxy_mode: Literal["direct", "lokiproxy_generator"] | None = None
+    owner_proxy_mode: Literal[
+        "direct", "clash_chain", "lokiproxy_generator"
+    ] | None = None
     owner_proxy: str = Field(default="", max_length=4096)
     owner_proxy_source_url: str = Field(default="", max_length=8192)
     owner_proxy_bootstrap: str = Field(default="", max_length=4096)
@@ -415,7 +424,7 @@ class ICloudTeamWorkspaceLookupRequest(StrictModel):
 
 class ICloudOwnerProxyRequest(StrictModel):
     proxy: str = Field(default="", max_length=4096)
-    mode: Literal["direct", "lokiproxy_generator"] = "direct"
+    mode: Literal["direct", "clash_chain", "lokiproxy_generator"] = "clash_chain"
     source_url: str = Field(default="", max_length=8192)
     bootstrap: str = Field(default="", max_length=4096)
 
@@ -560,7 +569,7 @@ class WebConsoleController:
         self._shutdown_probe: Callable[[], bool] = lambda: False
 
     def _migrate_legacy_proxy_chains(self) -> int:
-        """Move old per-node Mihomo configs to the one shared Clash URL."""
+        """Normalize legacy chain configs onto the shared Clash model."""
 
         if not self.enable_proxy_chains:
             return 0
@@ -1128,9 +1137,9 @@ class WebConsoleController:
         if result.get("role") != "team_owner":
             return result
         config = self.database.get_icloud_owner_proxy_config(str(result["id"]))
-        mode = str(config.get("mode") or "direct")
+        mode = normalize_chain_proxy_mode(config.get("mode") or "direct")
         result["proxy_mode"] = mode
-        if mode == "lokiproxy_generator":
+        if is_chain_proxy_mode(mode):
             result["proxy_chain"] = self.proxy_chains.status(str(result["id"]))
         return result
 
@@ -1347,7 +1356,7 @@ class WebConsoleController:
         payload: Mapping[str, Any],
         existing_owner: Mapping[str, Any] | None,
     ) -> dict[str, str]:
-        mode = str(payload.get("owner_proxy_mode") or "").strip()
+        mode = normalize_chain_proxy_mode(payload.get("owner_proxy_mode"))
         direct_proxy = str(payload.get("owner_proxy") or "").strip()
         source_url = str(payload.get("owner_proxy_source_url") or "").strip()
         bootstrap = str(payload.get("owner_proxy_bootstrap") or "").strip()
@@ -1355,7 +1364,7 @@ class WebConsoleController:
             config = self.database.get_icloud_owner_proxy_config(
                 str(existing_owner["id"])
             )
-            mode = str(config.get("mode") or "").strip()
+            mode = normalize_chain_proxy_mode(config.get("mode"))
             direct_proxy = str(
                 config.get("proxy") or config.get("effective_proxy") or ""
             ).strip()
@@ -1372,10 +1381,11 @@ class WebConsoleController:
                 direct_proxy = validate_proxy_url(direct_proxy)
             except ValueError as exc:
                 raise FieldInputError({"owner_proxy": str(exc)}) from exc
-        elif mode == "lokiproxy_generator":
+        elif is_chain_proxy_mode(mode):
+            mode = CHAIN_PROXY_MODE
             bootstrap = bootstrap or self.local_clash_proxy
             try:
-                source_url = validate_lokiproxy_source(source_url)
+                source_url = validate_proxy_source(source_url)
                 bootstrap = validate_bootstrap_proxy(bootstrap)
             except ValueError as exc:
                 raise FieldInputError(
@@ -1385,7 +1395,7 @@ class WebConsoleController:
                 raise FieldInputError(
                     {
                         "owner_proxy_bootstrap": (
-                            "all Team LokiProxy chains must use the shared local Clash proxy"
+                            "all Team proxy chains must use the shared local Clash proxy"
                         )
                     }
                 )
@@ -1566,14 +1576,14 @@ class WebConsoleController:
                 raise StateConflictError("selected current child is already bound")
 
         configure_proxy = payload.get("owner_proxy_mode") is not None
-        proxy_mode = str(payload.get("owner_proxy_mode") or "")
+        proxy_mode = normalize_chain_proxy_mode(payload.get("owner_proxy_mode"))
         direct_proxy = str(payload.get("owner_proxy") or "").strip()
         proxy_source = str(payload.get("owner_proxy_source_url") or "").strip()
         proxy_bootstrap = str(
             payload.get("owner_proxy_bootstrap")
             or (
                 self.local_clash_proxy
-                if proxy_mode == "lokiproxy_generator"
+                if is_chain_proxy_mode(proxy_mode)
                 else ""
             )
         ).strip()
@@ -1593,9 +1603,10 @@ class WebConsoleController:
                     validate_proxy_url(direct_proxy)
                 except ValueError as exc:
                     raise FieldInputError({"owner_proxy": str(exc)}) from exc
-            elif proxy_mode == "lokiproxy_generator":
+            elif is_chain_proxy_mode(proxy_mode):
+                proxy_mode = CHAIN_PROXY_MODE
                 try:
-                    proxy_source = validate_lokiproxy_source(proxy_source)
+                    proxy_source = validate_proxy_source(proxy_source)
                     proxy_bootstrap = validate_bootstrap_proxy(proxy_bootstrap)
                 except ValueError as exc:
                     raise FieldInputError(
@@ -1605,7 +1616,7 @@ class WebConsoleController:
                     raise FieldInputError(
                         {
                             "owner_proxy_bootstrap": (
-                                "all Team LokiProxy chains must use the shared local Clash proxy"
+                                "all Team proxy chains must use the shared local Clash proxy"
                             )
                         }
                     )
@@ -1717,7 +1728,7 @@ class WebConsoleController:
         if not isinstance(selected, list) or not selected:
             raise FieldInputError({"items": "select at least one iCloud alias"})
         requested: dict[str, Mapping[str, Any]] = {}
-        generated_owners: dict[str, dict[str, str]] = {}
+        chained_owners: dict[str, dict[str, str]] = {}
         for value in selected:
             if not isinstance(value, Mapping):
                 raise FieldInputError({"items": "iCloud alias selection is invalid"})
@@ -1725,12 +1736,15 @@ class WebConsoleController:
             if not email or email in requested:
                 raise FieldInputError({"items": "iCloud alias selection has duplicates"})
             normalized = dict(value)
-            mode = str(normalized.get("owner_proxy_mode") or "direct")
+            mode = normalize_chain_proxy_mode(
+                normalized.get("owner_proxy_mode") or CHAIN_PROXY_MODE
+            )
+            normalized["owner_proxy_mode"] = mode
             role = str(normalized.get("role") or "")
-            if role == "team_owner" and mode == "lokiproxy_generator":
+            if role == "team_owner" and is_chain_proxy_mode(mode):
                 if not self.enable_proxy_chains:
                     raise FieldInputError(
-                        {"items": "LokiProxy relay is disabled"}
+                        {"items": "Team proxy-chain relay is disabled"}
                     )
                 source_url = str(
                     normalized.get("owner_proxy_source_url")
@@ -1742,15 +1756,15 @@ class WebConsoleController:
                     or self.local_clash_proxy
                 ).strip()
                 try:
-                    source_url = validate_lokiproxy_source(source_url)
+                    source_url = validate_proxy_source(source_url)
                     bootstrap = validate_bootstrap_proxy(bootstrap)
                 except ValueError as exc:
                     raise FieldInputError({"items": str(exc)}) from exc
                 if bootstrap != self.local_clash_proxy:
                     raise FieldInputError(
-                        {"items": "both LokiProxy sources must use the shared local Clash proxy"}
+                        {"items": "all Team proxy sources must use the shared local Clash proxy"}
                     )
-                generated_owners[email] = {
+                chained_owners[email] = {
                     "source_url": source_url,
                     "bootstrap_proxy": bootstrap,
                 }
@@ -1801,12 +1815,12 @@ class WebConsoleController:
                     for email in requested
                 ],
             )
-            if generated_owners:
+            if chained_owners:
                 imported_by_email = {
                     str(item["email"]).casefold(): item for item in imported
                 }
                 configured_owner_ids: list[str] = []
-                for email, proxy_source in generated_owners.items():
+                for email, proxy_source in chained_owners.items():
                     owner = imported_by_email.get(email)
                     if owner is None or owner.get("role") != "team_owner":
                         raise StateConflictError(
@@ -1844,31 +1858,31 @@ class WebConsoleController:
     ) -> dict[str, Any]:
         alias_id = str(alias_id)
         previous = self.database.get_icloud_owner_proxy_config(alias_id)
-        mode = str(payload.get("mode") or "direct")
+        mode = normalize_chain_proxy_mode(payload.get("mode") or CHAIN_PROXY_MODE)
         if mode == "direct":
             if str(payload.get("source_url") or "").strip() or str(
                 payload.get("bootstrap") or ""
             ).strip():
                 raise FieldInputError(
-                    {"mode": "LokiProxy source and first hop require LokiProxy mode"}
+                    {"mode": "proxy source and first hop require Clash-chain mode"}
                 )
             updated = self.database.set_icloud_owner_proxy(
                 alias_id, str(payload.get("proxy") or "")
             )
-            if previous.get("mode") == "lokiproxy_generator":
+            if is_chain_proxy_mode(previous.get("mode")):
                 if self.enable_proxy_chains:
                     self.proxy_chains.apply()
-        elif mode == "lokiproxy_generator":
+        elif is_chain_proxy_mode(mode):
             if not self.enable_proxy_chains:
                 raise FieldInputError(
-                    {"mode": "LokiProxy relay is disabled"}
+                    {"mode": "Team proxy-chain relay is disabled"}
                 )
             source_url = str(
                 payload.get("source_url")
                 or payload.get("proxy")
                 or (
                     previous.get("source_url")
-                    if previous.get("mode") == "lokiproxy_generator"
+                    if is_chain_proxy_mode(previous.get("mode"))
                     else ""
                 )
                 or ""
@@ -1877,7 +1891,7 @@ class WebConsoleController:
                 payload.get("bootstrap")
                 or (
                     previous.get("bootstrap_proxy")
-                    if previous.get("mode") == "lokiproxy_generator"
+                    if is_chain_proxy_mode(previous.get("mode"))
                     else ""
                 )
                 or self.local_clash_proxy
@@ -1886,7 +1900,7 @@ class WebConsoleController:
                 bootstrap = validate_bootstrap_proxy(bootstrap)
                 if bootstrap != self.local_clash_proxy:
                     raise ValueError(
-                        "both LokiProxy chains must use the shared local Clash proxy"
+                        "all Team proxy chains must use the shared local Clash proxy"
                     )
                 chain = self.proxy_chains.prepare(alias_id, source_url, bootstrap)
             except ValueError as exc:
@@ -1906,14 +1920,14 @@ class WebConsoleController:
         if alias["role"] != "team_owner":
             raise StateConflictError("iCloud alias is not a Team owner")
         config = self.database.get_icloud_owner_proxy_config(str(alias_id))
-        mode = str(config.get("mode") or "direct")
+        mode = normalize_chain_proxy_mode(config.get("mode") or "direct")
         return _safe_payload(
             {
                 "configured": bool(alias["proxy_configured"]),
                 "mode": mode,
                 "chain": (
                     self.proxy_chains.status(str(alias_id))
-                    if mode == "lokiproxy_generator"
+                    if is_chain_proxy_mode(mode)
                     else None
                 ),
             }
@@ -2036,7 +2050,7 @@ class WebConsoleController:
         owner_proxy_config = self.database.get_icloud_owner_proxy_config(
             str(owner["id"])
         )
-        if owner_proxy_config.get("mode") == "lokiproxy_generator":
+        if is_chain_proxy_mode(owner_proxy_config.get("mode")):
             self.proxy_chains.ensure_ready(str(owner["id"]))
         mailbox = self.database.get_icloud_mailbox(owner["mailbox_id"])
         if mailbox["status"] != "ready":

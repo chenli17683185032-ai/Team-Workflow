@@ -1,10 +1,10 @@
-"""Two independent LokiProxy chains sharing one local Clash forward proxy.
+"""Independent Team proxy chains sharing one local Clash forward proxy.
 
 The user's Clash is deliberately treated as an ordinary upstream HTTP/SOCKS
 proxy.  Team Workflow never writes a Mihomo configuration, starts another
 Mihomo process, or changes a selector.  Each configured owner gets one local
-SOCKS5 relay.  A relay connects to that owner's short-lived LokiProxy endpoint
-through the shared Clash before it connects to the requested destination.
+SOCKS5 relay. A relay connects to that owner's fixed or generated second-hop
+proxy through the shared Clash before it connects to the requested destination.
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ import requests
 DEFAULT_LOCAL_CLASH_PROXY = "http://127.0.0.1:7897"
 DEFAULT_LISTENER_PORT_BASE = 18_880
 DEFAULT_CACHE_TTL = 45.0
+CHAIN_PROXY_MODE = "clash_chain"
+LEGACY_CHAIN_PROXY_MODE = "lokiproxy_generator"
+CHAIN_PROXY_MODES = frozenset({CHAIN_PROXY_MODE, LEGACY_CHAIN_PROXY_MODE})
 _GENERATOR_HOST = "gen.lokiproxy.com"
 _MAX_RESPONSE_BYTES = 256 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
@@ -128,7 +131,7 @@ def validate_proxy_url(value: str) -> str:
 
 
 def validate_bootstrap_proxy(value: str) -> str:
-    """Validate the single Clash URL shared by every LokiProxy chain."""
+    """Validate the single Clash URL shared by every Team proxy chain."""
 
     return validate_proxy_url(value)
 
@@ -175,24 +178,52 @@ def validate_generator_url(value: str) -> str:
     return urllib.parse.urlunsplit(parsed)
 
 
-def validate_lokiproxy_source(value: str) -> str:
-    """Accept either a Loki generator URL or a fixed Loki SOCKS5 endpoint."""
+def normalize_chain_proxy_mode(value: Any) -> str:
+    mode = str(value or "").strip()
+    return CHAIN_PROXY_MODE if mode in CHAIN_PROXY_MODES else mode
+
+
+def is_chain_proxy_mode(value: Any) -> bool:
+    return normalize_chain_proxy_mode(value) == CHAIN_PROXY_MODE
+
+
+def validate_proxy_source(value: str) -> str:
+    """Accept a fixed HTTP/SOCKS endpoint or a legacy Loki generator URL."""
 
     text = str(value or "").strip()
     try:
-        scheme = urllib.parse.urlsplit(text).scheme.casefold()
+        parsed = urllib.parse.urlsplit(text)
+        scheme = parsed.scheme.casefold()
     except ValueError:
-        raise ValueError("LokiProxy source URL is invalid") from None
+        raise ValueError("proxy source URL is invalid") from None
     if scheme in {"socks", "socks5", "socks5h", "s5", "s5h"}:
         normalized = validate_proxy_url(text)
-        if _parse_proxy_address(normalized, label="LokiProxy source").scheme != "socks5":
-            raise ValueError("fixed LokiProxy source must use SOCKS5")
+        _parse_proxy_address(normalized, label="proxy source")
         return normalized
-    return validate_generator_url(text)
+    if scheme == "http":
+        host = str(parsed.hostname or "").casefold()
+        if (host == _GENERATOR_HOST or host.endswith("." + _GENERATOR_HOST)) and (
+            parsed.path.rstrip("/") == "/gen"
+        ):
+            return validate_generator_url(text)
+        normalized = validate_proxy_url(text)
+        _parse_proxy_address(normalized, label="proxy source")
+        return normalized
+    if scheme == "https":
+        return validate_generator_url(text)
+    raise ValueError(
+        "proxy source must be a complete HTTP/SOCKS URL or supported generator URL"
+    )
+
+
+def validate_lokiproxy_source(value: str) -> str:
+    """Compatibility alias for callers using the old provider-specific name."""
+
+    return validate_proxy_source(value)
 
 
 @dataclass(frozen=True)
-class LokiProxyEndpoint:
+class ProxyEndpoint:
     host: str
     port: int
     scheme: str = "socks5"
@@ -207,20 +238,20 @@ class LokiProxyEndpoint:
             or any(character.isspace() or ord(character) < 32 for character in host)
             or any(separator in host for separator in ("/", "@", "://"))
         ):
-            raise ValueError("LokiProxy response host is invalid")
+            raise ValueError("proxy source response host is invalid")
         try:
             port = int(self.port)
         except (TypeError, ValueError) as exc:
-            raise ValueError("LokiProxy response port is invalid") from exc
+            raise ValueError("proxy source response port is invalid") from exc
         if not 1 <= port <= 65535:
-            raise ValueError("LokiProxy response port is invalid")
+            raise ValueError("proxy source response port is invalid")
         scheme = _normalize_proxy_scheme(str(self.scheme or "socks5"))
         if scheme == "https":
             scheme = "http"
         username = str(self.username or "")
         password = str(self.password or "")
         if any(ord(character) < 32 for character in username + password):
-            raise ValueError("LokiProxy response credentials are invalid")
+            raise ValueError("proxy source response credentials are invalid")
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "port", port)
         object.__setattr__(self, "scheme", scheme)
@@ -284,10 +315,10 @@ def _ttl_seconds(payload: Mapping[str, Any], item: Mapping[str, Any]) -> float |
     return None
 
 
-def _endpoint_from_mapping(payload: Mapping[str, Any]) -> LokiProxyEndpoint:
+def _endpoint_from_mapping(payload: Mapping[str, Any]) -> ProxyEndpoint:
     item = _candidate_mapping(payload)
     if item is None:
-        raise ValueError("LokiProxy response contains no proxy endpoint")
+        raise ValueError("proxy source response contains no endpoint")
     nested_auth = item.get("auth") if isinstance(item.get("auth"), Mapping) else {}
     host = item.get("ip") or item.get("host") or item.get("server") or item.get("address")
     port = item.get("port") or item.get("serverPort")
@@ -300,7 +331,7 @@ def _endpoint_from_mapping(payload: Mapping[str, Any]) -> LokiProxyEndpoint:
         or item.get("proxyType")
         or "socks5"
     )
-    return LokiProxyEndpoint(
+    return ProxyEndpoint(
         host=str(host or "").strip(),
         port=int(port),
         scheme=str(protocol),
@@ -310,10 +341,10 @@ def _endpoint_from_mapping(payload: Mapping[str, Any]) -> LokiProxyEndpoint:
     )
 
 
-def _endpoint_from_text(value: str) -> LokiProxyEndpoint:
+def _endpoint_from_text(value: str) -> ProxyEndpoint:
     text = str(value or "").strip().strip("\"'")
     if not text:
-        raise ValueError("LokiProxy response is empty")
+        raise ValueError("proxy source response is empty")
     if "://" in text:
         try:
             parsed = urllib.parse.urlsplit(text)
@@ -324,7 +355,7 @@ def _endpoint_from_text(value: str) -> LokiProxyEndpoint:
                 raise ValueError
             if port is None:
                 raise ValueError
-            return LokiProxyEndpoint(
+            return ProxyEndpoint(
                 host=host,
                 port=port,
                 scheme=scheme,
@@ -332,30 +363,30 @@ def _endpoint_from_text(value: str) -> LokiProxyEndpoint:
                 password=urllib.parse.unquote(parsed.password or ""),
             )
         except (ValueError, UnicodeError):
-            raise ValueError("LokiProxy response endpoint is invalid") from None
+            raise ValueError("proxy source response endpoint is invalid") from None
     if text.startswith("["):
         closing = text.find("]")
         if closing <= 0 or closing + 2 > len(text) or text[closing + 1] != ":":
-            raise ValueError("LokiProxy response endpoint is invalid")
+            raise ValueError("proxy source response endpoint is invalid")
         host, port_text = text[1:closing], text[closing + 2 :]
     else:
         host, separator, port_text = text.rpartition(":")
         if not separator:
-            raise ValueError("LokiProxy response endpoint is invalid")
+            raise ValueError("proxy source response endpoint is invalid")
     try:
-        return LokiProxyEndpoint(host=host, port=int(port_text))
+        return ProxyEndpoint(host=host, port=int(port_text))
     except (TypeError, ValueError) as exc:
-        raise ValueError("LokiProxy response endpoint is invalid") from exc
+        raise ValueError("proxy source response endpoint is invalid") from exc
 
 
-def parse_lokiproxy_response(payload: Any) -> LokiProxyEndpoint:
-    """Extract one SOCKS5/HTTP endpoint from common LokiProxy responses."""
+def parse_proxy_source_response(payload: Any) -> ProxyEndpoint:
+    """Extract one SOCKS5/HTTP endpoint from a legacy generator response."""
 
     if isinstance(payload, (bytes, bytearray)):
         try:
             payload = bytes(payload).decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ValueError("LokiProxy response is not UTF-8") from exc
+            raise ValueError("proxy source response is not UTF-8") from exc
     if isinstance(payload, str):
         text = payload.strip()
         try:
@@ -371,10 +402,16 @@ def parse_lokiproxy_response(payload: Any) -> LokiProxyEndpoint:
         item = _first_mapping(payload)
         if item is not None:
             return _endpoint_from_mapping(item)
-    raise ValueError("LokiProxy response is not an endpoint object")
+    raise ValueError("proxy source response is not an endpoint object")
 
 
-class LokiProxyFetcher:
+def parse_lokiproxy_response(payload: Any) -> ProxyEndpoint:
+    """Compatibility alias for the old provider-specific parser name."""
+
+    return parse_proxy_source_response(payload)
+
+
+class ProxySourceResolver:
     def __init__(
         self,
         *,
@@ -384,23 +421,30 @@ class LokiProxyFetcher:
         self.requester = requester
         self.timeout = timeout
 
-    def fetch(self, source_url: str, bootstrap_proxy: str) -> LokiProxyEndpoint:
-        normalized_url = validate_lokiproxy_source(source_url)
+    def fetch(self, source_url: str, bootstrap_proxy: str) -> ProxyEndpoint:
+        normalized_url = validate_proxy_source(source_url)
         proxy = validate_bootstrap_proxy(bootstrap_proxy)
-        if urllib.parse.urlsplit(normalized_url).scheme.casefold() in {
+        parsed_source = urllib.parse.urlsplit(normalized_url)
+        fixed_proxy = parsed_source.scheme.casefold() in {
             "socks",
             "socks5",
             "socks5h",
             "s5",
             "s5h",
-        }:
+        } or (
+            parsed_source.scheme.casefold() == "http"
+            and parsed_source.path in {"", "/"}
+            and not parsed_source.query
+            and not parsed_source.fragment
+        )
+        if fixed_proxy:
             source_address = _parse_proxy_address(
-                normalized_url, label="LokiProxy source"
+                normalized_url, label="proxy source"
             )
-            return LokiProxyEndpoint(
+            return ProxyEndpoint(
                 host=source_address.host,
                 port=source_address.port,
-                scheme="socks5",
+                scheme=source_address.scheme,
                 username=source_address.username,
                 password=source_address.password,
             )
@@ -420,23 +464,23 @@ class LokiProxyFetcher:
                 finally:
                     session.close()
         except (requests.RequestException, OSError, TimeoutError, ValueError) as exc:
-            raise ProxySourceError("LokiProxy generator request failed") from exc
+            raise ProxySourceError("legacy proxy generator request failed") from exc
         status = int(getattr(response, "status_code", 0) or 0)
         raw: bytes | None = None
         content = getattr(response, "content", None)
         if isinstance(content, (bytes, bytearray)):
             if len(content) > _MAX_RESPONSE_BYTES:
-                raise ProxySourceError("LokiProxy generator response is too large")
+                raise ProxySourceError("legacy proxy generator response is too large")
             raw = bytes(content)
         elif getattr(response, "text", None) is not None:
             raw = str(response.text or "").encode("utf-8")
             if len(raw) > _MAX_RESPONSE_BYTES:
-                raise ProxySourceError("LokiProxy generator response is too large")
+                raise ProxySourceError("legacy proxy generator response is too large")
         if status < 200 or status >= 300:
             error_text = "" if raw is None else raw.decode("utf-8", errors="ignore").casefold()
             if "whitelist" in error_text:
                 raise ProxySourceNotWhitelistedError(
-                    "LokiProxy requires the current Clash exit in its IP whitelist"
+                    "proxy generator requires the current Clash exit in its IP whitelist"
                 )
             if any(
                 marker in error_text
@@ -447,8 +491,8 @@ class LokiProxyFetcher:
                     "quota exhausted",
                 )
             ):
-                raise ProxySourceDepletedError("LokiProxy source has no remaining proxy quota")
-            raise ProxySourceError("LokiProxy generator returned an HTTP error")
+                raise ProxySourceDepletedError("proxy source has no remaining quota")
+            raise ProxySourceError("legacy proxy generator returned an HTTP error")
         try:
             if raw is not None:
                 try:
@@ -460,12 +504,16 @@ class LokiProxyFetcher:
                     payload = response.json()
                 except (TypeError, ValueError, AttributeError):
                     payload = str(getattr(response, "text", "") or "")
-            return parse_lokiproxy_response(payload)
+            return parse_proxy_source_response(payload)
         except (TypeError, ValueError, UnicodeError, AttributeError) as exc:
-            # Some LokiProxy deployments return a plain `host:port` line and
-            # some return JSON.  Both forms are parsed above without exposing
+            # Legacy generators may return a plain `host:port` line or JSON.
+            # Both forms are parsed above without exposing
             # the source URL or response body in the raised error.
-            raise ProxySourceError("LokiProxy generator response is incomplete") from exc
+            raise ProxySourceError("legacy proxy generator response is incomplete") from exc
+
+
+LokiProxyFetcher = ProxySourceResolver
+LokiProxyEndpoint = ProxyEndpoint
 
 
 @dataclass(frozen=True)
@@ -483,7 +531,10 @@ class OwnerChainConfig:
         owner_id = str(value.get("owner_id") or value.get("alias_id") or "").strip()
         if not owner_id:
             raise ValueError("owner proxy chain config has no owner")
-        source_url = validate_lokiproxy_source(str(value.get("source_url") or ""))
+        mode = normalize_chain_proxy_mode(value.get("mode") or CHAIN_PROXY_MODE)
+        if mode != CHAIN_PROXY_MODE:
+            raise ValueError("owner proxy chain mode is invalid")
+        source_url = validate_proxy_source(str(value.get("source_url") or ""))
         # `bootstrap_name` and `bootstrap_port` are accepted only as a migration
         # bridge for the old Mihomo-config implementation.  A node name is never
         # used as a route; it falls back to the one configured local Clash URL.
@@ -538,8 +589,8 @@ class OwnerChainConfig:
 
     def as_secret_dict(self) -> dict[str, Any]:
         return {
-            "version": 2,
-            "mode": "lokiproxy_generator",
+            "version": 3,
+            "mode": CHAIN_PROXY_MODE,
             "owner_id": self.owner_id,
             "source_url": self.source_url,
             "bootstrap_proxy": self.bootstrap_proxy,
@@ -552,14 +603,14 @@ def _short_owner_key(owner_id: str) -> str:
     return hashlib.sha256(str(owner_id).encode("utf-8")).hexdigest()[:12]
 
 
-def _endpoint_expiry(endpoint: LokiProxyEndpoint, cache_ttl: float) -> float:
+def _endpoint_expiry(endpoint: ProxyEndpoint, cache_ttl: float) -> float:
     ttl = endpoint.ttl_seconds if endpoint.ttl_seconds is not None else cache_ttl
     return time.monotonic() + max(5.0, min(float(ttl), cache_ttl))
 
 
 @dataclass
 class _CacheEntry:
-    endpoint: LokiProxyEndpoint
+    endpoint: ProxyEndpoint
     expires_at: float
 
 
@@ -679,7 +730,7 @@ def _http_connect(
 
 def _connect_to_bootstrap(
     bootstrap: _ProxyAddress,
-    endpoint: LokiProxyEndpoint,
+    endpoint: ProxyEndpoint,
     timeout: float,
 ) -> socket.socket:
     sock: socket.socket | None = None
@@ -708,12 +759,12 @@ def _connect_to_bootstrap(
                 pass
         if isinstance(exc, ProxyRelayError):
             raise
-        raise ProxyRelayError("shared Clash could not reach LokiProxy") from exc
+        raise ProxyRelayError("shared Clash could not reach the second-hop proxy") from exc
 
 
 def _connect_through_endpoint(
     sock: socket.socket,
-    endpoint: LokiProxyEndpoint,
+    endpoint: ProxyEndpoint,
     target_host: str,
     target_port: int,
 ) -> None:
@@ -732,7 +783,7 @@ def _connect_through_endpoint(
 
 def _connect_chain(
     bootstrap_proxy: str,
-    endpoint: LokiProxyEndpoint,
+    endpoint: ProxyEndpoint,
     target_host: str,
     target_port: int,
     *,
@@ -795,7 +846,7 @@ def _send_socks5_success(sock: socket.socket) -> None:
 
 
 class ChainedProxyRelay:
-    """A loopback SOCKS5 listener for one owner-specific LokiProxy chain."""
+    """A loopback SOCKS5 listener for one owner-specific proxy chain."""
 
     def __init__(
         self,
@@ -803,7 +854,7 @@ class ChainedProxyRelay:
         owner_id: str,
         bootstrap_proxy: str,
         listener_port: int,
-        endpoint_supplier: Callable[[], LokiProxyEndpoint],
+        endpoint_supplier: Callable[[], ProxyEndpoint],
         handshake_timeout: float = 30.0,
     ) -> None:
         self.owner_id = str(owner_id)
@@ -843,11 +894,11 @@ class ChainedProxyRelay:
                 server.settimeout(0.5)
             except OSError as exc:
                 server.close()
-                raise ProxyConfigurationError("local LokiProxy relay port is unavailable") from exc
+                raise ProxyConfigurationError("local proxy-chain relay port is unavailable") from exc
             self._server = server
             self._thread = threading.Thread(
                 target=self._serve,
-                name=f"lokiproxy-relay-{_short_owner_key(self.owner_id)}",
+                name=f"proxy-chain-relay-{_short_owner_key(self.owner_id)}",
                 daemon=True,
             )
             self._thread.start()
@@ -905,7 +956,7 @@ class ChainedProxyRelay:
             threading.Thread(
                 target=self._handle,
                 args=(client,),
-                name=f"lokiproxy-connection-{_short_owner_key(self.owner_id)}",
+                name=f"proxy-chain-connection-{_short_owner_key(self.owner_id)}",
                 daemon=True,
             ).start()
 
@@ -915,8 +966,8 @@ class ChainedProxyRelay:
             client.settimeout(self.handshake_timeout)
             target_host, target_port = _client_socks5_request(client)
             endpoint = self.endpoint_supplier()
-            if not isinstance(endpoint, LokiProxyEndpoint):
-                raise ProxyRelayError("LokiProxy endpoint is invalid")
+            if not isinstance(endpoint, ProxyEndpoint):
+                raise ProxyRelayError("second-hop proxy endpoint is invalid")
             upstream = _connect_chain(
                 self.bootstrap_proxy,
                 endpoint,
@@ -978,7 +1029,7 @@ class ProxyChainManager:
         console_port: int = 8765,
         list_configs: Callable[[], Sequence[Mapping[str, Any]]],
         get_config: Callable[[str], Mapping[str, Any]],
-        fetcher: LokiProxyFetcher | None = None,
+        fetcher: ProxySourceResolver | None = None,
         clash: Any | None = None,
         provider_token: str | None = None,
         cache_ttl: float = DEFAULT_CACHE_TTL,
@@ -988,7 +1039,7 @@ class ProxyChainManager:
         self.app_dir = Path(app_dir).expanduser().resolve()
         self.list_configs = list_configs
         self.get_config = get_config
-        self.fetcher = fetcher or LokiProxyFetcher()
+        self.fetcher = fetcher or ProxySourceResolver()
         self.bootstrap_proxy = validate_bootstrap_proxy(bootstrap_proxy)
         self.provider_token = str(provider_token or "")
         self.cache_ttl = max(5.0, min(float(cache_ttl), 900.0))
@@ -1018,7 +1069,7 @@ class ProxyChainManager:
         normalized = validate_bootstrap_proxy(value or self.bootstrap_proxy)
         if normalized != self.bootstrap_proxy:
             raise ProxyConfigurationError(
-                "both LokiProxy chains must use the same local Clash proxy"
+                "all Team proxy chains must use the same local Clash proxy"
             )
         return normalized
 
@@ -1031,7 +1082,7 @@ class ProxyChainManager:
         normalized_owner = str(owner_id or "").strip()
         if not normalized_owner:
             raise ProxyConfigurationError("Team owner is required")
-        source = validate_lokiproxy_source(source_url)
+        source = validate_proxy_source(source_url)
         bootstrap = self._assert_shared_bootstrap(bootstrap_proxy)
         existing = {item.owner_id: item for item in self.configs()}
         previous = existing.get(normalized_owner)
@@ -1050,7 +1101,7 @@ class ProxyChainManager:
                 listener_port = candidate
                 break
             if not listener_port:
-                raise ProxyConfigurationError("no free local LokiProxy relay port is available")
+                raise ProxyConfigurationError("no free local proxy-chain relay port is available")
         effective = f"socks5h://127.0.0.1:{listener_port}"
         return OwnerChainConfig(
             owner_id=normalized_owner,
@@ -1120,12 +1171,12 @@ class ProxyChainManager:
     def available_nodes(self) -> list[str]:
         return [self.bootstrap_proxy]
 
-    def refresh(self, owner_id: str, *, force: bool = False) -> LokiProxyEndpoint:
+    def refresh(self, owner_id: str, *, force: bool = False) -> ProxyEndpoint:
         normalized_owner = str(owner_id or "").strip()
         try:
             config = OwnerChainConfig.from_mapping(self.get_config(normalized_owner))
         except (KeyError, TypeError, ValueError) as exc:
-            raise ProxyConfigurationError("LokiProxy chain is not configured") from exc
+            raise ProxyConfigurationError("Team proxy chain is not configured") from exc
         self._assert_shared_bootstrap(config.bootstrap_proxy)
         now = time.monotonic()
         with self._lock:
@@ -1160,7 +1211,7 @@ class ProxyChainManager:
         with self._lock:
             relay = self._relays.get(normalized_owner)
         if relay is None or not relay.running:
-            raise ProxyRelayError("local LokiProxy relay is not running")
+            raise ProxyRelayError("local proxy-chain relay is not running")
         return config.effective_proxy
 
     def status(self, owner_id: str) -> dict[str, Any]:
@@ -1223,10 +1274,14 @@ def _port_busy(port: int) -> bool:
 
 
 __all__ = [
+    "CHAIN_PROXY_MODE",
+    "CHAIN_PROXY_MODES",
     "ChainedProxyRelay",
+    "LEGACY_CHAIN_PROXY_MODE",
     "LokiProxyEndpoint",
     "LokiProxyFetcher",
     "OwnerChainConfig",
+    "ProxyEndpoint",
     "ProxyChainError",
     "ProxyChainManager",
     "ProxyConfigurationError",
@@ -1234,9 +1289,14 @@ __all__ = [
     "ProxySourceDepletedError",
     "ProxySourceError",
     "ProxySourceNotWhitelistedError",
+    "ProxySourceResolver",
+    "is_chain_proxy_mode",
+    "normalize_chain_proxy_mode",
     "parse_lokiproxy_response",
+    "parse_proxy_source_response",
     "validate_bootstrap_proxy",
     "validate_generator_url",
     "validate_lokiproxy_source",
+    "validate_proxy_source",
     "validate_proxy_url",
 ]

@@ -663,7 +663,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.get_icloud_owner_proxy(owner["id"]), listener)
         self.assertEqual(self.database.get_account_proxy(child["account_id"]), listener)
         config = self.database.get_icloud_owner_proxy_config(owner["id"])
-        self.assertEqual(config["mode"], "lokiproxy_generator")
+        self.assertEqual(config["mode"], "clash_chain")
         self.assertEqual(config["source_url"], source_url)
         self.assertEqual(len(self.database.list_icloud_owner_proxy_configs()), 1)
         self.assertFalse(

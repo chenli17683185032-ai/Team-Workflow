@@ -878,12 +878,16 @@ class WebConsoleTests(unittest.TestCase):
         self.assertEqual(len(self.database.list_icloud_aliases(profile["id"])), 5)
         fresh = self.database.get_icloud_alias(handoff_payload["alias"]["id"])
         self.assertEqual(fresh["parent_owner_alias_id"], owner_one["id"])
+        owner_one_effective = self.database.get_icloud_owner_proxy(owner_one["id"])
+        owner_two_effective = self.database.get_icloud_owner_proxy(owner_two["id"])
         self.assertEqual(
-            self.database.get_account_proxy(fresh["account_id"]), owner_one_proxy
+            self.database.get_account_proxy(fresh["account_id"]), owner_one_effective
         )
         self.assertEqual(
-            self.database.get_account_proxy(current_two["account_id"]), owner_two_proxy
+            self.database.get_account_proxy(current_two["account_id"]),
+            owner_two_effective,
         )
+        self.assertNotEqual(owner_one_effective, owner_two_effective)
         serialized = json.dumps(
             {"preview": preview.json(), "imported": imported, "handoff": handoff_payload}
         )
@@ -1150,7 +1154,7 @@ class WebConsoleTests(unittest.TestCase):
             "mailbox_id": profile["id"],
             "owner_email": "lookup-owner@icloud.com",
             "current_child_email": "lookup-child@icloud.com",
-            "owner_proxy_mode": "lokiproxy_generator",
+            "owner_proxy_mode": "clash_chain",
             "owner_proxy_source_url": (
                 "socks5://lookup-user:lookup-proxy-secret@proxy.invalid:1080"
             ),
@@ -1177,7 +1181,7 @@ class WebConsoleTests(unittest.TestCase):
         self.assertEqual(len(lookup_calls), 1)
         self.assertEqual(lookup_calls[0]["owner_email"], "lookup-owner@icloud.com")
         self.assertEqual(lookup_calls[0]["child_email"], "lookup-child@icloud.com")
-        self.assertEqual(lookup_calls[0]["proxy_mode"], "lokiproxy_generator")
+        self.assertEqual(lookup_calls[0]["proxy_mode"], "clash_chain")
         self.assertIn("imap", lookup_calls[0]["mailbox_secret"])
         for secret in (
             "lookup-proxy-secret",
@@ -1330,7 +1334,7 @@ class WebConsoleTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(response.json()["detail"]["code"], "icloud_session_invalid")
 
-    def test_generated_owner_proxy_api_applies_chain_without_echoing_source(self):
+    def test_cliproxy_http_api_applies_clash_chain_without_echoing_source(self):
         profile = self.controller.create_icloud_mailbox(self.icloud_payload())
         self.database.set_icloud_mailbox_status(profile["id"], "ready")
         owner = self.database.import_icloud_aliases(
@@ -1388,7 +1392,7 @@ class WebConsoleTests(unittest.TestCase):
         self.controller.proxy_chains = chains
         self.controller.enable_proxy_chains = True
         source_url = (
-            "https://gen.lokiproxy.com/gen?region=PH&token=web-source-secret"
+            "http://cliproxy-user:cliproxy-secret@proxy.example:3010"
         )
         app = create_app(self.controller, testing=True)
         with TestClient(app) as client:
@@ -1396,7 +1400,7 @@ class WebConsoleTests(unittest.TestCase):
                 f"/api/icloud-team-owners/{owner['id']}/proxy",
                 headers=self.origin_headers,
                 json={
-                    "mode": "lokiproxy_generator",
+                    "mode": "clash_chain",
                     "source_url": source_url,
                     "bootstrap": "http://127.0.0.1:7897",
                 },
@@ -1415,7 +1419,7 @@ class WebConsoleTests(unittest.TestCase):
 
         serialized = configured.text + status_response.text + nodes.text
         self.assertEqual(configured.status_code, 200, configured.text)
-        self.assertEqual(configured.json()["proxy_mode"], "lokiproxy_generator")
+        self.assertEqual(configured.json()["proxy_mode"], "clash_chain")
         self.assertEqual(status_response.status_code, 200)
         self.assertTrue(status_response.json()["chain"]["healthy"])
         self.assertEqual(nodes.json()["nodes"], ["http://127.0.0.1:7897"])
@@ -1430,8 +1434,8 @@ class WebConsoleTests(unittest.TestCase):
             self.database.get_icloud_owner_proxy_config(owner["id"])["source_url"],
             source_url,
         )
-        self.assertNotIn("web-source-secret", serialized)
-        self.assertNotIn("gen.lokiproxy.com", serialized)
+        self.assertNotIn("cliproxy-secret", serialized)
+        self.assertNotIn("proxy.example", serialized)
 
     def test_proxy_chain_nodes_retries_a_failed_startup_application(self):
         class FailingOnceProxyChains:

@@ -8,7 +8,7 @@ from typing import Any, Iterator, Mapping
 
 from .chatgpt import AuthContext, ChatGPTClient
 from .database import StateConflictError
-from .proxy_chain import ChainedProxyRelay, LokiProxyFetcher
+from .proxy_chain import ChainedProxyRelay, ProxySourceResolver, is_chain_proxy_mode
 from .registrar import MailboxCredentials, RegistrarAdapter, validate_proxy_url
 
 
@@ -123,7 +123,7 @@ class WorkspaceLookupService:
         self.registrar_factory = registrar_factory
         self.chatgpt_client_factory = chatgpt_client_factory
         self.relay_factory = relay_factory
-        self.proxy_fetcher = proxy_fetcher or LokiProxyFetcher()
+        self.proxy_fetcher = proxy_fetcher or ProxySourceResolver()
 
     @contextmanager
     def _network(
@@ -141,7 +141,7 @@ class WorkspaceLookupService:
                 raise WorkspaceLookupError("子号代理配置无效") from exc
             yield normalized_proxy
             return
-        if mode != "lokiproxy_generator":
+        if not is_chain_proxy_mode(mode):
             raise WorkspaceLookupError("子号代理模式无效")
 
         try:
@@ -154,7 +154,7 @@ class WorkspaceLookupService:
             )
             relay.start()
         except Exception as exc:
-            raise WorkspaceLookupError("子号 LokiProxy 链路不可用") from exc
+            raise WorkspaceLookupError("子号 Clash 两跳链路不可用") from exc
         try:
             yield relay.effective_proxy
         finally:

@@ -148,7 +148,7 @@ class WorkspaceLookupTests(unittest.TestCase):
             mailbox_secret=mailbox_secret(),
             owner_email=OWNER,
             child_email=CHILD,
-            proxy_mode="lokiproxy_generator",
+            proxy_mode="clash_chain",
             source_url="socks5://proxy-source.invalid:1080",
             bootstrap_proxy="http://127.0.0.1:7897",
         )

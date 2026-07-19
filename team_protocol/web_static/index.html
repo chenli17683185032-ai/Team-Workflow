@@ -412,15 +412,10 @@
             <h3>子号链路</h3>
             <span id="icloud-team-import-proxy-status">未配置</span>
           </div>
-          <input type="hidden" name="owner_proxy_mode" value="lokiproxy_generator">
-          <div class="segmented-control owner-proxy-mode-control" id="icloud-team-import-proxy-mode" role="group" aria-label="子号链路类型">
-            <button type="button" data-action="select-icloud-team-proxy-mode" data-mode="direct" aria-pressed="false">固定 S5</button>
-            <button type="button" class="is-active" data-action="select-icloud-team-proxy-mode" data-mode="lokiproxy_generator" aria-pressed="true">LokiProxy</button>
-          </div>
-          <label class="field" id="icloud-team-import-direct-field" hidden><span>固定 S5 / SOCKS5</span><input name="owner_proxy" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false"></label>
-          <div class="form-grid form-grid--two" id="icloud-team-import-generator-fields">
-            <label class="field field--wide"><span>LokiProxy 来源</span><input name="owner_proxy_source_url" type="password" maxlength="8192" autocomplete="new-password" spellcheck="false"></label>
-            <label class="field"><span>统一 Clash 前置</span><input name="owner_proxy_bootstrap" type="text" readonly autocomplete="off" spellcheck="false"></label>
+          <input type="hidden" name="owner_proxy_mode" value="clash_chain">
+          <div class="form-grid form-grid--two" id="icloud-team-import-chain-fields">
+            <label class="field field--wide"><span>CliProxy / 代理链接</span><input name="owner_proxy_source_url" type="password" maxlength="8192" placeholder="http://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
+            <label class="field"><span>Clash 第一跳</span><input name="owner_proxy_bootstrap" type="text" readonly autocomplete="off" spellcheck="false"></label>
           </div>
         </section>
 
@@ -636,7 +631,7 @@
         <div class="table-frame table-frame--standalone">
           <table class="data-table icloud-sync-table">
             <caption class="sr-only">选择要接管的 iCloud 隐藏邮箱</caption>
-            <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">远端</th><th scope="col">接管为</th><th scope="col">归属母号</th><th scope="col">链路类型</th><th scope="col">LokiProxy / 固定 S5</th><th scope="col">统一 Clash 前置</th></tr></thead>
+            <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">远端</th><th scope="col">接管为</th><th scope="col">归属母号</th><th scope="col">链路类型</th><th scope="col">代理链接</th><th scope="col">Clash 第一跳</th></tr></thead>
             <tbody id="icloud-sync-table-body"><tr class="loading-row"><td colspan="7"><span class="inline-loader" aria-hidden="true"></span>正在读取 iCloud Alias…</td></tr></tbody>
           </table>
         </div>
@@ -657,22 +652,14 @@
       </header>
       <div class="dialog-content">
         <input type="hidden" name="alias_id">
-        <input type="hidden" name="mode" value="lokiproxy_generator">
+        <input type="hidden" name="mode" value="clash_chain">
         <dl class="allocation-preview">
           <div><dt>Team 母号</dt><dd id="icloud-owner-proxy-email">-</dd></div>
           <div><dt>子号默认链路</dt><dd id="icloud-owner-proxy-state">未配置</dd></div>
         </dl>
-        <div class="field">
-          <span>链路类型</span>
-          <div class="segmented-control owner-proxy-mode-control" id="icloud-owner-proxy-mode" role="group" aria-label="子号默认链路类型">
-            <button type="button" data-action="select-icloud-owner-proxy-mode" data-mode="direct" aria-pressed="false">固定 S5</button>
-            <button type="button" class="is-active" data-action="select-icloud-owner-proxy-mode" data-mode="lokiproxy_generator" aria-pressed="true">LokiProxy</button>
-          </div>
-        </div>
-        <label class="field" id="icloud-owner-direct-field" hidden><span>子号固定 S5 / SOCKS5 代理</span><input name="proxy" type="password" maxlength="4096" placeholder="socks5h://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
-        <div class="form-grid form-grid--two" id="icloud-owner-generator-fields">
-          <label class="field field--wide"><span>LokiProxy 来源</span><input name="source_url" type="password" maxlength="8192" placeholder="生成链接或 socks5://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
-          <label class="field field--wide"><span>统一 Clash 前置</span><input name="bootstrap" type="text" maxlength="4096" value="http://127.0.0.1:7897" readonly autocomplete="off" spellcheck="false"></label>
+        <div class="form-grid form-grid--two" id="icloud-owner-chain-fields">
+          <label class="field field--wide"><span>CliProxy / 代理链接</span><input name="source_url" type="password" maxlength="8192" placeholder="http://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
+          <label class="field field--wide"><span>Clash 第一跳</span><input name="bootstrap" type="text" maxlength="4096" value="http://127.0.0.1:7897" readonly autocomplete="off" spellcheck="false"></label>
         </div>
         <div class="form-error" id="icloud-owner-proxy-error" role="alert" hidden></div>
       </div>

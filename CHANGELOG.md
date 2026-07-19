@@ -8,7 +8,7 @@
 - 登录验证成功后增加 Cookie 回退：当 Apple Hide My Email 子应用无法载入时，使用内存中的核心会话 Cookie 构造候选 Session，并先执行 HME 只读列表验证再保存。
 - 保留手动粘贴 HME cURL/HAR 作为浏览器不可用时的降级路径。
 - 接力顺序调整为“旧号登录 -> 邀请新号 -> 旧号退出 -> 新号登录入组 -> 令牌/推送”；现场生成的下一子号沿用当前标签序号递增，例如 `组 1-7` 生成 `组 1-8`。
-- LokiProxy 子号默认链路同时支持生成 URL 与固定 SOCKS5 端点，两者均由本地中继经统一 Clash 前置连接。
+- Team 子号默认链路升级为通用 `Clash 两跳`：前端可直接粘贴 CliProxy 等固定 HTTP/SOCKS 代理链接，历史 Loki 生成 URL 继续兼容，所有第二跳均由本地中继经统一 Clash 第一跳连接。
 - iCloud 现场新子号使用真正的 OpenAI 注册流程；旧子号和非 iCloud 账号继续使用已有账号登录。
 - PAT 创建后无条件导出 CPA 与 Sub2API JSON；Sub2API 管理端未配置时仍能得到可导入文件。
 - Sub2API 导出对齐 `GPTSession2CPAandSub2API` 的 `exported_at / proxies / accounts` 结构，使用新建 Team PAT 作为账号令牌，并由 Session 补齐账号身份。
@@ -33,7 +33,9 @@
 - 提拉的清退、邀请、登录和成员复核均保存幂等断点；失败重试复用同一次运行与现场 Alias，不重复删除成员、邀请或创建 HME。
 - 服务端禁止通过普通 Alias 状态接口启用或停用母号；母号的 Team 写操作只从提拉队列入口进入。
 - iCloud Team 导入在服务端重新读取远端事实并原子校验角色、父子归属、Workspace ID 和既有绑定；重试不会复制 Alias、账号或空间。
-- Workspace 自动识别只调用登录、Session 刷新和成员读取；零匹配、多匹配、三人超员、成员分页不完整或身份不一致均在本地导入前失败。临时 LokiProxy Relay 必定停止，Session、Access Token、候选 ID 和成员明细不落库、不进入 API 响应或 DOM。
+- Workspace 自动识别只调用登录、Session 刷新和成员读取；零匹配、多匹配、三人超员、成员分页不完整或身份不一致均在本地导入前失败。临时代理中继必定停止，Session、Access Token、候选 ID 和成员明细不落库、不进入 API 响应或 DOM。
+- 固定 HTTP 代理端点必须通过统一 Clash 前置连接，避免供应商因本机直连出口不受支持而在严格地域身份预检前拒绝请求；代理认证继续只保存在加密配置中。
+- 新写入的链路配置使用供应商无关的 `clash_chain` 模式；旧 `lokiproxy_generator` 密文配置启动时自动规范化，监听端口、账号绑定与历史运行快照不变。
 
 ### 验证
 
