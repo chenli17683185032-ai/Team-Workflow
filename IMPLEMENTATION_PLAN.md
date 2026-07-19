@@ -832,3 +832,69 @@ Team 工作流 -> 本地隔离中继 -> 共享 Clash -> CliProxy/其他固定代
 - 2026-07-19：全量 292 项测试中 286 项通过、6 项 Windows DPAPI 按 macOS 平台跳过；Python compileall、`git diff --check` 和高置信凭据扫描通过。
 - 2026-07-19：LaunchAgent 重启约 2 秒后恢复 HTTP `200`，持久 profile 根目录位于应用数据目录且权限为 `0700`。
 - 2026-07-19：用户重新执行捕获后完成真实闭环验收；浏览器进程关闭后 profile 仍保留 iCloud Cookie 和本地登录记录，未读取或输出任何凭据值。
+
+### 节点 R：Sentinel 预取超时的总时限改造（完成）
+
+#### R.1 现状、测量与目标
+
+`create_account` 在 `check_proxy` 后异步预取浏览器 Sentinel，与邮箱 OTP 并行。现有捕获器中，`page.goto(wait_until="domcontentloaded")`、备用 `page.goto(wait_until="commit")` 和 `page.wait_for_function(SentinelSDK)` 各自使用独立的 timeout，因此一次不可用可以串联消耗超过两分钟。
+
+2026-07-19 实际运行证据：预取从 `21:53:10` 开始，`21:54:14` 以 `wait_for_function` 30 秒超时失败；同步重试到 `21:56:18` 才成功取到 token，单个账户创建因此多出约 124 秒。
+
+目标是把一次 Sentinel 捕获的所有阶段收敛在一个总时限内：
+
+- 第一次导航超时后，备用导航只能消耗剩余时间，不再重新获得一个完整 timeout。
+- `wait_for_function` 无法取到 `SentinelSDK` 时仍保持原有错误和关闭浏览器行为，但不会超过本次捕获总预算。
+- 预取成功时不改变 token、flow、指纹、代理或 OpenAI 请求头；只改超时分配。
+- 失败重试不会绕过 Sentinel 校验，也不会在本地伪造 token；仍由浏览器和远端返回决定是否继续。
+
+#### R.2 GitHub 与既有实现经验
+
+- `microsoft/playwright-python` 与 `microsoft/playwright` 的 `goto` / `wait_for_function` API 均把 timeout 作为每个调用的独立选项，并不跨调用扣减剩余时间。本节点采用其上层调用者维护 deadline 的做法。
+- 现有 `sentinel_browser.py` 已有统一资源关闭和代理 lease 回收；保留这些边界，只引入一个内部剩余时间计算器。
+- 当前 `register.py` 已经把预取与 OTP 并行，故先修复单次捕获的时间放大，不重构邮件提供方、队列或浏览器指纹。
+
+#### R.3 最小充分闭环
+
+```text
+进入 Sentinel 捕获
+    -> deadline = now + timeout_seconds
+    -> 首次导航使用 remaining(deadline)
+    -> 如果需要，备用 commit 导航只用剩余预算
+    -> warmup 和 SentinelSDK 等待同样消耗该预算
+    -> 剩余为 0 时立即失败并清理浏览器
+    -> 预取失败时只执行一次不超过总预算的合法重试
+```
+
+控制对象是单次 Sentinel 捕获的稳定时间，测量是导航响应、SDK 存在性和 token 返回，执行器是 Playwright 页面。以总 deadline 作负反馈，把代理时延、页面资源不完整和 SDK 未加载视为扰动，优先保证不超时串联。
+
+#### R.4 实施节点
+
+- [x] 为 `_run_browser_sentinel_capture` 增加单次捕获 deadline 和剩余毫秒计算，收敛多个 Playwright 调用的 timeout。
+- [x] 避免备用导航重新消耗完整 timeout，保留一次可控的 commit 重试。
+- [x] 增加超时路径、首次导航失败、SDK 已加载和资源回收测试，不读取或输出 Sentinel 或代理凭据。
+- [x] 更新 README、CHANGELOG 和本计划，说明预取失败时最大耗时与旧版的差异。
+- [x] 运行 Sentinel 聚焦测试、注册回归、全量测试、语法/diff/敏感扫描，不启动新的真实账号注册。
+- [x] 重启 LaunchAgent 并验证服务在 1 分钟内恢复；不改动用户当前运行与代理配置。
+- [x] 提交并推送 GitHub `main`，保证工作树干净。
+
+#### R.7 实施记录
+
+- 2026-07-19：正式运行回放确认预取失败后的同步重试串联消耗约 124 秒，根因是多个 Playwright 阶段各自获取完整 timeout。
+- 2026-07-19：新增共享 monotonic deadline；导航、commit 备用、warmup 和 `SentinelSDK` 等待均只消耗剩余时间，超时后不再发起无限重复导航。
+- 2026-07-19：新增 4 项超时边界测试；聚焦回归 70 项全部通过，全量 296 项中 290 项通过、6 项 Windows DPAPI 按平台跳过。
+- 2026-07-19：未启动新的真实账号注册；最后重启前保持现有运行与代理配置不变。
+
+#### R.5 验收场景
+
+1. 模拟首次 `goto` 占满部分时间：备用 `commit` 的 timeout 等于剩余预算，总耗时不超过单次配置的 timeout 加少量调度误差。
+2. 模拟 `SentinelSDK` 始终不出现：引发脱敏超时错误，浏览器、context 和 proxy lease 均回收，不进入第二个无限时重试。
+3. 模拟页面快速返回且 SDK 已加载：token 返回格式、flow、SO token 和原有请求完全不变。
+4. 预取超时后的同步路径：最多只增加一次配置内重试，不再出现 120 秒级别的串联等待。
+5. 现有注册回归不改变成功时的 `create_account` 、OTP 、PAT 和导出行为，也不把 token 写入普通日志。
+
+#### R.6 回滚与边界
+
+- 可回滚到旧的独立调用 timeout 逻辑，但不应恢复使用多个完整 timeout 串联的旧行为。
+- 本节点不改变 Sentinel flow 序列、指纹配置、代理选择、OTP 提供方或 OpenAI 端点。
+- 不使用本地缓存或伪造远端 Sentinel token 来绕过服务端校验；优化仅限于超时和资源回收。

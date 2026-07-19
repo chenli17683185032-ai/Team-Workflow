@@ -37,10 +37,11 @@
 - Workspace 自动识别只调用登录、Session 刷新和成员读取；零匹配、多匹配、三人超员、成员分页不完整或身份不一致均在本地导入前失败。临时代理中继必定停止，Session、Access Token、候选 ID 和成员明细不落库、不进入 API 响应或 DOM。
 - 固定 HTTP 代理端点必须通过统一 Clash 前置连接，避免供应商因本机直连出口不受支持而在严格地域身份预检前拒绝请求；代理认证继续只保存在加密配置中。
 - 新写入的链路配置使用供应商无关的 `clash_chain` 模式；旧 `lokiproxy_generator` 密文配置启动时自动规范化，监听端口、账号绑定与历史运行快照不变。
+- Sentinel 浏览器捕获的导航、备用导航、warmup 和 SDK 等待共享单次总时限；失败时不再把多个完整 timeout 串联成两分钟级等待，不改变 token 和远端校验。
 
 ### 验证
 
-- macOS：全量 292 项测试中 286 项通过，6 项 Windows DPAPI 测试按平台跳过；Python、JavaScript 语法与 `git diff --check` 通过。
+- macOS：全量 296 项测试中 290 项通过，6 项 Windows DPAPI 测试按平台跳过；Python、JavaScript 语法与 `git diff --check` 通过。
 - `组2-9` 真实 Sub2API 文件与既有可用样本的顶层、账号、credentials 和 extra 字段结构完全一致；PAT、workspace、session 排除及 `0600` 权限校验通过。
 - 控制台在 `1600×1000` 和 `390×844` 实测十阶段运行详情：桌面保持 `960px` 宽、移动端单列显示，均无横向溢出；旧运行的成员复核明确显示“跳过”，历史 OAuth `state/code/token` 查询参数在 API/日志中统一脱敏。
 - Team 主表、子号默认链路、提拉确认和导入向导在 `1600×1000` 与 `390×844` 完成浏览器验收；页面无横向溢出或按钮重叠，提拉确认取消后没有创建运行或发送执行请求。

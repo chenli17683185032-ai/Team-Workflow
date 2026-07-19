@@ -8,6 +8,7 @@ import random
 import re
 import secrets
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Sequence
@@ -38,6 +39,59 @@ DEFAULT_CREATE_ACCOUNT_FLOW_CANDIDATES = (
     "create_account",
     "create-account",
 )
+
+
+class _SentinelCaptureDeadlineExceeded(RuntimeError):
+    """Raised when all browser-capture phases have consumed their shared budget."""
+
+
+def _remaining_timeout_ms(deadline: float, *, cap_ms: int | None = None) -> int:
+    remaining_ms = max(0, int((float(deadline) - time.monotonic()) * 1000))
+    if cap_ms is not None:
+        remaining_ms = min(remaining_ms, max(0, int(cap_ms)))
+    return remaining_ms
+
+
+def _require_remaining_timeout_ms(deadline: float, *, cap_ms: int | None = None) -> int:
+    remaining_ms = _remaining_timeout_ms(deadline, cap_ms=cap_ms)
+    if remaining_ms <= 0:
+        raise _SentinelCaptureDeadlineExceeded(
+            "total browser capture deadline exceeded"
+        )
+    return remaining_ms
+
+
+def _prepare_sentinel_page(page: Any, target_url: str, deadline: float) -> None:
+    try:
+        page.goto(
+            target_url,
+            wait_until="domcontentloaded",
+            timeout=_require_remaining_timeout_ms(deadline),
+        )
+    except _SentinelCaptureDeadlineExceeded:
+        raise
+    except Exception as navigation_error:
+        # A slow document load may still have committed enough for the
+        # Sentinel script to finish. Retry only with the budget left.
+        try:
+            fallback_timeout_ms = _require_remaining_timeout_ms(deadline)
+        except _SentinelCaptureDeadlineExceeded:
+            raise _SentinelCaptureDeadlineExceeded(
+                "navigation consumed the total browser capture deadline"
+            ) from navigation_error
+        page.goto(
+            target_url,
+            wait_until="commit",
+            timeout=fallback_timeout_ms,
+        )
+    warmup_timeout_ms = _require_remaining_timeout_ms(deadline)
+    page.wait_for_timeout(min(DEFAULT_BROWSER_SENTINEL_WARMUP_MS, warmup_timeout_ms))
+    page.wait_for_function(
+        "() => !!window.SentinelSDK",
+        timeout=_require_remaining_timeout_ms(deadline, cap_ms=30000),
+    )
+
+
 def _close_quietly(resource: Any) -> None:
     if resource is None:
         return
@@ -791,7 +845,11 @@ def _run_browser_sentinel_capture(
     except Exception as exc:
         raise RuntimeError(f"Playwright unavailable: {exc}") from exc
 
-    timeout_ms = max(3000, int(float(timeout_seconds or DEFAULT_BROWSER_SENTINEL_TIMEOUT_SECONDS) * 1000))
+    capture_timeout_seconds = max(
+        3.0,
+        float(timeout_seconds or DEFAULT_BROWSER_SENTINEL_TIMEOUT_SECONDS),
+    )
+    capture_deadline = time.monotonic() + capture_timeout_seconds
     flows = _normalize_flow_candidates(flow_candidates)
     use_gmailreg_create_account_protocol = not flows
     target_url = (
@@ -825,12 +883,7 @@ def _run_browser_sentinel_capture(
                 session_profile=profile,
             )
             page = context.new_page()
-            try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            except Exception:
-                page.goto(target_url, wait_until="commit", timeout=timeout_ms)
-            page.wait_for_timeout(min(DEFAULT_BROWSER_SENTINEL_WARMUP_MS, timeout_ms))
-            page.wait_for_function("() => !!window.SentinelSDK", timeout=min(30000, timeout_ms))
+            _prepare_sentinel_page(page, target_url, capture_deadline)
             result = page.evaluate(
                 """async (flows) => {
                     if (!window.SentinelSDK) throw new Error('SentinelSDK missing');
@@ -1076,6 +1129,8 @@ def _run_browser_sentinel_capture(
                 },
             }
             return bundle
+    except _SentinelCaptureDeadlineExceeded as exc:
+        raise RuntimeError(f"browser sentinel timeout: {exc}") from exc
     except PlaywrightTimeoutError as exc:
         raise RuntimeError(f"browser sentinel timeout: {exc}") from exc
     except Exception as exc:
