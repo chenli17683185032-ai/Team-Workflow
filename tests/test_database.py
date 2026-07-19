@@ -587,7 +587,8 @@ class DatabaseTests(unittest.TestCase):
             self.database.get_account_proxy(fresh_alias["account_id"]), owner_proxy
         )
 
-        run = self.database.enqueue_workspace(workspace["id"])
+        run = self.database.enqueue_rescue_workspace(workspace["id"])
+        self.assertEqual(run["kind"], "rescue")
         self.database.claim_next_queue_item()
         self.database.complete_run_and_rotate(run["id"])
         rotated = self.database.get_workspace(workspace["id"])
@@ -681,6 +682,33 @@ class DatabaseTests(unittest.TestCase):
         )
         self.assertEqual(self.database.get_account_proxy(child["account_id"]), direct)
         self.assertEqual(self.database.list_icloud_owner_proxy_configs(), [])
+
+        first_identity = self.database.ensure_icloud_owner_network_identity(
+            owner["id"], proxy_sid="OwnerRescue90"
+        )
+        second_identity = self.database.ensure_icloud_owner_network_identity(
+            owner["id"], proxy_sid="IgnoredRescue91"
+        )
+        self.assertEqual(first_identity, second_identity)
+        merged_identity = self.database.merge_icloud_owner_network_identity(
+            owner["id"],
+            {
+                "proxy_geo": {
+                    "resolved": True,
+                    "country_code": "JP",
+                    "timezone_id": "Asia/Tokyo",
+                    "locale": "ja-JP",
+                }
+            },
+        )
+        self.assertEqual(merged_identity["proxy_sid"], "OwnerRescue90")
+        self.assertFalse(
+            any(
+                str(item["key"]).startswith("icloud-owner-runtime-identity:")
+                for item in self.database.list_settings()
+            )
+        )
+        self.assert_secret_absent_from_database_files("OwnerRescue90")
 
     def test_icloud_team_owner_workspace_rejects_another_owners_child(self):
         profile = self.database.create_icloud_mailbox(
@@ -832,7 +860,7 @@ class DatabaseTests(unittest.TestCase):
         upgraded = Database(legacy_path, secret_store=store)
         alias = upgraded.get_icloud_alias(alias_id)
 
-        self.assertEqual(upgraded.diagnostics()["schema_version"], 6)
+        self.assertEqual(upgraded.diagnostics()["schema_version"], 7)
         self.assertEqual(alias["role"], "rotating_child")
         self.assertIsNone(alias["parent_owner_alias_id"])
         self.assertIsNone(alias["used_at"])

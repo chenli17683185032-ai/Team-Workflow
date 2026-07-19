@@ -35,6 +35,7 @@ _REGISTRAR_PROVIDER_STATE_STEP = "_registrar_provider_state"
 _TEAM_MEMBER_LIMIT = 2
 _MEMBER_FEEDBACK_TIMEOUT_SECONDS = 15.0
 _MEMBER_FEEDBACK_POLL_SECONDS = 0.5
+_RESCUE_MAX_MEMBER_REMOVALS = 100
 _FINGERPRINT_BOUND_STEPS = (
     "old_login",
     "old_workspace",
@@ -114,7 +115,7 @@ class WorkflowCancelled(RuntimeError):
 
 class WorkflowIdentityError(RuntimeError):
     ALLOWED_CODES = frozenset({"alias_disabled", "mailbox_credentials_invalid"})
-    ALLOWED_ROLES = frozenset({"current", "next"})
+    ALLOWED_ROLES = frozenset({"current", "next", "owner"})
 
     def __init__(self, code: str, role: str) -> None:
         normalized_code = str(code or "").strip()
@@ -143,6 +144,11 @@ def _email_from_item(item: Mapping[str, Any]) -> str:
     ).strip().casefold()
 
 
+def _user_id_from_item(item: Mapping[str, Any]) -> str:
+    user = item.get("user") if isinstance(item.get("user"), dict) else {}
+    return str(item.get("id") or item.get("user_id") or user.get("id") or "").strip()
+
+
 def _items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     for key in ("items", "users", "members", "account_invites", "invites"):
         value = payload.get(key)
@@ -169,7 +175,7 @@ def _identity_present(
     normalized_id = str(user_id or "").strip()
     normalized_email = str(email or "").strip().casefold()
     for item in items:
-        item_id = str(item.get("id") or item.get("user_id") or "").strip()
+        item_id = _user_id_from_item(item)
         if normalized_id and item_id == normalized_id:
             return True
         if normalized_email and _email_from_item(item) == normalized_email:
@@ -365,12 +371,22 @@ class WorkflowRunner:
     @staticmethod
     def _account_bound_steps(role: str) -> tuple[str, ...]:
         if role == "old":
-            return ("old_login", "old_workspace", "invite", "old_leave")
+            return (
+                "old_login",
+                "old_workspace",
+                "invite",
+                "old_leave",
+                "owner_login",
+                "owner_workspace",
+                "rescue_clear",
+                "rescue_invite",
+            )
         return (
             "new_login",
             "new_workspace_login",
             "new_workspace",
             "member_verify",
+            "rescue_verify",
             "pat",
         )
 
@@ -611,7 +627,7 @@ class WorkflowRunner:
             self._validate_login_session(spec, cached)
             self._log(f"[resume] {step}")
             return cached
-        role = "old" if step == "old_login" else "new"
+        role = "old" if step in {"old_login", "owner_login"} else "new"
         mailbox = self._mailboxes.get(f"{role}_login")
         network = self._networks[role]
         action = "register" if step == "new_login" else "login"
@@ -646,7 +662,13 @@ class WorkflowRunner:
             session = operation(**login_kwargs)
         except RegistrarIdentityError as exc:
             self._check_cancel()
-            role = "current" if step == "old_login" else "next"
+            role = (
+                "owner"
+                if step == "owner_login"
+                else "current"
+                if step == "old_login"
+                else "next"
+            )
             raise WorkflowIdentityError(exc.code, role) from exc
         except Exception:
             self._check_cancel()
@@ -673,7 +695,7 @@ class WorkflowRunner:
         if not context.session_token:
             raise RuntimeError("login result has no session_token")
         self._log(f"[workspace] {self.config.workspace_id}")
-        role = "old" if step == "old_workspace" else "new"
+        role = "old" if step in {"old_workspace", "owner_workspace"} else "new"
         session = self._chatgpt_clients[role].refresh_session(
             context.session_token,
             account_id=self.config.workspace_id,
@@ -1223,33 +1245,36 @@ class WorkflowRunner:
         self._log(f"[sub2api] {result.action} verified={result.verified}")
         return payload
 
+    def _log_network_context(self) -> None:
+        roles = ("old", "new") if self._account_network_mode else ("old",)
+        for role in roles:
+            network = self._networks[role]
+            label = f"[{role}] " if self._account_network_mode else ""
+            self._log(f"[proxy] {label}{network.description}")
+            if network.proxy_geo is not None:
+                geo_status = "已匹配" if network.proxy_geo.get("resolved") else "已回退"
+                self._log(
+                    f"[geo] {label}{geo_status} country="
+                    f"{network.proxy_geo.get('country_code') or '<unknown>'} "
+                    f"locale={network.proxy_geo.get('locale') or '<unknown>'} "
+                    f"timezone={network.proxy_geo.get('timezone_id') or '<unknown>'} "
+                    f"source={network.proxy_geo.get('source') or '<unknown>'}"
+                )
+            profile = network.fingerprint_profile
+            if profile is not None:
+                profile_action = "已恢复" if network.fingerprint_restored else "已生成"
+                self._log(
+                    f"[fingerprint] {label}{profile_action}并锁定 "
+                    f"{getattr(profile, 'profile_id', '<unknown>')} "
+                    f"impersonate={getattr(profile, 'impersonate', '<unknown>')} "
+                    f"os={getattr(profile, 'os', '<unknown>')} "
+                    f"locale={getattr(profile, 'locale', '<unknown>')} "
+                    f"timezone={getattr(profile, 'timezone_id', '<unknown>')}"
+                )
+
     def run(self) -> dict[str, Any]:
         try:
-            roles = ("old", "new") if self._account_network_mode else ("old",)
-            for role in roles:
-                network = self._networks[role]
-                label = f"[{role}] " if self._account_network_mode else ""
-                self._log(f"[proxy] {label}{network.description}")
-                if network.proxy_geo is not None:
-                    geo_status = "已匹配" if network.proxy_geo.get("resolved") else "已回退"
-                    self._log(
-                        f"[geo] {label}{geo_status} country="
-                        f"{network.proxy_geo.get('country_code') or '<unknown>'} "
-                        f"locale={network.proxy_geo.get('locale') or '<unknown>'} "
-                        f"timezone={network.proxy_geo.get('timezone_id') or '<unknown>'} "
-                        f"source={network.proxy_geo.get('source') or '<unknown>'}"
-                    )
-                profile = network.fingerprint_profile
-                if profile is not None:
-                    profile_action = "已恢复" if network.fingerprint_restored else "已生成"
-                    self._log(
-                        f"[fingerprint] {label}{profile_action}并锁定 "
-                        f"{getattr(profile, 'profile_id', '<unknown>')} "
-                        f"impersonate={getattr(profile, 'impersonate', '<unknown>')} "
-                        f"os={getattr(profile, 'os', '<unknown>')} "
-                        f"locale={getattr(profile, 'locale', '<unknown>')} "
-                        f"timezone={getattr(profile, 'timezone_id', '<unknown>')}"
-                    )
+            self._log_network_context()
             self._check_cancel()
             def old_login_stage() -> dict[str, Any]:
                 login = self._login(self.config.old_account, "old_login")
@@ -1311,6 +1336,353 @@ class WorkflowRunner:
                 "invite": invite.get("action"),
                 "old_leave": old_leave.get("action"),
                 "member_guard": member_verify,
+                "cpa_path": str(cpa_path.resolve()),
+                "sub2api_path": str(sub2api_path.resolve()),
+                "push": push,
+                "sub2api": sub2api,
+            }
+            self.state.set("complete", summary)
+            return summary
+        finally:
+            self.close()
+
+
+class RescueWorkflowRunner(WorkflowRunner):
+    """Recover a Team through its owner without using the broken child."""
+
+    @staticmethod
+    def _matching_owner_items(
+        items: list[dict[str, Any]],
+        context: AuthContext,
+        owner_email: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in items
+            if _identity_present(
+                [item],
+                user_id=context.user_id,
+                email=owner_email,
+            )
+        ]
+
+    def _owner_member_snapshot(
+        self,
+        owner_session: Mapping[str, Any],
+        *,
+        phase: str,
+    ) -> tuple[AuthContext, list[dict[str, Any]], dict[str, Any]]:
+        context = AuthContext.from_mapping(owner_session)
+        if not context.access_token:
+            raise RuntimeError("Team owner session has no access token")
+        payload = self._chatgpt_clients["old"].get_members(
+            context.access_token,
+            self.config.workspace_id,
+        )
+        items, active_count = _counted_items(payload)
+        if active_count != len(items):
+            raise RuntimeError(f"Team member list is incomplete {phase}")
+        owners = self._matching_owner_items(
+            items,
+            context,
+            self.config.old_account.email,
+        )
+        if len(owners) != 1:
+            raise RuntimeError(f"Team owner identity is not unique {phase}")
+        return context, items, {
+            "active_members": active_count,
+            "owner_present": True,
+        }
+
+    def _wait_until_member_absent(
+        self,
+        owner_session: Mapping[str, Any],
+        user_id: str,
+    ) -> None:
+        deadline = time.monotonic() + _MEMBER_FEEDBACK_TIMEOUT_SECONDS
+        while True:
+            self._check_cancel()
+            _context, items, _snapshot = self._owner_member_snapshot(
+                owner_session,
+                phase="after rescue member removal",
+            )
+            if all(_user_id_from_item(item) != user_id for item in items):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Team rescue member removal was not confirmed by remote feedback"
+                )
+            wait_seconds = min(
+                _MEMBER_FEEDBACK_POLL_SECONDS,
+                max(0.0, deadline - time.monotonic()),
+            )
+            if self.stop_event is not None:
+                if self.stop_event.wait(wait_seconds):
+                    raise WorkflowCancelled("workflow cancelled")
+            else:
+                threading.Event().wait(wait_seconds)
+
+    def _clear_team_to_owner(
+        self,
+        owner_session: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        self._check_cancel()
+        cached = self.state.get("rescue_clear")
+        handoff_started = any(
+            self.state.get(step) is not None
+            for step in ("rescue_invite", "new_login", "rescue_verify", "pat")
+        )
+        if isinstance(cached, dict) and handoff_started:
+            self._log("[resume] rescue clear is locked after invitation")
+            return cached
+
+        progress = self.state.get("rescue_clear_progress")
+        removed_count = (
+            int(progress.get("removed_count") or 0)
+            if isinstance(progress, Mapping)
+            else 0
+        )
+        client = self._chatgpt_clients["old"]
+        while True:
+            context, items, snapshot = self._owner_member_snapshot(
+                owner_session,
+                phase="during rescue clear",
+            )
+            owner_items = self._matching_owner_items(
+                items,
+                context,
+                self.config.old_account.email,
+            )
+            owner_marker = id(owner_items[0])
+            others = [item for item in items if id(item) != owner_marker]
+            if not others:
+                active_invites = _active_invites(
+                    client.get_invites(context.access_token, self.config.workspace_id)
+                )
+                target_email = self.config.new_account.email.casefold()
+                if any(_email_from_item(item) != target_email for item in active_invites):
+                    raise RuntimeError(
+                        "Team rescue found unrelated pending invites before new child login"
+                    )
+                if snapshot["active_members"] != 1:
+                    raise RuntimeError(
+                        "Team rescue requires exactly one active owner before invitation"
+                    )
+                result = {
+                    "verified": True,
+                    "active_members": 1,
+                    "owner_present": True,
+                    "removed_members": removed_count,
+                    "member_limit": _TEAM_MEMBER_LIMIT,
+                }
+                self.state.set("rescue_clear", result)
+                self._log(
+                    f"[rescue-clear] active_members=1/{_TEAM_MEMBER_LIMIT} "
+                    f"removed={removed_count}"
+                )
+                return result
+
+            if removed_count >= _RESCUE_MAX_MEMBER_REMOVALS:
+                raise RuntimeError("Team rescue member removal limit was exceeded")
+            target_ids = [_user_id_from_item(item) for item in others]
+            if any(not value for value in target_ids) or len(set(target_ids)) != len(target_ids):
+                raise RuntimeError("Team rescue member identity is incomplete")
+            target_id = target_ids[0]
+            self.state.set(
+                "rescue_clear_progress",
+                {
+                    "phase": "removing",
+                    "removed_count": removed_count,
+                    "target_user_id": target_id,
+                },
+            )
+            client.remove_member(
+                context.access_token,
+                self.config.workspace_id,
+                target_id,
+            )
+            self._wait_until_member_absent(owner_session, target_id)
+            removed_count += 1
+            self.state.set(
+                "rescue_clear_progress",
+                {"phase": "confirmed", "removed_count": removed_count},
+            )
+
+    def _ensure_rescue_invited(
+        self,
+        owner_session: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        self._check_cancel()
+        cached = self.state.get("rescue_invite")
+        context, members, snapshot = self._owner_member_snapshot(
+            owner_session,
+            phase="before rescue invitation",
+        )
+        target = self.config.new_account.email.casefold()
+        target_present = _identity_present(members, user_id="", email=target)
+        expected_count = 2 if target_present else 1
+        if snapshot["active_members"] != expected_count:
+            raise RuntimeError(
+                "Team rescue member count changed before new child login"
+            )
+        active_invites = _active_invites(
+            self._chatgpt_clients["old"].get_invites(
+                context.access_token,
+                self.config.workspace_id,
+            )
+        )
+        if any(_email_from_item(item) != target for item in active_invites):
+            raise RuntimeError("Team rescue found unrelated pending invites")
+        if target_present:
+            action = "already-member"
+            response = None
+        elif any(_email_from_item(item) == target for item in active_invites):
+            action = "already-invited"
+            response = None
+        elif isinstance(cached, dict):
+            raise RuntimeError("Team rescue invitation checkpoint has no remote feedback")
+        else:
+            response = self._chatgpt_clients["old"].invite(
+                context.access_token,
+                self.config.workspace_id,
+                self.config.new_account.email,
+            )
+            action = "invited"
+        result = {
+            "action": action,
+            "active_members_before": snapshot["active_members"],
+            "member_limit": _TEAM_MEMBER_LIMIT,
+        }
+        if response is not None:
+            result["response"] = response
+        self.state.set("rescue_invite", result)
+        self._log(f"[rescue-invite] {action} {self.config.new_account.email}")
+        if self.config.invite_settle_seconds:
+            if self.stop_event is not None:
+                if self.stop_event.wait(self.config.invite_settle_seconds):
+                    raise WorkflowCancelled("workflow cancelled")
+            else:
+                threading.Event().wait(self.config.invite_settle_seconds)
+        return result
+
+    def _verify_rescue_membership(
+        self,
+        new_session: Mapping[str, Any],
+        owner_session: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        self._check_cancel()
+        new_context = AuthContext.from_mapping(new_session)
+        owner_context = AuthContext.from_mapping(owner_session)
+        client = self._chatgpt_clients["new"]
+        payload = client.get_members(new_context.access_token, self.config.workspace_id)
+        members, active_count = _counted_items(payload)
+        if active_count != len(members):
+            raise RuntimeError("Team member list is incomplete after rescue")
+        owner_present = _identity_present(
+            members,
+            user_id=owner_context.user_id,
+            email=self.config.old_account.email,
+        )
+        new_present = _identity_present(
+            members,
+            user_id=new_context.user_id,
+            email=self.config.new_account.email,
+        )
+        if active_count != _TEAM_MEMBER_LIMIT or not owner_present or not new_present:
+            raise RuntimeError(
+                "Team rescue verification requires exactly the owner and new child"
+            )
+        active_invites = _active_invites(
+            client.get_invites(new_context.access_token, self.config.workspace_id)
+        )
+        target = self.config.new_account.email.casefold()
+        if any(_email_from_item(item) != target for item in active_invites):
+            raise RuntimeError("Team rescue verification found unrelated pending invites")
+        result = {
+            "verified": True,
+            "active_members": active_count,
+            "member_limit": _TEAM_MEMBER_LIMIT,
+            "owner_present": True,
+            "new_child_present": True,
+            "other_members_absent": True,
+        }
+        self.state.set("rescue_verify", result)
+        self._log(
+            f"[rescue-verify] active_members={active_count}/{_TEAM_MEMBER_LIMIT}"
+        )
+        return result
+
+    def run(self) -> dict[str, Any]:
+        try:
+            self._log_network_context()
+            self._check_cancel()
+
+            def owner_login_stage() -> dict[str, Any]:
+                login = self._login(self.config.old_account, "owner_login")
+                return self._switch_workspace(login, "owner_workspace")
+
+            owner_workspace = self._run_stage("owner_login", owner_login_stage)
+            clear = self._run_stage(
+                "rescue_clear",
+                lambda: self._clear_team_to_owner(owner_workspace),
+            )
+            invite = self._run_stage(
+                "rescue_invite",
+                lambda: self._ensure_rescue_invited(owner_workspace),
+            )
+            new_login = self._run_stage(
+                "new_login",
+                lambda: self._login(
+                    self.config.new_account,
+                    "new_login",
+                    select_workspace=False,
+                ),
+            )
+
+            def verify_stage() -> tuple[dict[str, Any], dict[str, Any]]:
+                try:
+                    new_workspace = self._switch_workspace(new_login, "new_workspace")
+                except _WorkspaceSwitchError:
+                    self._log("[reauth] new account workspace selection")
+                    workspace_login = self._login(
+                        self.config.new_account,
+                        "new_workspace_login",
+                    )
+                    new_workspace = self._switch_workspace(
+                        workspace_login,
+                        "new_workspace",
+                    )
+                guard = self._verify_rescue_membership(
+                    new_workspace,
+                    owner_workspace,
+                )
+                return new_workspace, guard
+
+            new_workspace, member_guard = self._run_stage(
+                "rescue_verify",
+                verify_stage,
+            )
+            pat = self._run_stage("pat", lambda: self._create_pat(new_workspace))
+            cpa_path = self._run_stage(
+                "cpa", lambda: self._write_cpa(new_workspace, pat)
+            )
+            sub2api_path = self._run_stage(
+                "sub2api_export",
+                lambda: self._write_sub2api_export(new_workspace, pat),
+            )
+            push = self._run_stage("push", lambda: self._push(cpa_path))
+            sub2api = self._run_stage(
+                "push_sub2api", lambda: self._push_sub2api(sub2api_path)
+            )
+            self._check_cancel()
+            summary = {
+                "mode": "rescue",
+                "owner_email": self.config.old_account.email,
+                "new_email": self.config.new_account.email,
+                "workspace_id": self.config.workspace_id,
+                "clear": clear,
+                "invite": invite.get("action"),
+                "member_guard": member_guard,
                 "cpa_path": str(cpa_path.resolve()),
                 "sub2api_path": str(sub2api_path.resolve()),
                 "push": push,

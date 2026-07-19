@@ -179,10 +179,21 @@ class TaskQueueTests(unittest.TestCase):
         )
         return workspace, current, next_account
 
-    def make_queue(self, harness, *, shutdown_timeout=1.0):
+    def make_queue(
+        self,
+        harness,
+        *,
+        rescue_harness=None,
+        shutdown_timeout=1.0,
+    ):
         queue = TaskQueue(
             self.database,
             runner_factory=harness,
+            **(
+                {"rescue_runner_factory": rescue_harness}
+                if rescue_harness is not None
+                else {}
+            ),
             shutdown_timeout=shutdown_timeout,
         )
         self.queues.append(queue)
@@ -789,7 +800,12 @@ class TaskQueueTests(unittest.TestCase):
             next_account_id=children[1]["account_id"],
         )
         run = self.database.enqueue_workspace(workspace["id"])
-        queue = self.make_queue(RunnerHarness())
+        normal_harness = RunnerHarness()
+        rescue_harness = RunnerHarness("success")
+        queue = self.make_queue(
+            normal_harness,
+            rescue_harness=rescue_harness,
+        )
 
         inputs = queue._build_run_inputs(run["id"])
         old_mailbox, new_mailbox = inputs[1], inputs[2]
@@ -799,6 +815,38 @@ class TaskQueueTests(unittest.TestCase):
             old_mailbox.registration_email,
             new_mailbox.registration_email,
         })
+
+        self.assertEqual(self.database.request_stop(run["id"]), "cancelled")
+        self.database.replace_account_credentials(children[0]["account_id"], {})
+        rescue_run = queue.enqueue_rescue(workspace["id"])
+        self.assertEqual(rescue_run["kind"], "rescue")
+        queue.start()
+        self.assertTrue(
+            wait_until(
+                lambda: self.database.get_run(rescue_run["id"])["state"]
+                == "succeeded"
+            )
+        )
+
+        self.assertEqual(normal_harness.calls, [])
+        self.assertEqual(len(rescue_harness.calls), 1)
+        rescue_call = rescue_harness.calls[0]
+        self.assertEqual(
+            rescue_call["config"].old_account.email,
+            "passive-owner@icloud.com",
+        )
+        self.assertEqual(
+            rescue_call["old_mailbox"].registration_email,
+            "passive-owner@icloud.com",
+        )
+        self.assertEqual(rescue_call["old_mailbox"].imap_password, "owner-imap-secret")
+        self.assertEqual(
+            rescue_call["new_mailbox"].registration_email,
+            "executing-child-b@icloud.com",
+        )
+        self.assertTrue(
+            self.database.get_icloud_owner_network_identity(owner["id"])
+        )
 
     def test_redact_text_removes_known_secrets_and_url_userinfo(self):
         value = (

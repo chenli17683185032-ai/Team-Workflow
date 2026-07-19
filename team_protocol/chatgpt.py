@@ -179,7 +179,9 @@ class ChatGPTClient:
             },
         )
 
-    def leave(self, access_token: str, account_id: str, user_id: str) -> dict[str, Any]:
+    def remove_member(
+        self, access_token: str, account_id: str, user_id: str
+    ) -> dict[str, Any]:
         return self._request(
             "DELETE",
             f"{self.BASE_URL}/accounts/{account_id}/users/{user_id}",
@@ -188,6 +190,9 @@ class ChatGPTClient:
                 "chatgpt-account-id": account_id,
             },
         )
+
+    def leave(self, access_token: str, account_id: str, user_id: str) -> dict[str, Any]:
+        return self.remove_member(access_token, account_id, user_id)
 
     def create_personal_access_token(
         self,

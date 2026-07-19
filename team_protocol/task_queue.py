@@ -15,6 +15,7 @@ from .registrar import (
 from .workflow import (
     AccountNetworkSpec,
     AccountSpec,
+    RescueWorkflowRunner,
     WorkflowCancelled,
     WorkflowConfig,
     WorkflowIdentityError,
@@ -109,10 +110,12 @@ class TaskQueue:
         database: Database,
         *,
         runner_factory: Callable[..., Any] = WorkflowRunner,
+        rescue_runner_factory: Callable[..., Any] = RescueWorkflowRunner,
         shutdown_timeout: float = 5.0,
     ) -> None:
         self.database = database
         self.runner_factory = runner_factory
+        self.rescue_runner_factory = rescue_runner_factory
         self.shutdown_timeout = max(0.0, float(shutdown_timeout))
         self._condition = threading.Condition(threading.RLock())
         self._revision = 0
@@ -195,6 +198,18 @@ class TaskQueue:
                 )
             self._bump_locked()
             return runs
+
+    def enqueue_rescue(self, workspace_id: str) -> dict[str, Any]:
+        with self._condition:
+            run = self.database.enqueue_rescue_workspace(str(workspace_id))
+            self._append_event_locked(
+                run["id"],
+                step=None,
+                level="warning",
+                message="emergency rescue queued",
+            )
+            self._bump_locked()
+            return run
 
     def set_paused(self, paused: bool) -> bool:
         with self._condition:
@@ -316,6 +331,7 @@ class TaskQueue:
         secrets: tuple[str, ...] = ()
         try:
             checkpoint = DatabaseCheckpointStore(self.database, run_id)
+            run_kind = str(self.database.get_run(run_id).get("kind") or "handoff")
             (
                 config,
                 old_mailbox,
@@ -324,7 +340,7 @@ class TaskQueue:
                 old_network,
                 new_network,
                 secrets,
-            ) = self._build_run_inputs(run_id)
+            ) = self._build_run_inputs(run_id, rescue=run_kind == "rescue")
             current_step: list[str | None] = [None]
 
             def on_log(message: str) -> None:
@@ -364,7 +380,12 @@ class TaskQueue:
                 )
 
             self._append_event(run_id, step=None, level="info", message="run started")
-            runner = self.runner_factory(
+            runner_factory = (
+                self.rescue_runner_factory
+                if run_kind == "rescue"
+                else self.runner_factory
+            )
+            runner = runner_factory(
                 config,
                 checkpoint_store=checkpoint,
                 old_mailbox=old_mailbox,
@@ -400,12 +421,15 @@ class TaskQueue:
                     )
                 else:
                     safe_error = redact_text(exc, secrets)
-                    self.database.fail_run_and_replace_account(
-                        run_id,
-                        role=exc.role,
-                        failure_code=exc.code,
-                        redacted_error=safe_error,
-                    )
+                    if exc.role == "owner":
+                        self.database.fail_run(run_id, safe_error)
+                    else:
+                        self.database.fail_run_and_replace_account(
+                            run_id,
+                            role=exc.role,
+                            failure_code=exc.code,
+                            redacted_error=safe_error,
+                        )
                     self._append_event(
                         run_id,
                         step=None,
@@ -455,7 +479,7 @@ class TaskQueue:
             secrets = ()
 
     def _build_run_inputs(
-        self, run_id: str
+        self, run_id: str, *, rescue: bool = False
     ) -> tuple[
         WorkflowConfig,
         MailboxCredentials,
@@ -466,6 +490,8 @@ class TaskQueue:
         tuple[str, ...],
     ]:
         run = self.database.get_run(run_id)
+        if (str(run.get("kind") or "handoff") == "rescue") != bool(rescue):
+            raise StateConflictError("run kind no longer matches its executor")
         workspace = self.database.get_workspace(run["workspace_id"])
         if (
             workspace["current_account_id"] != run["current_account_id"]
@@ -483,9 +509,9 @@ class TaskQueue:
             raise StateConflictError("account identity no longer matches the run snapshot")
 
         owner_alias_id = str(workspace["owner_alias_id"] or "").strip()
+        if rescue and not owner_alias_id:
+            raise StateConflictError("rescue run has no iCloud Team owner")
         if owner_alias_id:
-            # The owner is deliberately absent from the runner inputs. The
-            # old/new identities must both be active children of that owner.
             for account in (old_account, new_account):
                 if (
                     account.get("icloud_role") != "rotating_child"
@@ -495,10 +521,22 @@ class TaskQueue:
                         "iCloud Team workflow requires two child accounts"
                     )
 
-        old_credentials = self.database.get_resolved_account_credentials(old_account["id"])
         new_credentials = self.database.get_resolved_account_credentials(new_account["id"])
-        old_mailbox = self._mailbox(old_account, old_credentials)
         new_mailbox = self._mailbox(new_account, new_credentials)
+        if rescue:
+            owner_alias = self.database.get_icloud_alias(owner_alias_id)
+            old_mailbox, old_credentials = self._icloud_owner_mailbox(owner_alias)
+            old_execution_id = owner_alias_id
+            old_execution_email = str(owner_alias["email"])
+            old_password = ""
+        else:
+            old_credentials = self.database.get_resolved_account_credentials(
+                old_account["id"]
+            )
+            old_mailbox = self._mailbox(old_account, old_credentials)
+            old_execution_id = str(old_account["id"])
+            old_execution_email = str(run["current_email_snapshot"])
+            old_password = str(old_credentials.get("account_password") or "")
 
         proxy_template = self._secret_setting("proxy")
         had_run_proxy = bool(run["proxy_configured"])
@@ -514,7 +552,11 @@ class TaskQueue:
                 current_override = None
                 next_override = None
             else:
-                current_override = self.database.get_account_proxy(old_account["id"])
+                current_override = (
+                    self.database.get_icloud_owner_proxy(owner_alias_id)
+                    if rescue
+                    else self.database.get_account_proxy(old_account["id"])
+                )
                 next_override = self.database.get_account_proxy(new_account["id"])
 
             def proxy_entry(account_proxy: str | None) -> dict[str, str]:
@@ -531,9 +573,16 @@ class TaskQueue:
             }
             self.database.set_run_account_proxy_snapshot(run_id, proxy_snapshot)
 
-        old_identity = self.database.ensure_account_network_identity(
-            old_account["id"],
-            proxy_sid=generate_proxy_sid(),
+        old_identity = (
+            self.database.ensure_icloud_owner_network_identity(
+                owner_alias_id,
+                proxy_sid=generate_proxy_sid(),
+            )
+            if rescue
+            else self.database.ensure_account_network_identity(
+                old_account["id"],
+                proxy_sid=generate_proxy_sid(),
+            )
         )
         new_identity = self.database.ensure_account_network_identity(
             new_account["id"],
@@ -560,7 +609,7 @@ class TaskQueue:
                 and isinstance(legacy_geo, Mapping)
             )
 
-        old_legacy = uses_legacy_identity("old", old_identity)
+        old_legacy = False if rescue else uses_legacy_identity("old", old_identity)
         new_legacy = uses_legacy_identity("new", new_identity)
         legacy_openai_steps = {
             "old_login",
@@ -593,11 +642,11 @@ class TaskQueue:
         new_proxy = account_proxy("next", new_identity, legacy_recovery=new_legacy)
 
         def account_network(
-            account_id: str,
             account_proxy: str,
             identity: Mapping[str, Any],
             *,
             legacy_recovery: bool,
+            persist_callback: Callable[[Mapping[str, Any]], Any],
         ) -> AccountNetworkSpec:
             source = dict(identity)
             if legacy_recovery:
@@ -637,25 +686,39 @@ class TaskQueue:
                 persist_callback=(
                     None
                     if legacy_recovery
-                    else lambda updates: self.database.merge_account_network_identity(
-                        account_id,
-                        updates,
-                    )
+                    else persist_callback
                 ),
                 legacy_recovery=legacy_recovery,
             )
 
+        if rescue:
+            old_persist_callback = (
+                lambda updates: self.database.merge_icloud_owner_network_identity(
+                    old_execution_id,
+                    updates,
+                )
+            )
+        else:
+            old_persist_callback = (
+                lambda updates: self.database.merge_account_network_identity(
+                    old_execution_id,
+                    updates,
+                )
+            )
         old_network = account_network(
-            old_account["id"],
             old_proxy,
             old_identity,
             legacy_recovery=old_legacy,
+            persist_callback=old_persist_callback,
         )
         new_network = account_network(
-            new_account["id"],
             new_proxy,
             new_identity,
             legacy_recovery=new_legacy,
+            persist_callback=lambda updates: self.database.merge_account_network_identity(
+                new_account["id"],
+                updates,
+            ),
         )
 
         management_key = self._secret_setting("management_api_key")
@@ -665,8 +728,8 @@ class TaskQueue:
         output_dir = Path(self._text_setting("output_dir", "output")).expanduser().resolve()
         config = WorkflowConfig(
             old_account=AccountSpec(
-                run["current_email_snapshot"],
-                str(old_credentials.get("account_password") or ""),
+                old_execution_email,
+                old_password,
             ),
             new_account=AccountSpec(
                 run["next_email_snapshot"],
@@ -738,6 +801,39 @@ class TaskQueue:
             new_network,
             known_secrets,
         )
+
+    def _icloud_owner_mailbox(
+        self,
+        owner_alias: Mapping[str, Any],
+    ) -> tuple[MailboxCredentials, dict[str, Any]]:
+        if owner_alias.get("role") != "team_owner":
+            raise StateConflictError("rescue identity is not an iCloud Team owner")
+        mailbox_id = str(owner_alias.get("mailbox_id") or "").strip()
+        if not mailbox_id:
+            raise StateConflictError("iCloud Team owner mailbox is missing")
+        mailbox = self.database.get_icloud_mailbox(mailbox_id)
+        if mailbox["status"] != "ready":
+            raise StateConflictError("iCloud Team owner mailbox is not ready")
+        secret = self.database.get_icloud_mailbox_secrets(mailbox_id)
+        imap = secret.get("imap")
+        if not isinstance(imap, Mapping):
+            raise StateConflictError("iCloud Team owner IMAP configuration is missing")
+        credentials = {
+            "provider": "icloud_hme_imap",
+            "forwarding_email": str(mailbox["forwarding_email"]),
+            "imap_host": str(imap.get("host") or ""),
+            "imap_port": int(imap.get("port") or 993),
+            "imap_username": str(imap.get("username") or ""),
+            "imap_password": str(imap.get("password") or ""),
+            "imap_folder": str(imap.get("folder") or "INBOX"),
+            "mailbox_proxy": str(secret.get("proxy") or ""),
+            "account_password": "",
+        }
+        account = {
+            "email": str(owner_alias["email"]),
+            "primary_email": str(mailbox["forwarding_email"]),
+        }
+        return self._mailbox(account, credentials), credentials
 
     @staticmethod
     def _mailbox(

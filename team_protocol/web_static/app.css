@@ -773,19 +773,18 @@ input[readonly] {
   background: #f1f5fd;
 }
 
-.workspace-table th:nth-child(1),
-.workspace-table td:nth-child(1) {
-  width: 48px;
-  padding-inline: 14px 4px;
-}
+.workspace-table th:nth-child(1) { width: 14%; }
+.workspace-table th:nth-child(2) { width: 17%; }
+.workspace-table th:nth-child(3) { width: 12%; }
+.workspace-table th:nth-child(4) { width: 17%; }
+.workspace-table th:nth-child(5) { width: 10%; }
+.workspace-table th:nth-child(6) { width: 12%; }
+.workspace-table th:nth-child(7) { width: 300px; }
 
-.workspace-table th:nth-child(2) { width: 15%; }
-.workspace-table th:nth-child(3) { width: 16%; }
-.workspace-table th:nth-child(4),
-.workspace-table th:nth-child(5) { width: 16%; }
-.workspace-table th:nth-child(6) { width: 10%; }
-.workspace-table th:nth-child(7) { width: 13%; }
-.workspace-table th:nth-child(8) { width: 112px; }
+.workspace-table .row-actions {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
 
 .account-table th:nth-child(1) { width: 19%; }
 .account-table th:nth-child(2) { width: 17%; }
@@ -1598,6 +1597,10 @@ dialog::backdrop {
   width: min(960px, calc(100vw - 48px));
 }
 
+#icloud-team-import-dialog {
+  width: min(1120px, calc(100vw - 48px));
+}
+
 #icloud-alias-dialog,
 #icloud-sync-dialog {
   width: min(1240px, calc(100vw - 48px));
@@ -1676,6 +1679,59 @@ dialog::backdrop {
 
 #icloud-sync-dialog .icloud-sync-table {
   min-width: 1160px;
+}
+
+.team-import-source {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 16px;
+}
+
+.team-import-source .compound-control select {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.team-import-proxy,
+.team-import-snapshot {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+  padding-block: 16px;
+  border-block: 1px solid var(--line);
+}
+
+.team-import-snapshot {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.section-heading-inline {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.section-heading-inline > span {
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.icloud-team-alias-table {
+  min-width: 760px;
+}
+
+.icloud-team-alias-table th:nth-child(1) { width: 35%; }
+.icloud-team-alias-table th:nth-child(2) { width: 22%; }
+.icloud-team-alias-table th:nth-child(3) { width: 12%; }
+.icloud-team-alias-table th:nth-child(4) { width: 31%; }
+
+#icloud-team-import-dialog .team-import-snapshot .table-frame {
+  max-height: 330px;
 }
 
 .form-error,
@@ -2299,6 +2355,10 @@ dialog::backdrop {
     border-radius: 0;
   }
 
+  .icloud-team-alias-table {
+    min-width: 0;
+  }
+
   .stage-groups,
   .run-output {
     grid-template-columns: 1fr;
@@ -2326,6 +2386,15 @@ dialog::backdrop {
 
   .heading-actions .button {
     flex: 1 1 0;
+  }
+
+  .form-grid--two,
+  .team-import-source {
+    grid-template-columns: 1fr;
+  }
+
+  .team-import-source .inventory-search-status {
+    width: auto;
   }
 
   .segmented-control {

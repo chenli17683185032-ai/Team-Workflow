@@ -108,6 +108,17 @@ class FakeTaskQueue:
         self.notify_change()
         return result
 
+    def enqueue_rescue(self, workspace_id):
+        result = self.database.enqueue_rescue_workspace(workspace_id)
+        self.database.append_run_event(
+            result["id"],
+            step=None,
+            level="warning",
+            message="emergency rescue queued",
+        )
+        self.notify_change()
+        return result
+
     def reorder(self, queue_item_ids):
         result = self.database.reorder_queue(queue_item_ids)
         self.notify_change()
@@ -887,6 +898,317 @@ class WebConsoleTests(unittest.TestCase):
             "owner-two-secret",
         ):
             self.assertNotIn(secret, serialized)
+
+    def test_icloud_owner_rescue_creates_one_child_and_retries_same_checkpoint(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        owner_proxy = "socks5h://rescue:rescue-secret@proxy.invalid:1080"
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "rescue-owner@icloud.com",
+                    "role": "team_owner",
+                    "owner_proxy": owner_proxy,
+                    "remote_metadata": {
+                        "hme": "rescue-owner@icloud.com",
+                        "anonymousId": "rescue-owner-remote-secret",
+                    },
+                },
+                {
+                    "email": "broken-child@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "rescue-owner@icloud.com",
+                    "remote_metadata": {
+                        "hme": "broken-child@icloud.com",
+                        "anonymousId": "broken-child-remote-secret",
+                    },
+                },
+            ],
+        )
+        owner = next(item for item in imported if item["role"] == "team_owner")
+        child = next(item for item in imported if item["role"] == "rotating_child")
+        workspace = self.database.create_workspace(
+            name="Rescue Team",
+            workspace_uid="rescue-team-uid",
+            owner_alias_id=owner["id"],
+            current_account_id=child["account_id"],
+        )
+        generated = []
+
+        class RescueHmeClient:
+            def create_alias(self, *, label, note):
+                item = {
+                    "hme": "fresh-rescue@icloud.com",
+                    "anonymousId": "fresh-rescue-remote-secret",
+                    "isActive": True,
+                    "label": label,
+                    "note": note,
+                }
+                generated.append(item)
+                return item
+
+            def deactivate_alias(self, anonymous_id):
+                raise AssertionError(f"unexpected compensation for {anonymous_id}")
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: RescueHmeClient()
+        )
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as client:
+            first = client.post(
+                f"/api/workspaces/{workspace['id']}/rescue-icloud-child",
+                json={"version": workspace["version"]},
+                headers=self.origin_headers,
+            )
+            self.assertEqual(first.status_code, 202, first.text)
+            first_payload = first.json()
+            self.assertEqual(first_payload["mode"], "rescue")
+            self.assertTrue(first_payload["created"])
+            self.assertEqual(first_payload["run"]["kind"], "rescue")
+
+            claimed = self.database.claim_next_queue_item()
+            self.assertEqual(claimed["run_id"], first_payload["run"]["id"])
+            self.database.fail_run(first_payload["run"]["id"], "simulated failure")
+            failed_workspace = self.database.get_workspace(workspace["id"])
+            retried = client.post(
+                f"/api/workspaces/{workspace['id']}/rescue-icloud-child",
+                json={"version": failed_workspace["version"]},
+                headers=self.origin_headers,
+            )
+            protected_owner = client.patch(
+                f"/api/icloud-aliases/{owner['id']}/state",
+                json={"state": "inactive"},
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(retried.status_code, 202, retried.text)
+        retried_payload = retried.json()
+        self.assertTrue(retried_payload["resumed"])
+        self.assertEqual(protected_owner.status_code, 409, protected_owner.text)
+        self.assertEqual(
+            self.database.get_icloud_alias(owner["id"])["state"],
+            "active",
+        )
+        self.assertFalse(retried_payload["created"])
+        self.assertEqual(
+            retried_payload["run"]["id"],
+            first_payload["run"]["id"],
+        )
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(
+            len(self.database.list_icloud_aliases(profile["id"])),
+            3,
+        )
+        for secret in (
+            "rescue-secret",
+            "rescue-owner-remote-secret",
+            "broken-child-remote-secret",
+            "fresh-rescue-remote-secret",
+        ):
+            self.assertNotIn(secret, first.text + retried.text)
+
+    def test_icloud_team_import_is_selective_idempotent_and_secret_safe(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        remote_aliases = [
+            {
+                "hme": "team-owner@icloud.com",
+                "anonymousId": "team-owner-remote-secret",
+                "isActive": True,
+                "label": "Team owner",
+            },
+            {
+                "hme": "current-child@icloud.com",
+                "anonymousId": "current-child-remote-secret",
+                "isActive": True,
+                "label": "组 1-7",
+            },
+            {
+                "hme": "obsolete@icloud.com",
+                "anonymousId": "obsolete-remote-secret",
+                "isActive": True,
+                "label": "Unused",
+            },
+        ]
+        list_calls = []
+
+        class TeamImportClient:
+            def list_aliases(self):
+                list_calls.append(1)
+                return list(remote_aliases)
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: TeamImportClient()
+        )
+        owner_proxy = (
+            "socks5h://team-owner:team-proxy-secret@proxy.invalid:1080"
+        )
+        request = {
+            "mailbox_id": profile["id"],
+            "name": "组 1",
+            "workspace_uid": "team-workspace-uid",
+            "owner_email": "team-owner@icloud.com",
+            "current_child_email": "current-child@icloud.com",
+            "owner_proxy_mode": "direct",
+            "owner_proxy": owner_proxy,
+        }
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as client:
+            preview_before = client.get(
+                f"/api/icloud-mailboxes/{profile['id']}/remote-aliases",
+                headers=self.origin_headers,
+            )
+            created = client.post(
+                "/api/icloud-teams/import",
+                json=request,
+                headers=self.origin_headers,
+            )
+            preview_after = client.get(
+                f"/api/icloud-mailboxes/{profile['id']}/remote-aliases",
+                headers=self.origin_headers,
+            )
+
+            class UnexpectedRemoteClient:
+                @staticmethod
+                def list_aliases():
+                    raise AssertionError("idempotent Team import reread iCloud")
+
+            self.controller.hme_client_factory = (
+                lambda _session, **_kwargs: UnexpectedRemoteClient()
+            )
+            repeated = client.post(
+                "/api/icloud-teams/import",
+                json=request,
+                headers=self.origin_headers,
+            )
+            conflict = client.post(
+                "/api/icloud-teams/import",
+                json={**request, "current_child_email": "obsolete@icloud.com"},
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(preview_before.status_code, 200, preview_before.text)
+        self.assertEqual(len(preview_before.json()), 3)
+        self.assertEqual(created.status_code, 201, created.text)
+        self.assertTrue(created.json()["created"])
+        self.assertEqual(created.json()["workspace"]["status"], "needs_account")
+        self.assertEqual(repeated.status_code, 201, repeated.text)
+        self.assertFalse(repeated.json()["created"])
+        self.assertEqual(
+            repeated.json()["workspace"]["id"],
+            created.json()["workspace"]["id"],
+        )
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(len(self.database.list_workspaces()), 1)
+        aliases = self.database.list_icloud_aliases(profile["id"])
+        self.assertEqual(len(aliases), 2)
+        self.assertNotIn("obsolete@icloud.com", {item["email"] for item in aliases})
+        owner = next(item for item in aliases if item["role"] == "team_owner")
+        current = next(item for item in aliases if item["role"] == "rotating_child")
+        self.assertEqual(current["parent_owner_alias_id"], owner["id"])
+        self.assertEqual(self.database.get_icloud_owner_proxy(owner["id"]), owner_proxy)
+        after_by_email = {item["email"]: item for item in preview_after.json()}
+        self.assertTrue(after_by_email["team-owner@icloud.com"]["imported"])
+        self.assertTrue(
+            after_by_email["team-owner@icloud.com"]["proxy_configured"]
+        )
+        self.assertEqual(
+            after_by_email["current-child@icloud.com"]["workspace_name"],
+            "组 1",
+        )
+        self.assertEqual(len(list_calls), 3)
+        serialized = created.text + repeated.text + preview_after.text
+        for secret in (
+            "team-owner-remote-secret",
+            "current-child-remote-secret",
+            "obsolete-remote-secret",
+            "team-proxy-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_icloud_team_import_reuses_existing_unbound_owner_and_child(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        owner_proxy = "socks5h://existing:proxy-secret@proxy.invalid:1080"
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "existing-owner@icloud.com",
+                    "role": "team_owner",
+                    "remote_metadata": {
+                        "hme": "existing-owner@icloud.com",
+                        "anonymousId": "existing-owner-remote-secret",
+                    },
+                    "owner_proxy": owner_proxy,
+                },
+                {
+                    "email": "existing-child@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "existing-owner@icloud.com",
+                    "remote_metadata": {
+                        "hme": "existing-child@icloud.com",
+                        "anonymousId": "existing-child-remote-secret",
+                    },
+                },
+            ],
+        )
+
+        class ExistingAliasClient:
+            @staticmethod
+            def list_aliases():
+                return [
+                    {
+                        "hme": "existing-owner@icloud.com",
+                        "anonymousId": "existing-owner-remote-secret",
+                        "isActive": True,
+                    },
+                    {
+                        "hme": "existing-child@icloud.com",
+                        "anonymousId": "existing-child-remote-secret",
+                        "isActive": True,
+                    },
+                ]
+
+        self.controller.hme_client_factory = (
+            lambda _session, **_kwargs: ExistingAliasClient()
+        )
+        result = self.controller.import_icloud_team(
+            {
+                "mailbox_id": profile["id"],
+                "name": "组 1",
+                "workspace_uid": "existing-team-uid",
+                "owner_email": "existing-owner@icloud.com",
+                "current_child_email": "existing-child@icloud.com",
+            }
+        )
+
+        self.assertTrue(result["created"])
+        self.assertEqual(result["workspace"]["name"], "组 1")
+        self.assertEqual(len(self.database.list_icloud_aliases(profile["id"])), 2)
+        self.assertEqual({item["id"] for item in imported}, {
+            result["owner"]["id"],
+            result["current_child"]["id"],
+        })
+        self.assertEqual(
+            self.database.get_icloud_owner_proxy(result["owner"]["id"]),
+            owner_proxy,
+        )
+
+    def test_remote_icloud_preview_exposes_session_refresh_code(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "session_invalid")
+        app = create_app(self.controller, testing=True)
+
+        with TestClient(app) as client:
+            response = client.get(
+                f"/api/icloud-mailboxes/{profile['id']}/remote-aliases",
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "icloud_session_invalid")
 
     def test_generated_owner_proxy_api_applies_chain_without_echoing_source(self):
         profile = self.controller.create_icloud_mailbox(self.icloud_payload())

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-STEP_DEFINITIONS = (
+HANDOFF_STEP_DEFINITIONS = (
     ("old_login", "旧号登录"),
     ("invite", "邀请新号"),
     ("old_leave", "旧号退出并确认"),
@@ -14,6 +14,21 @@ STEP_DEFINITIONS = (
     ("push_sub2api", "推送 Sub2API（可选）"),
 )
 
+RESCUE_STEP_DEFINITIONS = (
+    ("owner_login", "母号登录"),
+    ("rescue_clear", "清退并确认只剩母号"),
+    ("rescue_invite", "母号邀请新号"),
+    ("new_login", "新号注册"),
+    ("rescue_verify", "复核母号与新号"),
+    ("pat", "创建令牌"),
+    ("cpa", "导出 CPA"),
+    ("sub2api_export", "导出 Sub2 JSON"),
+    ("push", "推送 CPA（可选）"),
+    ("push_sub2api", "推送 Sub2API（可选）"),
+)
+
+STEP_DEFINITIONS = HANDOFF_STEP_DEFINITIONS
+
 STEP_STATE_TEXT = {
     "pending": "待执行",
     "active": "执行中",
@@ -22,7 +37,11 @@ STEP_STATE_TEXT = {
     "error": "失败",
 }
 
-STEP_IDS = frozenset(step for step, _ in STEP_DEFINITIONS)
+STEP_IDS = frozenset(
+    step
+    for definitions in (HANDOFF_STEP_DEFINITIONS, RESCUE_STEP_DEFINITIONS)
+    for step, _ in definitions
+)
 TERMINAL_STEP_STATES = frozenset({"done", "skipped", "error"})
 
 

@@ -53,19 +53,19 @@
     <section class="view is-active" id="view-spaces" data-view="spaces" aria-labelledby="spaces-title">
       <header class="page-heading">
         <div>
-          <p class="eyebrow">WORKSPACES</p>
-          <h1 id="spaces-title">空间任务</h1>
+          <p class="eyebrow">TEAM HANDOFF</p>
+          <h1 id="spaces-title">Team 换班</h1>
         </div>
         <div class="heading-actions">
-          <button type="button" class="button" data-action="open-workspace-dialog">新增空间</button>
-          <button type="button" class="button button--primary" id="enqueue-selected" data-action="enqueue-selected" disabled>加入队列</button>
+          <button type="button" class="button button--quiet" data-action="open-workspace-dialog">高级新增</button>
+          <button type="button" class="button button--primary" data-action="open-icloud-team-import">导入新母号</button>
         </div>
       </header>
 
-      <div class="metric-strip" aria-label="空间概览">
-        <div class="metric"><span>全部空间</span><strong id="metric-total">0</strong></div>
-        <div class="metric metric--ready"><span>可执行</span><strong id="metric-ready">0</strong></div>
-        <div class="metric metric--waiting"><span>待分配</span><strong id="metric-needs-account">0</strong></div>
+      <div class="metric-strip" aria-label="Team 概览">
+        <div class="metric"><span>全部 Team</span><strong id="metric-total">0</strong></div>
+        <div class="metric metric--ready"><span>可换班</span><strong id="metric-ready">0</strong></div>
+        <div class="metric metric--waiting"><span>待配置</span><strong id="metric-needs-account">0</strong></div>
         <div class="metric metric--failed"><span>需处理</span><strong id="metric-attention">0</strong></div>
       </div>
 
@@ -73,39 +73,32 @@
         <label class="search-control">
           <span class="sr-only">搜索空间</span>
           <span class="search-icon" aria-hidden="true"></span>
-          <input id="workspace-search" name="workspace_search" type="search" placeholder="搜索空间、账号或 Workspace ID…" autocomplete="off" spellcheck="false">
+          <input id="workspace-search" name="workspace_search" type="search" placeholder="搜索 Team、母号、子号或 Workspace ID…" autocomplete="off" spellcheck="false">
         </label>
-        <div class="segmented-control" id="workspace-status-filter" aria-label="空间状态筛选">
+        <div class="segmented-control" id="workspace-status-filter" aria-label="Team 状态筛选">
           <button type="button" class="is-active" data-action="filter-workspaces" data-status="all" aria-pressed="true">全部</button>
-          <button type="button" data-action="filter-workspaces" data-status="ready" aria-pressed="false">可执行</button>
-          <button type="button" data-action="filter-workspaces" data-status="needs_account" aria-pressed="false">待分配</button>
+          <button type="button" data-action="filter-workspaces" data-status="ready" aria-pressed="false">可换班</button>
+          <button type="button" data-action="filter-workspaces" data-status="needs_account" aria-pressed="false">待配置</button>
           <button type="button" data-action="filter-workspaces" data-status="failed" aria-pressed="false">失败</button>
         </div>
-        <span class="selection-count" id="workspace-selection-count" aria-live="polite">已选 0 项</span>
       </div>
 
       <div class="table-frame" id="workspace-table-frame">
         <table class="data-table workspace-table">
-          <caption class="sr-only">空间、绑定账号和最近运行状态</caption>
+          <caption class="sr-only">Team 母号、当前子号和换班状态</caption>
           <thead>
             <tr>
-              <th class="selection-cell" scope="col">
-                <label class="check-control check-control--solo">
-                  <input id="select-all-workspaces" type="checkbox" aria-label="选择当前列表全部空间">
-                  <span aria-hidden="true"></span>
-                </label>
-              </th>
-              <th scope="col">空间</th>
+              <th scope="col">Team</th>
+              <th scope="col">母号</th>
               <th scope="col">Workspace ID</th>
-              <th scope="col">当前账号</th>
-              <th scope="col">下一账号</th>
-              <th scope="col">状态</th>
-              <th scope="col">最近运行</th>
+              <th scope="col">当前子号</th>
+              <th scope="col">换班统计</th>
+              <th scope="col">状态 / 最近运行</th>
               <th class="actions-cell" scope="col">操作</th>
             </tr>
           </thead>
           <tbody id="workspace-table-body">
-            <tr class="loading-row"><td colspan="8"><span class="inline-loader" aria-hidden="true"></span>正在载入空间…</td></tr>
+            <tr class="loading-row"><td colspan="7"><span class="inline-loader" aria-hidden="true"></span>正在载入 Team…</td></tr>
           </tbody>
         </table>
       </div>
@@ -392,6 +385,67 @@
     </form>
   </dialog>
 
+  <dialog class="side-dialog side-dialog--detail" id="icloud-team-import-dialog" aria-labelledby="icloud-team-import-title">
+    <form method="dialog" class="dialog-shell" id="icloud-team-import-form" novalidate>
+      <header class="dialog-header">
+        <div><p class="eyebrow">ICLOUD TEAM</p><h2 id="icloud-team-import-title">导入新母号</h2></div>
+        <button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭母号导入">×</button>
+      </header>
+      <div class="dialog-content">
+        <div class="form-grid form-grid--two">
+          <label class="field"><span>Team 名称</span><input name="name" type="text" maxlength="160" required autocomplete="off" placeholder="例如 组 1"></label>
+          <label class="field"><span>Workspace ID</span><input name="workspace_uid" type="text" maxlength="500" required autocomplete="off" spellcheck="false"></label>
+        </div>
+
+        <div class="team-import-source">
+          <label class="field"><span>iCloud 资源池</span><span class="compound-control"><select name="mailbox_id" required><option value="">选择 iCloud</option></select><button type="button" class="button" data-action="load-icloud-team-aliases">一键读取 iCloud</button></span></label>
+          <span class="inventory-search-status" id="icloud-team-import-status" role="status" aria-live="polite">尚未读取</span>
+        </div>
+
+        <div class="form-grid form-grid--two team-import-selection">
+          <label class="field"><span>Team 母号</span><select name="owner_email" required disabled><option value="">先读取 iCloud</option></select></label>
+          <label class="field"><span>当前子号</span><select name="current_child_email" required disabled><option value="">先选择母号</option></select></label>
+        </div>
+
+        <section class="team-import-proxy" id="icloud-team-import-proxy">
+          <div class="section-heading-inline">
+            <h3>子号链路</h3>
+            <span id="icloud-team-import-proxy-status">未配置</span>
+          </div>
+          <input type="hidden" name="owner_proxy_mode" value="lokiproxy_generator">
+          <div class="segmented-control owner-proxy-mode-control" id="icloud-team-import-proxy-mode" role="group" aria-label="子号链路类型">
+            <button type="button" data-action="select-icloud-team-proxy-mode" data-mode="direct" aria-pressed="false">固定 S5</button>
+            <button type="button" class="is-active" data-action="select-icloud-team-proxy-mode" data-mode="lokiproxy_generator" aria-pressed="true">LokiProxy</button>
+          </div>
+          <label class="field" id="icloud-team-import-direct-field" hidden><span>固定 S5 / SOCKS5</span><input name="owner_proxy" type="password" maxlength="4096" autocomplete="new-password" spellcheck="false"></label>
+          <div class="form-grid form-grid--two" id="icloud-team-import-generator-fields">
+            <label class="field field--wide"><span>LokiProxy 来源</span><input name="owner_proxy_source_url" type="password" maxlength="8192" autocomplete="new-password" spellcheck="false"></label>
+            <label class="field"><span>统一 Clash 前置</span><input name="owner_proxy_bootstrap" type="text" readonly autocomplete="off" spellcheck="false"></label>
+          </div>
+        </section>
+
+        <section class="team-import-snapshot">
+          <div class="section-heading-inline">
+            <h3>iCloud Alias 快照</h3>
+            <span id="icloud-team-alias-count">0 个</span>
+          </div>
+          <div class="table-frame table-frame--standalone">
+            <table class="data-table icloud-team-alias-table">
+              <caption class="sr-only">iCloud 远端 Alias 与本地接管状态</caption>
+              <thead><tr><th scope="col">隐藏邮箱</th><th scope="col">标签</th><th scope="col">远端</th><th scope="col">本地状态</th></tr></thead>
+              <tbody id="icloud-team-alias-table-body"><tr class="empty-row"><td colspan="4">尚未读取 iCloud</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+        <div class="form-error" id="icloud-team-import-error" role="alert" hidden></div>
+      </div>
+      <footer class="dialog-footer">
+        <button type="button" class="button" data-action="close-dialog">取消</button>
+        <button type="submit" class="button button--primary" id="icloud-team-import-submit" disabled>导入 Team</button>
+      </footer>
+    </form>
+  </dialog>
+
   <dialog class="side-dialog side-dialog--detail" id="run-dialog" aria-labelledby="run-dialog-title">
     <div class="dialog-shell">
       <header class="dialog-header">
@@ -605,7 +659,7 @@
         <input type="hidden" name="alias_id">
         <input type="hidden" name="mode" value="lokiproxy_generator">
         <dl class="allocation-preview">
-          <div><dt>归属母号（不参与操作）</dt><dd id="icloud-owner-proxy-email">-</dd></div>
+          <div><dt>Team 母号</dt><dd id="icloud-owner-proxy-email">-</dd></div>
           <div><dt>子号默认链路</dt><dd id="icloud-owner-proxy-state">未配置</dd></div>
         </dl>
         <div class="field">

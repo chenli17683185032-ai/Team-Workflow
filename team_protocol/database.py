@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 ACCOUNT_STATUSES = frozenset(
     {
         "available",
@@ -34,6 +34,7 @@ WORKSPACE_STATUSES = frozenset(
 RUN_STATES = frozenset(
     {"queued", "running", "stopping", "succeeded", "failed", "cancelled"}
 )
+RUN_KINDS = frozenset({"handoff", "rescue"})
 QUEUE_STATES = frozenset({"pending", "running", "completed", "failed", "cancelled"})
 MAILBOX_INVENTORY_STATUSES = frozenset({"available", "disabled", "exhausted"})
 MAILBOX_ALLOCATION_STATES = frozenset({"allocated", "retired", "disabled"})
@@ -47,8 +48,12 @@ WORKFLOW_STEPS = (
     "old_login",
     "invite",
     "old_leave",
+    "owner_login",
+    "rescue_clear",
+    "rescue_invite",
     "new_login",
     "member_verify",
+    "rescue_verify",
     "pat",
     "cpa",
     "sub2api_export",
@@ -60,6 +65,7 @@ _ACCOUNT_RUNTIME_IDENTITY_VERSION = 1
 _RUN_PROXY_SNAPSHOT_VERSION = 1
 _RUN_PROXY_SOURCES = frozenset({"account", "global", "direct"})
 _ICLOUD_OWNER_PROXY_CONFIG_PREFIX = "icloud-owner-proxy-config:"
+_ICLOUD_OWNER_RUNTIME_IDENTITY_PREFIX = "icloud-owner-runtime-identity:"
 _ACCOUNT_RUNTIME_IDENTITY_KEYS = frozenset(
     {
         "version",
@@ -554,6 +560,11 @@ _SCHEMA_V6_STATEMENTS = (
     "CREATE UNIQUE INDEX ux_workspaces_owner_alias ON workspaces(owner_alias_id) WHERE owner_alias_id IS NOT NULL",
 )
 
+_SCHEMA_V7_STATEMENTS = (
+    "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'handoff' "
+    "CHECK (kind IN ('handoff', 'rescue'))",
+)
+
 _SCHEMA_MIGRATIONS = {
     1: _SCHEMA_STATEMENTS,
     2: _SCHEMA_V2_STATEMENTS,
@@ -561,6 +572,7 @@ _SCHEMA_MIGRATIONS = {
     4: _SCHEMA_V4_STATEMENTS,
     5: _SCHEMA_V5_STATEMENTS,
     6: _SCHEMA_V6_STATEMENTS,
+    7: _SCHEMA_V7_STATEMENTS,
 }
 
 
@@ -806,10 +818,13 @@ class Database:
                 """
                 SELECT key, value_text, encrypted, updated_at
                 FROM settings
-                WHERE key NOT LIKE ?
+                WHERE key NOT LIKE ? AND key NOT LIKE ?
                 ORDER BY key
                 """,
-                (f"{_ICLOUD_OWNER_PROXY_CONFIG_PREFIX}%",),
+                (
+                    f"{_ICLOUD_OWNER_PROXY_CONFIG_PREFIX}%",
+                    f"{_ICLOUD_OWNER_RUNTIME_IDENTITY_PREFIX}%",
+                ),
             ).fetchall()
         return [
             {
@@ -1728,6 +1743,120 @@ class Database:
         ):
             raise DatabaseError("iCloud Team owner proxy config is invalid")
         return result
+
+    @staticmethod
+    def _icloud_owner_runtime_identity_key(alias_id: str) -> str:
+        return f"{_ICLOUD_OWNER_RUNTIME_IDENTITY_PREFIX}{alias_id}"
+
+    def _decode_icloud_owner_network_identity(
+        self,
+        alias_id: str,
+        row: sqlite3.Row | None,
+    ) -> dict[str, Any]:
+        if row is None:
+            return {}
+        key = self._icloud_owner_runtime_identity_key(alias_id)
+        if not row["encrypted"] or row["value_blob"] is None:
+            raise DatabaseError("iCloud Team owner runtime identity is invalid")
+        try:
+            plaintext = self._require_secret_store().decrypt(
+                bytes(row["value_blob"]), f"setting:{key}"
+            )
+            value = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            raise DatabaseError(
+                "iCloud Team owner runtime identity is invalid"
+            ) from exc
+        return _validate_account_runtime_identity(value)
+
+    def get_icloud_owner_network_identity(self, alias_id: str) -> dict[str, Any]:
+        key = self._icloud_owner_runtime_identity_key(alias_id)
+        with self._read_connection() as connection:
+            self._icloud_owner_alias_tx(connection, alias_id)
+            row = connection.execute(
+                "SELECT value_blob, encrypted FROM settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return self._decode_icloud_owner_network_identity(alias_id, row)
+
+    def ensure_icloud_owner_network_identity(
+        self,
+        alias_id: str,
+        *,
+        proxy_sid: str,
+    ) -> dict[str, Any]:
+        candidate = _validate_account_runtime_identity(
+            {
+                "version": _ACCOUNT_RUNTIME_IDENTITY_VERSION,
+                "proxy_sid": proxy_sid,
+            }
+        )
+        key = self._icloud_owner_runtime_identity_key(alias_id)
+        with self._write_transaction() as connection:
+            self._icloud_owner_alias_tx(connection, alias_id)
+            row = connection.execute(
+                "SELECT value_blob, encrypted FROM settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            existing = self._decode_icloud_owner_network_identity(alias_id, row)
+            if existing:
+                return existing
+            ciphertext = self._require_secret_store().encrypt(
+                _json_bytes(candidate), f"setting:{key}"
+            )
+            connection.execute(
+                """
+                INSERT INTO settings(key, value_text, value_blob, encrypted, updated_at)
+                VALUES(?, NULL, ?, 1, ?)
+                """,
+                (key, sqlite3.Binary(ciphertext), _now()),
+            )
+            return candidate
+
+    def merge_icloud_owner_network_identity(
+        self,
+        alias_id: str,
+        updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(updates, Mapping):
+            raise ValidationError("iCloud Team owner runtime identity update is invalid")
+        update_values = dict(updates)
+        if set(update_values) - _ACCOUNT_RUNTIME_IDENTITY_KEYS:
+            raise ValidationError(
+                "iCloud Team owner runtime identity update contains unsupported fields"
+            )
+        update_values.pop("version", None)
+        key = self._icloud_owner_runtime_identity_key(alias_id)
+        with self._write_transaction() as connection:
+            self._icloud_owner_alias_tx(connection, alias_id)
+            row = connection.execute(
+                "SELECT value_blob, encrypted FROM settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            identity = self._decode_icloud_owner_network_identity(alias_id, row)
+            if not identity:
+                raise StateConflictError(
+                    "iCloud Team owner runtime identity has not been initialized"
+                )
+            for name, value in update_values.items():
+                existing = identity.get(name, _UNSET)
+                if existing is not _UNSET and existing != value:
+                    raise StateConflictError(
+                        f"iCloud Team owner runtime identity {name} is immutable"
+                    )
+                identity[name] = value
+            validated = _validate_account_runtime_identity(identity)
+            ciphertext = self._require_secret_store().encrypt(
+                _json_bytes(validated), f"setting:{key}"
+            )
+            connection.execute(
+                """
+                UPDATE settings SET value_blob = ?, updated_at = ?
+                WHERE key = ? AND encrypted = 1
+                """,
+                (sqlite3.Binary(ciphertext), _now(), key),
+            )
+            return validated
 
     def list_icloud_owner_proxy_configs(self) -> list[dict[str, Any]]:
         with self._read_connection() as connection:
@@ -3727,6 +3856,7 @@ class Database:
             result = json.loads(str(row["result_json"]))
         return {
             "id": str(row["id"]),
+            "kind": str(row["kind"]),
             "workspace_id": str(row["workspace_id"]),
             "current_account_id": str(row["current_account_id"]),
             "next_account_id": str(row["next_account_id"]),
@@ -3781,7 +3911,15 @@ class Database:
             ).fetchall()
         return [self._run_view(row) for row in rows]
 
-    def enqueue_workspaces(self, workspace_ids: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+    def enqueue_workspaces(
+        self,
+        workspace_ids: list[str] | tuple[str, ...],
+        *,
+        kind: str = "handoff",
+    ) -> list[dict[str, Any]]:
+        run_kind = str(kind or "").strip()
+        if run_kind not in RUN_KINDS:
+            raise ValidationError("run kind is invalid")
         ordered_ids = [_required_text(value, "workspace_id") for value in workspace_ids]
         if not ordered_ids:
             raise ValidationError("at least one workspace is required")
@@ -3800,8 +3938,24 @@ class Database:
                 ).fetchone()
                 if workspace is None:
                     raise NotFoundError("workspace not found")
-                if workspace["status"] != "ready" or workspace["next_account_id"] is None:
+                allowed_statuses = (
+                    {"ready", "failed"} if run_kind == "rescue" else {"ready"}
+                )
+                if (
+                    workspace["status"] not in allowed_statuses
+                    or workspace["next_account_id"] is None
+                ):
                     raise StateConflictError("workspace is not ready")
+                if connection.execute(
+                    """
+                    SELECT 1 FROM queue_items AS queue
+                    JOIN runs AS active ON active.id = queue.run_id
+                    WHERE active.workspace_id = ?
+                      AND queue.state IN ('pending', 'running')
+                    """,
+                    (workspace_id,),
+                ).fetchone() is not None:
+                    raise StateConflictError("workspace already has an active queue item")
                 current = connection.execute(
                     "SELECT email, status FROM accounts WHERE id = ?",
                     (workspace["current_account_id"],),
@@ -3822,9 +3976,11 @@ class Database:
                     if workspace["owner_alias_id"] is None
                     else str(workspace["owner_alias_id"])
                 )
+                if run_kind == "rescue" and owner_alias_id is None:
+                    raise StateConflictError(
+                        "rescue requires an iCloud Team owner"
+                    )
                 if owner_alias_id is not None:
-                    # A Team owner is a passive anchor; only its child accounts
-                    # may enter the executable queue.
                     self._validate_workspace_icloud_group_tx(
                         connection,
                         owner_alias_id=owner_alias_id,
@@ -3840,8 +3996,8 @@ class Database:
                     INSERT INTO runs(
                         id, workspace_id, current_account_id, next_account_id,
                         current_email_snapshot, next_email_snapshot,
-                        workspace_uid_snapshot, state, created_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+                        workspace_uid_snapshot, kind, state, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
                     """,
                     (
                         run_id,
@@ -3851,6 +4007,7 @@ class Database:
                         current["email"],
                         next_account["email"],
                         workspace["workspace_uid"],
+                        run_kind,
                         timestamp,
                     ),
                 )
@@ -3881,6 +4038,9 @@ class Database:
 
     def enqueue_workspace(self, workspace_id: str) -> dict[str, Any]:
         return self.enqueue_workspaces([workspace_id])[0]
+
+    def enqueue_rescue_workspace(self, workspace_id: str) -> dict[str, Any]:
+        return self.enqueue_workspaces([workspace_id], kind="rescue")[0]
 
     def set_run_checkpoint(
         self, run_id: str, checkpoint: Mapping[str, Any], *, current_step: str | None = None
@@ -5349,9 +5509,15 @@ class Database:
                     for row in connection.execute(
                         "SELECT key, value_blob FROM settings WHERE encrypted = 1"
                     ):
-                        self._require_secret_store().decrypt(
+                        plaintext = self._require_secret_store().decrypt(
                             bytes(row["value_blob"]), f"setting:{row['key']}"
                         )
+                        if str(row["key"]).startswith(
+                            _ICLOUD_OWNER_RUNTIME_IDENTITY_PREFIX
+                        ):
+                            _validate_account_runtime_identity(
+                                json.loads(plaintext.decode("utf-8"))
+                            )
                     if schema_version >= 4:
                         account_query = (
                             "SELECT id, credential_blob, runtime_identity_blob, "

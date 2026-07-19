@@ -13,6 +13,7 @@ from team_protocol.registrar import MailboxCredentials, RegistrarIdentityError
 from team_protocol.workflow import (
     AccountNetworkSpec,
     AccountSpec,
+    RescueWorkflowRunner,
     WorkflowCancelled,
     WorkflowConfig,
     WorkflowIdentityError,
@@ -227,6 +228,12 @@ class FakeChatGPT:
     def leave(self, access_token_value, account_id, user_id):
         del access_token_value
         self.calls.append(("leave", account_id, user_id))
+        self.member_state["members"].pop(user_id, None)
+        return {"ok": True}
+
+    def remove_member(self, access_token_value, account_id, user_id):
+        del access_token_value
+        self.calls.append(("remove", account_id, user_id))
         self.member_state["members"].pop(user_id, None)
         return {"ok": True}
 
@@ -1901,6 +1908,264 @@ class WorkflowTests(unittest.TestCase):
             [("main+2@example.com", "http://proxy-1.example:9000")],
         )
         self.assertIs(registrar.login_profiles[0], registrar.resolved_profiles[0])
+
+
+class RescueWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def member_state(*, include_third=False):
+        members = {
+            "user-owner": {"id": "user-owner", "email": "main+2@example.com"},
+            "user-broken": {
+                "id": "user-broken",
+                "email": "broken-child@example.com",
+            },
+        }
+        if include_third:
+            members["user-third"] = {
+                "id": "user-third",
+                "email": "third@example.com",
+            }
+        return {"members": members, "invites": set()}
+
+    @staticmethod
+    def runner(root, checkpoint, chatgpt, registrar=None):
+        config = make_workflow_config(
+            root,
+            push=False,
+            sub2api_push=False,
+        )
+        return RescueWorkflowRunner(
+            config,
+            **run_dependencies(config, checkpoint),
+            registrar=registrar or FakeRegistrar(),
+            chatgpt=chatgpt,
+            verbose=False,
+        )
+
+    def test_rescue_clears_every_non_owner_before_invite_and_finishes_with_two(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = InMemoryCheckpoint()
+            config = make_workflow_config(root, push=False, sub2api_push=False)
+            chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                self.member_state(include_third=True),
+            )
+
+            result = self.runner(root, checkpoint, chatgpt).run()
+
+        self.assertEqual(result["mode"], "rescue")
+        self.assertEqual(result["clear"]["removed_members"], 2)
+        self.assertEqual(result["member_guard"]["active_members"], 2)
+        self.assertEqual(
+            set(chatgpt.member_state["members"]),
+            {"user-owner", "user-new"},
+        )
+        remove_indexes = [
+            index for index, call in enumerate(chatgpt.calls) if call[0] == "remove"
+        ]
+        invite_index = next(
+            index for index, call in enumerate(chatgpt.calls) if call[0] == "invite"
+        )
+        self.assertEqual(len(remove_indexes), 2)
+        self.assertTrue(all(index < invite_index for index in remove_indexes))
+        self.assertTrue(any(call[0] == "pat" for call in chatgpt.calls))
+
+    def test_rescue_remove_failure_stops_before_invite_new_login_and_pat(self):
+        class FailingRemovalChatGPT(FakeChatGPT):
+            def remove_member(self, access_token_value, account_id, user_id):
+                del access_token_value
+                self.calls.append(("remove", account_id, user_id))
+                raise RuntimeError("member removal failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = InMemoryCheckpoint()
+            config = make_workflow_config(root, push=False, sub2api_push=False)
+            registrar = FakeRegistrar()
+            chatgpt = FailingRemovalChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                self.member_state(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "member removal failed"):
+                self.runner(root, checkpoint, chatgpt, registrar).run()
+
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+        self.assertFalse(any(call[0] == "invite" for call in chatgpt.calls))
+        self.assertFalse(any(call[0] == "pat" for call in chatgpt.calls))
+        self.assertIsNone(checkpoint.get("rescue_invite"))
+        self.assertIsNone(checkpoint.get("new_login"))
+
+    def test_rescue_residual_member_feedback_stops_before_invite(self):
+        class NonRemovingChatGPT(FakeChatGPT):
+            def remove_member(self, access_token_value, account_id, user_id):
+                del access_token_value
+                self.calls.append(("remove", account_id, user_id))
+                return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = InMemoryCheckpoint()
+            config = make_workflow_config(root, push=False, sub2api_push=False)
+            chatgpt = NonRemovingChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                self.member_state(),
+            )
+            with patch(
+                "team_protocol.workflow._MEMBER_FEEDBACK_TIMEOUT_SECONDS", 0
+            ):
+                with self.assertRaisesRegex(RuntimeError, "was not confirmed"):
+                    self.runner(root, checkpoint, chatgpt).run()
+
+        self.assertFalse(any(call[0] == "invite" for call in chatgpt.calls))
+        self.assertFalse(any(call[0] == "pat" for call in chatgpt.calls))
+
+    def test_rescue_member_change_after_clear_blocks_invite_and_new_login(self):
+        class JoinAfterClearChatGPT(FakeChatGPT):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.invite_reads = 0
+
+            def get_invites(self, access_token_value, account_id):
+                result = super().get_invites(access_token_value, account_id)
+                self.invite_reads += 1
+                if self.invite_reads == 1:
+                    self.member_state["members"]["user-third"] = {
+                        "id": "user-third",
+                        "email": "third@example.com",
+                    }
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = InMemoryCheckpoint()
+            config = make_workflow_config(root, push=False, sub2api_push=False)
+            registrar = FakeRegistrar()
+            chatgpt = JoinAfterClearChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                self.member_state(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "member count changed"):
+                self.runner(root, checkpoint, chatgpt, registrar).run()
+
+        self.assertFalse(any(call[0] == "invite" for call in chatgpt.calls))
+        self.assertFalse(any(call[0] == "pat" for call in chatgpt.calls))
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+
+    def test_rescue_final_three_member_feedback_blocks_pat_and_rotation_result(self):
+        class ConcurrentJoinChatGPT(FakeChatGPT):
+            def refresh_session(self, session_token, account_id=None):
+                result = super().refresh_session(session_token, account_id)
+                if not session_token.startswith("old-") and account_id == self.workspace_id:
+                    self.member_state["members"]["user-third"] = {
+                        "id": "user-third",
+                        "email": "third@example.com",
+                    }
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = InMemoryCheckpoint()
+            config = make_workflow_config(root, push=False, sub2api_push=False)
+            chatgpt = ConcurrentJoinChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                self.member_state(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "exactly the owner and new child"):
+                self.runner(root, checkpoint, chatgpt).run()
+
+        self.assertIsNone(checkpoint.get("rescue_verify"))
+        self.assertIsNone(checkpoint.get("pat"))
+        self.assertFalse(any(call[0] == "pat" for call in chatgpt.calls))
+
+    def test_rescue_resume_after_remove_crash_does_not_repeat_removal(self):
+        class CrashAfterRemovalChatGPT(FakeChatGPT):
+            def remove_member(self, access_token_value, account_id, user_id):
+                result = super().remove_member(
+                    access_token_value,
+                    account_id,
+                    user_id,
+                )
+                raise RuntimeError("crash after remote removal")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = InMemoryCheckpoint()
+            config = make_workflow_config(root, push=False, sub2api_push=False)
+            first = CrashAfterRemovalChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                self.member_state(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "crash after remote removal"):
+                self.runner(root, checkpoint, first).run()
+
+            resumed = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                first.member_state,
+            )
+            result = self.runner(root, checkpoint, resumed).run()
+
+        self.assertEqual(result["member_guard"]["active_members"], 2)
+        self.assertEqual(
+            sum(call[0] == "remove" for call in first.calls + resumed.calls),
+            1,
+        )
+
+    def test_rescue_resume_after_invite_crash_reuses_remote_invite(self):
+        class CrashAfterInviteChatGPT(FakeChatGPT):
+            def invite(self, access_token_value, account_id, email):
+                result = super().invite(access_token_value, account_id, email)
+                raise RuntimeError("crash after remote invite")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = InMemoryCheckpoint()
+            config = make_workflow_config(root, push=False, sub2api_push=False)
+            first = CrashAfterInviteChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                self.member_state(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "crash after remote invite"):
+                self.runner(root, checkpoint, first).run()
+
+            resumed = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                first.member_state,
+            )
+            result = self.runner(root, checkpoint, resumed).run()
+
+        self.assertEqual(result["invite"], "already-invited")
+        self.assertEqual(
+            sum(call[0] == "invite" for call in first.calls + resumed.calls),
+            1,
+        )
 
 
 if __name__ == "__main__":
