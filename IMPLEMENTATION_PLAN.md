@@ -577,7 +577,7 @@
 - 2026-07-19：最终全量 282 项测试中 276 项通过，6 项 Windows DPAPI 按 macOS 平台跳过；JavaScript/Python 语法、diff 检查和高置信敏感信息扫描通过，LaunchAgent 已恢复固定 `http://127.0.0.1:8765/`。
 - 2026-07-19：主实现提交 `ece9c07` 已推送 GitHub `main`；真实数据库、备份、运行产物和凭据均保持在忽略的本地目录，未进入提交。
 
-### 节点 N：iCloud Team Workspace 自动识别（进行中）
+### 节点 N：iCloud Team Workspace 自动识别（完成）
 
 #### N.1 现状与目标
 
@@ -628,7 +628,7 @@
 - [x] 覆盖唯一匹配、零匹配、多匹配、超员、成员列表不完整、身份错配、代理链清理、已绑定短路和响应脱敏测试。
 - [x] 完成 Python/JavaScript 语法、聚焦与全量测试、敏感扫描；更新 README 与 CHANGELOG。
 - [x] 重启 LaunchAgent，并在桌面与移动端验证自动识别、错误反馈、按钮状态和无横向溢出。
-- [ ] 提交并推送 GitHub `main`，确认本地与远端一致，清理临时查询文件与测试产物。
+- [x] 提交并推送 GitHub `main`，确认本地与远端一致，清理临时查询文件与测试产物。
 
 #### N.5 验收场景
 
@@ -649,3 +649,4 @@
 - 2026-07-19：全量 290 项测试中 284 项通过，6 项 Windows DPAPI 按 macOS 平台跳过；Python compileall、JavaScript 语法、`git diff --check` 与高置信敏感扫描通过。扫描命中仅为测试假 Cookie 和生产代码中的 Session Cookie 模板，不含真实值。
 - 2026-07-19：LaunchAgent 重启后首次探测即恢复 HTTP `200`；正式库组 1 的识别 API 走已绑定短路并返回 `verified=true / member_count=2`，未发送新 OTP 或访问 Team 写接口。
 - 2026-07-19：Chrome 实机验收确认 `1600×1000` 宽屏导入侧栏和 `390×844` 移动端均无页面/面板横向溢出，Workspace 字段只读，提交文案为“识别并导入”，按钮与字段无重叠；验收后已恢复默认宽屏视口。
+- 2026-07-19：主实现提交 `3542caf` 已推送 GitHub `main`；一次性查询凭据、临时登录目录与 GitHub 调研克隆已删除，正式数据库凭据仍只保存在本机加密存储中。
