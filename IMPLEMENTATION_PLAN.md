@@ -898,3 +898,144 @@ Team 工作流 -> 本地隔离中继 -> 共享 Clash -> CliProxy/其他固定代
 - 可回滚到旧的独立调用 timeout 逻辑，但不应恢复使用多个完整 timeout 串联的旧行为。
 - 本节点不改变 Sentinel flow 序列、指纹配置、代理选择、OTP 提供方或 OpenAI 端点。
 - 不使用本地缓存或伪造远端 Sentinel token 来绕过服务端校验；优化仅限于超时和资源回收。
+
+### 节点 S：账户创建成功后 ChatGPT session 导出失败诊断（已收敛）
+
+#### S.1 现象、目标与性能指标
+
+2026-07-19 23:40 的两次实际运行均收到 `create_account` 成功反馈，随后约 6 秒内在 `export_session` 阶段报告“未能读取当前 ChatGPT session”，任务最终被 registrar 标记为失败。用户通过独立手动 token 流程验证其中的新账号能够正常使用，因此账户创建状态与自动导出状态必须分开建模。
+
+本节点只做证据驱动诊断，不修改注册/OAuth 行为，不创建新账号：
+
+- 确认失败发生在 post-create URL 预热、`/api/auth/session` 请求、响应解析还是 access token 缺失。
+- 解释为什么“账号已创建且可手动取 token”与“当前 HTTP 注册会话无法自动导出”可以同时成立。
+- 区分上游认证流程变化、Cookie 域/重定向问题、请求库兼容问题、并发共享状态、代理出口变化和纯时序延迟。
+- 结论必须由运行日志、持久化任务状态、代码历史或脱敏响应元数据至少两类证据支撑；不记录 Cookie、session token、access token、密码或邮箱完整值。
+- 若证据不足，明确列出最小的下一次观测点，不凭猜测改 OAuth 或增加无限重试。
+
+#### S.2 GitHub 与既有实现经验
+
+- GitHub 上可检索到的通用 NextAuth/Auth.js 客户端实现把 `/api/auth/session` 视为“读取当前浏览器/HTTP Cookie 会话”的接口，不是凭账号存在即可生成 token 的独立登录接口；本项目应同样把 create-account 成功和 session materialization 分成两个状态。
+- 当前公开仓库搜索尚未发现可信、近期且可直接照搬的 ChatGPT 自动注册实现；名称相近的 `gmailreg` 仓库与本项目认证链路无关，不作为依据。
+- 本项目当前代码在 create-account 200 后只预热一次返回 URL、再读取一次 `/api/auth/session`，且对非 200、非 JSON、空 payload 和缺少 access token 都压缩成同一条最终错误；应先补齐脱敏测量，再考虑控制器改动。
+
+#### S.3 动态控制结构与初始假设
+
+```text
+OpenAI create_account 200（账户对象已建立）
+    -> 响应中的 continue/redirect URL
+    -> 同一个 requests.Session 跟随 auth -> chatgpt 重定向
+    -> Set-Cookie 跨域落入 cookie jar
+    -> GET chatgpt.com/api/auth/session
+    -> 200 JSON 且含 accessToken
+    -> 导出 session-only token
+```
+
+控制对象是“刚创建账户的认证状态向 ChatGPT 应用会话收敛”的过程；控制器是 post-create 跳转和 session 读取，执行器是同一个 HTTP session，测量是重定向终点、状态码、Content-Type、Cookie 名称/域和 payload 字段存在性。外部扰动包括上游页面类型变化、跨域 Cookie、代理/出口切换、会话最终一致性延迟、挑战页、并发隔离和接口限流。
+
+初始假设按优先级等待证据验证：
+
+1. `create_account` 只完成账户写入，返回的下一步 URL 未在当前请求会话中完成 ChatGPT session 建立。
+2. `/api/auth/session` 已返回非 200、HTML/挑战页、空对象或不再含旧字段，但现有日志吞掉了具体分支。
+3. 两次同时失败来自同一上游行为变化或共同配置；只有发现 cookie jar/代理/session 对象被跨任务共享时，才判定为本地并发问题。
+4. 6 秒级失败不像 20 秒网络超时，更接近快速非 200、空 session 或缺少 access token；该推断必须由原始运行元数据确认。
+
+#### S.4 诊断节点
+
+- [x] 将 `create_account` 成功与 session 导出失败拆为独立状态，定位最终错误的唯一代码分支。
+- [ ] 检查 23:40 两次运行的服务端/任务持久化日志，恢复不含秘密的请求阶段、状态码和时序。
+- [ ] 检查 `_session_get`、redirect URL 提取、Cookie jar、代理与并发对象的生命周期，确认是否真正复用同一注册会话。
+- [ ] 用 Git 历史对照该 session-only 策略的引入时间、此前行为和已覆盖测试，确认是否为近期代码回归。
+- [ ] 对照 GitHub/Auth.js 会话接口经验和上游当前响应契约，形成按证据排序的根因结论。
+- [ ] 运行不访问真实账号的聚焦测试或离线回放，验证错误折叠路径与并发隔离假设。
+- [ ] 更新本节点实施记录，向用户说明根因、影响范围和最小修复建议；诊断任务不提交业务代码、不部署服务。
+
+#### S.5 验收场景
+
+1. 能指出 23:40 失败在调用链中的具体阶段，而不是只重复最终聚合错误。
+2. 能说明账户为何仍然有效，以及手动 token 流程补做了自动流程缺失的哪一类状态转换。
+3. 对“两次同时失败”给出共同上游变化、并发缺陷或巧合时序中的证据化判断。
+4. 不在日志、计划、终端输出、Git diff 或最终答复中暴露邮箱、Cookie 或 token 值。
+5. 若建议修复，先定义可重复的离线失败用例、稳定性边界和有限重试预算，再决定是否实施。
+
+#### S.6 回滚与边界
+
+- 本节点只新增诊断计划记录；不改 `register.py`、队列失败语义、数据库、代理、Sentinel 或 OAuth 配置。
+- 不用新注册账号作为探针，不重放用户的手动 token，不读取或输出任何 token 内容。
+- 不把“允许 refresh_token/OAuth 回退”默认为修复；这与用户此前要求的 post-create 停止策略冲突，需在诊断完成后单独确认。
+
+#### S.7 收敛记录
+
+- 2026-07-20：运行回放确认同一任务中旧子号于 23:38 成功读取 ChatGPT session，新子号于 23:40 收到 `create_account=200` 后在 session 落地阶段失败；账号创建与会话导出是两个独立状态。
+- 2026-07-20：用户通过独立流程为该账号创建 PAT，并导出与失败任务下一子号邮箱、目标 Team workspace 均精确匹配的 Sub2API 文件，证明账号和 Team 身份有效。
+- 2026-07-20：根因收敛为 post-create 当前 HTTP 会话未成功物化，而现有一次读取策略把非 200、非 JSON、空 session 或缺少 access token 合并为同一错误；用户改为要求通过外部已导入凭据刷新既有子号，后续进入节点 T。
+
+### 节点 T：已导入子号刷新与失败任务恢复（进行中）
+
+#### T.1 目标与性能指标
+
+为账号库中已经导入的 iCloud 轮换子号增加行内刷新按钮。用户为该子号重新生成 PAT 并导出新的 Sub2API JSON 后，点击刷新并选择该文件，即可让本地确认该账号已经注册，并恢复原失败接力任务。
+
+- 刷新只接受本地 JSON 中邮箱与本地子号一致、`chatgpt_account_id` 与绑定 Team workspace 一致且包含 PAT 的唯一 OpenAI 账号。
+- 只读取用户本次选择的单个 `.json` 文件；限制为 2 MiB，不保存文件路径、文件内容或 PAT。
+- 本地只保存加密的“账号已注册”布尔状态，不复制或回显远端 PAT、密码、Session、refresh token 或完整凭据。
+- 子号 ID、iCloud Alias、母号归属、Workspace 当前/下一绑定、代理、浏览器身份和原运行 checkpoint 均保持不变。
+- 若该子号是失败 Workspace 的下一子号，刷新成功后自动把原失败 run 入队；恢复到 `new_login` 时走既有账号 OTP 登录，不再重复调用 `create_account`。
+- 新子号登录成功后，把最小充分的 ChatGPT browser session cookie 加密绑定到该子号；不保存完整 Cookie jar 或浏览器 profile。
+- 该 cookie 在子号成为当前号后持续保留，下一次接力优先复用；只有接力完成并确认旧号退出时才原子删除，过期/撤销时清除并回退 OTP 登录。
+- 若文件格式不合法、身份不匹配、PAT 缺失、Workspace 正在运行或原 run 不可重试，明确失败且不改变本地状态。
+
+#### T.2 GitHub 与既有经验
+
+- `Wei-Shaw/sub2api` 的 Codex 导入按账号身份键匹配已有账号并原位更新凭据，同时保留账号 ID、分组和非凭据配置；本节点沿用“身份匹配后更新、秘密不回显”的边界。
+- 同项目的账号操作菜单把刷新作为行内账号动作；本项目继续复用现有 `row-actions`、`actionButton` 和请求防重机制，不新增独立页面。
+- 本仓库已有稳定的 Sub2API 单账号 JSON 结构、加密 `replace_account_credentials()` 和失败 run 原 checkpoint 重试能力；采用最小组合，不新增数据库列或迁移。
+
+#### T.3 最小充分闭环
+
+```text
+点击子号“刷新”
+    -> 选择本地 Sub2API JSON
+    -> 校验后只在内存读取单账号记录
+    -> email + Team workspace + PAT 三项反馈校验
+    -> 在原账号加密凭据中写入 registered_account=true
+    -> 若绑定失败 run，则原地重新入队
+    -> checkpoint 跳过已完成的邀请/旧号退出
+    -> new_login 对该子号执行已有账号登录
+    -> 加密保存新子号 browser session cookie
+    -> 后续成员复核、PAT、导出与推送照常执行
+    -> 下一次接力复用 cookie，完成轮换时删除旧子号 cookie
+```
+
+控制对象是失败任务中“远端已注册、本地仍按新号注册”的状态偏差；用户选择的 Sub2API JSON 是测量，账号注册标记是控制状态，原 run 重试是执行器。稳定性优先：文件与三重匹配不通过不动作，刷新不伪造 session，也不直接把失败任务标成成功。
+
+#### T.4 实施节点
+
+- [x] 增加控制器/API：读取本地 Sub2API JSON 并对指定 iCloud 子号做精确身份校验。
+- [x] 增加 `.json` 本地文件选择器，按钮取消选择时保持零副作用。
+- [x] 原子合并账号已注册标记，保留原邮箱/IMAP/代理凭据；失败时零写入。
+- [x] 让工作流对带标记的下一子号调用现有登录而非注册，并自动重试匹配的失败 run。
+- [x] 保存新子号最小 browser session cookie，下一次接力优先复用，并在成功轮换事务中删除旧子号 cookie。
+- [x] 在账号表操作列增加刷新图标按钮、忙碌防重、成功/失败提示和资源重载。
+- [x] 增加数据库/控制器/工作流/API 聚焦测试，覆盖本地文件匹配成功、身份不符、无 PAT、非 iCloud 子号和失败 run 恢复。
+- [x] 运行聚焦与全量回归、语法、diff 和敏感信息扫描。
+- [x] 重启 LaunchAgent，在 1 分钟内恢复服务并用桌面/移动视口验证按钮无重叠；不替用户点击真实刷新，避免立即启动外部任务。
+- [x] 更新 README/CHANGELOG/本计划并清理临时诊断文件。
+- [ ] 提交并推送 GitHub `main`，确认工作树与远端一致。
+
+#### T.5 验收场景
+
+1. 所选 JSON 中存在同邮箱、同 Team workspace、含 PAT 的唯一 OpenAI 账号：按钮成功，账号更新时间变化，响应不含 token 或路径。
+2. 该账号是失败 run 的 `bound_next`：原 run 自动重新入队，旧登录/邀请/退出 checkpoint 保留，下一阶段使用 login 而非 register。
+3. 只有邮箱相同但 workspace 不同，或只有 workspace 相同但邮箱不同：返回身份不匹配，本地凭据和 run 状态不变。
+4. 文件无 PAT、格式/扩展名/大小不合法、账号不是 iCloud 轮换子号或 Workspace 非失败状态：明确阻断，不写标记。
+5. 按钮重复点击不会创建第二个 run；运行中禁用，刷新结果不回显任何远端凭据。
+6. 新子号登录成功但后续阶段失败：cookie 仍加密保留以支持重试；完整接力成功：旧子号 cookie 被删除，新当前子号 cookie 保留到下一次接力。
+7. 保存的 cookie 已过期或被撤销：下一次接力清除旧值并回退正常 OTP 登录，不把失效 cookie 当成成功会话。
+
+#### T.6 实施记录
+
+- 2026-07-20：刷新反馈源改为用户选择的本地 Sub2API JSON；控制器限制 `.json`、2 MiB 和单账号结构，只校验 OpenAI 平台、邮箱、Team workspace、PAT 类型与非空令牌，不保存或返回路径和令牌。
+- 2026-07-20：新子号登录所得最小 browser session cookie 加密保存到账号凭据；后续接力优先复用，失效时清除并回退 OTP，只有下一次完整轮换提交时才原子删除旧子号 cookie。
+- 2026-07-20：全量 303 项测试中 297 项通过、6 项 Windows DPAPI 按 macOS 平台跳过；Python/JavaScript 语法、diff 与敏感信息扫描通过。
+- 2026-07-20：`com.teamworkflow.console` 重启后 9 秒恢复 HTTP 200；在 `1440×900` 和 `390×844` 只读验证刷新按钮无拆字、动作无重叠、页面无横向溢出且控制台无错误，未点击真实刷新。

@@ -265,6 +265,27 @@ class TaskQueue:
             self._bump_locked()
             return run
 
+    def retry_registered_account(
+        self, run_id: str, account_id: str
+    ) -> dict[str, Any]:
+        run_id = str(run_id)
+        with self._condition:
+            run = self.database.retry_run(
+                run_id,
+                registered_account_id=str(account_id),
+            )
+            self._append_event_locked(
+                run_id,
+                step="new_login",
+                level="info",
+                message=(
+                    "Sub2API imported account verified; failed run queued for "
+                    "existing-account login"
+                ),
+            )
+            self._bump_locked()
+            return run
+
     def shutdown(self, timeout: float | None = None) -> bool:
         wait_timeout = self.shutdown_timeout if timeout is None else max(0.0, float(timeout))
         with self._condition:
@@ -764,6 +785,31 @@ class TaskQueue:
             sub2api_priority=self._int_setting("sub2api_priority", 1, minimum=0),
             sub2api_group_id=self._optional_int_setting(
                 "sub2api_group_id", minimum=1
+            ),
+            new_account_registered=bool(
+                new_credentials.get("registered_account")
+            ),
+            old_session_token=(
+                ""
+                if rescue
+                else str(old_credentials.get("browser_session_token") or "")
+            ),
+            persist_old_session=(
+                None
+                if rescue
+                else lambda token: self.database.set_account_browser_session(
+                    str(old_account["id"]), token
+                )
+            ),
+            clear_old_session=(
+                None
+                if rescue
+                else lambda: self.database.clear_account_browser_session(
+                    str(old_account["id"])
+                )
+            ),
+            persist_new_session=lambda token: self.database.set_account_browser_session(
+                str(new_account["id"]), token
             ),
         )
         known_secrets = tuple(

@@ -139,6 +139,14 @@ class FakeTaskQueue:
         self.notify_change()
         return result
 
+    def retry_registered_account(self, run_id, account_id):
+        result = self.database.retry_run(
+            run_id,
+            registered_account_id=account_id,
+        )
+        self.notify_change()
+        return result
+
 
 class WebConsoleTests(unittest.TestCase):
     def test_next_icloud_child_label_increments_the_existing_group_sequence(self):
@@ -246,6 +254,98 @@ class WebConsoleTests(unittest.TestCase):
             "imap_folder": "INBOX",
             "proxy": "socks5h://parent:proxy-password-secret@proxy.invalid:1080",
         }
+
+    def failed_icloud_handoff(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "refresh-owner@icloud.com",
+                    "role": "team_owner",
+                    "remote_metadata": {
+                        "hme": "refresh-owner@icloud.com",
+                        "anonymousId": "refresh-owner-remote-secret",
+                    },
+                },
+                {
+                    "email": "refresh-current@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "refresh-owner@icloud.com",
+                    "remote_metadata": {
+                        "hme": "refresh-current@icloud.com",
+                        "anonymousId": "refresh-current-remote-secret",
+                    },
+                },
+                {
+                    "email": "refresh-next@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "refresh-owner@icloud.com",
+                    "remote_metadata": {
+                        "hme": "refresh-next@icloud.com",
+                        "anonymousId": "refresh-next-remote-secret",
+                    },
+                },
+            ],
+        )
+        owner = next(item for item in imported if item["role"] == "team_owner")
+        children = [
+            item for item in imported if item["role"] == "rotating_child"
+        ]
+        workspace = self.database.create_workspace(
+            name="Refresh Team",
+            workspace_uid="refresh-team-workspace",
+            owner_alias_id=owner["id"],
+            current_account_id=children[0]["account_id"],
+            next_account_id=children[1]["account_id"],
+        )
+        run = self.queue.enqueue([workspace["id"]])[0]
+        claimed = self.database.claim_next_queue_item()
+        self.assertEqual(claimed["run_id"], run["id"])
+        self.database.fail_run(run["id"], "registrar registration failed")
+        return (
+            self.database.get_workspace(workspace["id"]),
+            self.database.get_account(children[1]["account_id"]),
+            self.database.get_run(run["id"]),
+        )
+
+    def write_sub2api_refresh_file(
+        self,
+        workspace,
+        account,
+        *,
+        access_token="pat-refresh-canary",
+        auth_mode="personalAccessToken",
+        workspace_uid=None,
+    ):
+        path = self.root / "refreshed-account.sub2api.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "exported_at": "2026-07-20T00:00:00.000Z",
+                    "proxies": [],
+                    "accounts": [
+                        {
+                            "platform": "openai",
+                            "type": "oauth",
+                            "credentials": {
+                                "access_token": access_token,
+                                "auth_mode": auth_mode,
+                                "chatgpt_account_id": (
+                                    workspace["workspace_uid"]
+                                    if workspace_uid is None
+                                    else workspace_uid
+                                ),
+                                "email": account["email"],
+                            },
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
 
     def legacy_fixture(self):
         config = self.root / "workflow.json"
@@ -1996,6 +2096,112 @@ class WebConsoleTests(unittest.TestCase):
         )
         self.assertNotIn("api-key-canary", response.text)
 
+    def test_refresh_imported_child_verifies_local_json_and_retries_failed_run(self):
+        workspace, account, run = self.failed_icloud_handoff()
+        before_credentials = self.database.get_account_credentials(account["id"])
+        path = self.write_sub2api_refresh_file(workspace, account)
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as test_client:
+            response = test_client.post(
+                f"/api/accounts/{account['id']}/refresh",
+                json={"path": str(path)},
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertTrue(response.json()["verified"])
+        self.assertEqual(response.json()["run"]["id"], run["id"])
+        self.assertEqual(self.database.get_run(run["id"])["state"], "queued")
+        self.assertEqual(
+            self.database.get_workspace(workspace["id"])["status"], "queued"
+        )
+        after_credentials = self.database.get_account_credentials(account["id"])
+        self.assertEqual(
+            {
+                key: value
+                for key, value in after_credentials.items()
+                if key != "registered_account"
+            },
+            before_credentials,
+        )
+        self.assertIs(after_credentials["registered_account"], True)
+        self.assertNotIn("pat-refresh-canary", response.text)
+        self.assertNotIn(str(path), response.text)
+
+    def test_refresh_imported_child_rejects_wrong_json_workspace_without_writes(self):
+        workspace, account, run = self.failed_icloud_handoff()
+        before_credentials = self.database.get_account_credentials(account["id"])
+        path = self.write_sub2api_refresh_file(
+            workspace,
+            account,
+            access_token="pat-wrong-workspace-canary",
+            workspace_uid="another-workspace",
+        )
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as test_client:
+            response = test_client.post(
+                f"/api/accounts/{account['id']}/refresh",
+                json={"path": str(path)},
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(
+            self.database.get_account_credentials(account["id"]),
+            before_credentials,
+        )
+        self.assertEqual(self.database.get_run(run["id"])["state"], "failed")
+        self.assertEqual(
+            self.database.get_workspace(workspace["id"])["status"], "failed"
+        )
+        self.assertNotIn("pat-wrong-workspace-canary", response.text)
+
+    def test_refresh_imported_child_requires_personal_access_token(self):
+        workspace, account, run = self.failed_icloud_handoff()
+        before_credentials = self.database.get_account_credentials(account["id"])
+        path = self.write_sub2api_refresh_file(
+            workspace,
+            account,
+            access_token="oauth-token-canary",
+            auth_mode="oauth",
+        )
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as test_client:
+            response = test_client.post(
+                f"/api/accounts/{account['id']}/refresh",
+                json={"path": str(path)},
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(
+            self.database.get_account_credentials(account["id"]),
+            before_credentials,
+        )
+        self.assertEqual(self.database.get_run(run["id"])["state"], "failed")
+        self.assertNotIn("oauth-token-canary", response.text)
+
+    def test_refresh_imported_child_rejects_non_icloud_account(self):
+        workspace, _current, next_account = self.workspace("refresh-regular")
+        run = self.queue.enqueue([workspace["id"]])[0]
+        self.database.claim_next_queue_item()
+        self.database.fail_run(run["id"], "failed")
+        before_credentials = self.database.get_account_credentials(next_account["id"])
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as test_client:
+            response = test_client.post(
+                f"/api/accounts/{next_account['id']}/refresh",
+                json={"path": str(self.root / "unused.json")},
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(
+            self.database.get_account_credentials(next_account["id"]),
+            before_credentials,
+        )
+        self.assertEqual(self.database.get_run(run["id"])["state"], "failed")
+
     def test_static_traversal_and_legacy_config_routes_are_absent(self):
         app = create_app(self.controller, testing=True)
         with TestClient(app) as client:
@@ -2031,6 +2237,8 @@ class WebConsoleTests(unittest.TestCase):
         self.assertIn('id="icloud-team-workspace-status"', index.text)
         self.assertIn('name="workspace_uid" type="text" maxlength="500" readonly', index.text)
         self.assertIn('/api/sub2api/groups', script.text)
+        self.assertIn('refresh-imported-child', script.text)
+        self.assertIn('/api/accounts/${encodeURIComponent(id)}/refresh', script.text)
         self.assertIn('/api/icloud-teams/workspace/lookup', script.text)
         self.assertIn('submit.textContent = workspaceUid ? "导入 Team" : "识别并导入"', script.text)
         self.assertIn('form.id === "icloud-sync-form"', script.text)

@@ -1267,6 +1267,12 @@ class DatabaseTests(unittest.TestCase):
 
     def test_success_rotation_is_atomic_and_idempotent(self):
         workspace, current, next_account = self.create_workspace("success")
+        self.database.set_account_browser_session(
+            current["id"], "old-browser-cookie-secret"
+        )
+        self.database.set_account_browser_session(
+            next_account["id"], "new-browser-cookie-secret"
+        )
         run = self.database.enqueue_workspace(workspace["id"])
         self.database.claim_next_queue_item()
 
@@ -1282,6 +1288,18 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.get_workspace(workspace["id"])["rotation_count"], 1)
         self.assertEqual(self.database.get_account(current["id"])["status"], "exited_pending")
         self.assertEqual(self.database.get_account(next_account["id"])["status"], "bound_current")
+        self.assertNotIn(
+            "browser_session_token",
+            self.database.get_account_credentials(current["id"]),
+        )
+        self.assertEqual(
+            self.database.get_account_credentials(next_account["id"])[
+                "browser_session_token"
+            ],
+            "new-browser-cookie-secret",
+        )
+        self.assert_secret_absent_from_database_files("old-browser-cookie-secret")
+        self.assert_secret_absent_from_database_files("new-browser-cookie-secret")
         self.assertEqual(self.database.list_queue(), [])
         self.assertEqual(
             self.database.transition_account_status(current["id"], "available")["status"],

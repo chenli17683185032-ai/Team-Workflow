@@ -927,7 +927,13 @@ input[readonly] {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 4px;
+}
+
+.row-actions > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .text-action {

@@ -188,6 +188,7 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
         "recipientmailid",
         "session_token",
         "sessiontoken",
+        "browser_session_token",
         "access_token",
         "accesstoken",
         "members",
@@ -348,6 +349,10 @@ class AccountStatusRequest(StrictModel):
 
 class AccountProxyRequest(StrictModel):
     proxy: str = Field(default="", max_length=4096)
+
+
+class AccountRefreshRequest(StrictModel):
+    path: str = Field(min_length=1)
 
 
 class ICloudMailboxCreateRequest(StrictModel):
@@ -981,6 +986,149 @@ class WebConsoleController:
         )
         self.task_queue.notify_change()
         return _safe_payload(account)
+
+    def _sub2api_client(self) -> Sub2APIClient:
+        base_url = str(
+            self.database.get_text_setting(
+                "sub2api_base_url", "https://sub2api.example.com"
+            )
+            or ""
+        ).strip()
+        email = str(
+            self.database.get_text_setting("sub2api_email", "") or ""
+        ).strip()
+        password_blob = self.database.get_secret_setting("sub2api_password")
+        password = "" if password_blob is None else password_blob.decode("utf-8")
+        api_key_blob = self.database.get_secret_setting("sub2api_api_key")
+        api_key = "" if api_key_blob is None else api_key_blob.decode("utf-8")
+        totp_blob = self.database.get_secret_setting("sub2api_totp_secret")
+        totp_secret = "" if totp_blob is None else totp_blob.decode("utf-8")
+        if not base_url or (not api_key and (not email or not password)):
+            raise FieldInputError(
+                {
+                    "sub2api": (
+                        "service URL and either administrator API key or "
+                        "administrator email and password are required"
+                    )
+                }
+            )
+        options: dict[str, str] = {}
+        if api_key:
+            options["api_key"] = api_key
+        if totp_secret:
+            options["totp_secret"] = totp_secret
+        return Sub2APIClient(base_url, email, password, **options)
+
+    def refresh_imported_child(
+        self, account_id: str, path: str | Path
+    ) -> dict[str, Any]:
+        account = self.database.get_account(str(account_id))
+        if (
+            account.get("source") != "icloud_hme"
+            or account.get("icloud_role") != "rotating_child"
+            or account.get("status") != "bound_next"
+        ):
+            raise StateConflictError(
+                "only a failed workspace iCloud next child can be refreshed"
+            )
+        workspace = next(
+            (
+                item
+                for item in self.database.list_workspaces()
+                if item.get("next_account_id") == account["id"]
+            ),
+            None,
+        )
+        if (
+            workspace is None
+            or workspace.get("status") != "failed"
+            or not workspace.get("last_run_id")
+        ):
+            raise StateConflictError(
+                "account is not the next child of a failed workspace"
+            )
+        run = self.database.get_run(str(workspace["last_run_id"]))
+        if (
+            run.get("state") != "failed"
+            or run.get("next_account_id") != account["id"]
+        ):
+            raise StateConflictError("failed run no longer matches this child")
+
+        source = Path(path).expanduser().resolve()
+        if source.suffix.casefold() != ".json":
+            raise FieldInputError({"path": "select a Sub2API JSON file"})
+        try:
+            file_size = source.stat().st_size
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise FieldInputError({"path": "selected JSON file cannot be read"}) from exc
+        if not source.is_file():
+            raise FieldInputError({"path": "selected path is not a file"})
+        if file_size > 2 * 1024 * 1024:
+            raise FieldInputError({"path": "selected JSON file exceeds 2 MiB"})
+        try:
+            raw_document = source.read_bytes()
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise FieldInputError({"path": "selected JSON file cannot be read"}) from exc
+        if len(raw_document) > 2 * 1024 * 1024:
+            raise FieldInputError({"path": "selected JSON file exceeds 2 MiB"})
+        try:
+            document = json.loads(raw_document)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FieldInputError({"path": "selected file is not valid JSON"}) from exc
+        accounts = document.get("accounts") if isinstance(document, dict) else None
+        if not isinstance(accounts, list) or len(accounts) != 1:
+            raise FieldInputError(
+                {"path": "Sub2API JSON must contain exactly one account"}
+            )
+        imported = accounts[0]
+        credentials = (
+            imported.get("credentials") if isinstance(imported, dict) else None
+        )
+        if not isinstance(credentials, dict):
+            raise FieldInputError({"path": "Sub2API account credentials are invalid"})
+
+        expected_email = str(account["email"]).strip().casefold()
+        expected_workspace = str(workspace["workspace_uid"]).strip()
+        imported_email = str(credentials.get("email") or "").strip().casefold()
+        imported_workspace = str(
+            credentials.get("chatgpt_account_id") or ""
+        ).strip()
+        access_token = str(credentials.get("access_token") or "").strip()
+        auth_mode = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(
+                credentials.get("auth_mode")
+                or credentials.get("openai_auth_mode")
+                or ""
+            ).casefold(),
+        )
+        if (
+            str(imported.get("platform") or "").strip().casefold() != "openai"
+            or imported_email != expected_email
+            or imported_workspace != expected_workspace
+            or not access_token
+            or auth_mode != "personalaccesstoken"
+        ):
+            raise StateConflictError(
+                "selected Sub2API JSON does not match this child, Team workspace, and PAT"
+            )
+
+        retried = self.task_queue.retry_registered_account(
+            str(run["id"]), str(account["id"])
+        )
+        return _safe_payload(
+            {
+                "verified": True,
+                "account": self.database.get_account(str(account["id"])),
+                "workspace": self.database.get_workspace(str(workspace["id"])),
+                "run": retried,
+            }
+        )
 
     def _icloud_secret_from_payload(
         self,
@@ -2457,35 +2605,7 @@ class WebConsoleController:
         return {"values": values, "secrets": configured}
 
     def list_sub2api_groups(self) -> dict[str, Any]:
-        base_url = str(
-            self.database.get_text_setting(
-                "sub2api_base_url", "https://sub2api.example.com"
-            )
-            or ""
-        ).strip()
-        email = str(self.database.get_text_setting("sub2api_email", "") or "").strip()
-        password_blob = self.database.get_secret_setting("sub2api_password")
-        password = "" if password_blob is None else password_blob.decode("utf-8")
-        api_key_blob = self.database.get_secret_setting("sub2api_api_key")
-        api_key = "" if api_key_blob is None else api_key_blob.decode("utf-8")
-        totp_blob = self.database.get_secret_setting("sub2api_totp_secret")
-        totp_secret = "" if totp_blob is None else totp_blob.decode("utf-8")
-        if not base_url or (not api_key and (not email or not password)):
-            raise FieldInputError(
-                {
-                    "sub2api": (
-                        "service URL and either administrator API key or "
-                        "administrator email and password are required"
-                    )
-                }
-            )
-
-        client_options = {}
-        if api_key:
-            client_options["api_key"] = api_key
-        if totp_secret:
-            client_options["totp_secret"] = totp_secret
-        with Sub2APIClient(base_url, email, password, **client_options) as client:
+        with self._sub2api_client() as client:
             remote_groups = client.list_groups(include_inactive=True)
         groups = []
         for item in remote_groups:
@@ -2671,8 +2791,10 @@ class WebConsoleController:
         return _safe_payload(result)
 
     def choose_path(self, kind: str, current: str = "") -> dict[str, str]:
-        if kind not in {"txt", "directory", "backup"}:
-            raise FieldInputError({"kind": "supported values are txt, directory, backup"})
+        if kind not in {"txt", "json", "directory", "backup"}:
+            raise FieldInputError(
+                {"kind": "supported values are txt, json, directory, backup"}
+            )
         with self._dialog_lock:
             selected = _choose_path(kind, current)
         return {"path": selected}
@@ -2738,11 +2860,12 @@ def _choose_path(kind: str, current: str) -> str:
                 )
                 or ""
             )
-        filetypes = (
-            (("加密备份", "*.twbackup"), ("全部文件", "*.*"))
-            if kind == "backup"
-            else (("文本文件", "*.txt"), ("全部文件", "*.*"))
-        )
+        if kind == "backup":
+            filetypes = (("加密备份", "*.twbackup"), ("全部文件", "*.*"))
+        elif kind == "json":
+            filetypes = (("JSON 文件", "*.json"), ("全部文件", "*.*"))
+        else:
+            filetypes = (("文本文件", "*.txt"), ("全部文件", "*.*"))
         return str(
             filedialog.askopenfilename(
                 parent=root,
@@ -2967,6 +3090,14 @@ def create_app(
     async def update_account_proxy(account_id: str, request: AccountProxyRequest):
         return await _call_controller(
             controller.update_account_proxy, account_id, request.proxy
+        )
+
+    @app.post("/api/accounts/{account_id}/refresh", status_code=status.HTTP_202_ACCEPTED)
+    async def refresh_imported_child(
+        account_id: str, request: AccountRefreshRequest
+    ):
+        return await _call_controller(
+            controller.refresh_imported_child, account_id, request.path
         )
 
     @app.get("/api/icloud-mailboxes")

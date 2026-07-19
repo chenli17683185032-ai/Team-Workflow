@@ -101,6 +101,11 @@ class WorkflowConfig:
     sub2api_concurrency: int = 10
     sub2api_priority: int = 1
     sub2api_group_id: int | None = None
+    new_account_registered: bool = False
+    old_session_token: str = ""
+    persist_old_session: Callable[[str], Any] | None = None
+    clear_old_session: Callable[[], Any] | None = None
+    persist_new_session: Callable[[str], Any] | None = None
 
 
 class CheckpointStore(Protocol):
@@ -630,6 +635,25 @@ class WorkflowRunner:
         role = "old" if step in {"old_login", "owner_login"} else "new"
         mailbox = self._mailboxes.get(f"{role}_login")
         network = self._networks[role]
+        if step == "old_login" and self.config.old_session_token:
+            self._log("[session] reuse saved child browser cookie")
+            try:
+                session = self._chatgpt_clients[role].refresh_session(
+                    self.config.old_session_token,
+                    account_id=self.config.workspace_id if select_workspace else None,
+                )
+                self._validate_login_session(spec, session)
+            except Exception:
+                self._check_cancel()
+                if self.config.clear_old_session is not None:
+                    self.config.clear_old_session()
+                self._log("[session] saved child browser cookie expired; fallback to OTP login")
+            else:
+                context = AuthContext.from_mapping(session)
+                if self.config.persist_old_session is not None:
+                    self.config.persist_old_session(context.session_token)
+                self.state.set(step, session)
+                return dict(session)
         action = "register" if step == "new_login" else "login"
         self._log(f"[{action}] {spec.email}")
         login_kwargs: dict[str, Any] = {
@@ -655,6 +679,7 @@ class WorkflowRunner:
                 if step == "new_login"
                 and mailbox is not None
                 and mailbox.provider == "icloud_hme_imap"
+                and not self.config.new_account_registered
                 else None
             )
             if not callable(operation):
@@ -677,6 +702,13 @@ class WorkflowRunner:
         if not isinstance(session, Mapping):
             raise RuntimeError("login result is not an object")
         self._validate_login_session(spec, session)
+        if (
+            step in {"new_login", "new_workspace_login"}
+            and self.config.persist_new_session is not None
+        ):
+            self.config.persist_new_session(
+                AuthContext.from_mapping(session).session_token
+            )
         self.state.set(step, session)
         return session
 

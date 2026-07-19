@@ -317,6 +317,11 @@ def make_workflow_config(
     sub2api_api_key="",
     sub2api_totp_secret="totp-secret",
     invite_settle_seconds=0,
+    new_account_registered=False,
+    old_session_token="",
+    persist_old_session=None,
+    clear_old_session=None,
+    persist_new_session=None,
 ):
     return WorkflowConfig(
         old_account=AccountSpec("main+2@example.com"),
@@ -338,6 +343,11 @@ def make_workflow_config(
         sub2api_api_key=sub2api_api_key,
         sub2api_totp_secret=sub2api_totp_secret,
         sub2api_push=sub2api_push,
+        new_account_registered=new_account_registered,
+        old_session_token=old_session_token,
+        persist_old_session=persist_old_session,
+        clear_old_session=clear_old_session,
+        persist_new_session=persist_new_session,
     )
 
 
@@ -514,6 +524,85 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(timeline.index(leave), timeline.index(new_login))
         self.assertLess(timeline.index(new_login), timeline.index(new_workspace))
 
+    def test_saved_child_browser_cookie_is_reused_and_new_cookie_is_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_sessions = []
+            new_sessions = []
+            cleared = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                old_session_token="old-browser-cookie",
+                persist_old_session=old_sessions.append,
+                clear_old_session=lambda: cleared.append(True),
+                persist_new_session=new_sessions.append,
+            )
+            registrar = FakeRegistrar()
+            chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+
+            WorkflowRunner(
+                config,
+                **run_dependencies(config),
+                registrar=registrar,
+                chatgpt=chatgpt,
+                verbose=False,
+            ).run()
+
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.new_account.email],
+        )
+        self.assertIn(
+            ("refresh", "old-browser-cookie", config.workspace_id),
+            chatgpt.calls,
+        )
+        self.assertEqual(old_sessions, ["old-workspace-session"])
+        self.assertEqual(new_sessions, ["new-login-session"])
+        self.assertEqual(cleared, [])
+
+    def test_expired_child_browser_cookie_clears_and_falls_back_to_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cleared = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                old_session_token="old-expired-cookie",
+                clear_old_session=lambda: cleared.append(True),
+            )
+
+            class ExpiringChatGPT(FakeChatGPT):
+                def refresh_session(self, session_token, account_id=None):
+                    if session_token == "old-expired-cookie":
+                        raise ChatGPTApiError("expired", status_code=401)
+                    return super().refresh_session(
+                        session_token, account_id=account_id
+                    )
+
+            registrar = FakeRegistrar()
+            WorkflowRunner(
+                config,
+                **run_dependencies(config),
+                registrar=registrar,
+                chatgpt=ExpiringChatGPT(
+                    config.workspace_id,
+                    config.old_account.email,
+                    config.new_account.email,
+                ),
+                verbose=False,
+            ).run()
+
+        self.assertEqual(cleared, [True])
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email, config.new_account.email],
+        )
+
     def test_new_account_uses_registration_when_adapter_supports_it(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_workflow_config(
@@ -563,6 +652,55 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             [email for email, _proxy in registrar.calls],
             [config.old_account.email],
+        )
+
+    def test_registered_icloud_new_account_uses_existing_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                new_account_registered=True,
+            )
+
+            class RegisteringRegistrar(FakeRegistrar):
+                def __init__(self):
+                    super().__init__()
+                    self.registered = []
+
+                def register(self, **kwargs):
+                    self.registered.append(kwargs["email"])
+                    return super().login(**kwargs)
+
+            registrar = RegisteringRegistrar()
+            dependencies = run_dependencies(config)
+            dependencies["new_mailbox"] = MailboxCredentials(
+                primary_email="forwarding@example.com",
+                registration_email=config.new_account.email,
+                client_id="",
+                refresh_token="",
+                provider="icloud_hme_imap",
+                forwarding_email="forwarding@example.com",
+                imap_host="imap.example.com",
+                imap_username="forwarding@example.com",
+                imap_password="imap-secret",
+            )
+            WorkflowRunner(
+                config,
+                **dependencies,
+                registrar=registrar,
+                chatgpt=FakeChatGPT(
+                    config.workspace_id,
+                    config.old_account.email,
+                    config.new_account.email,
+                ),
+                verbose=False,
+            ).run()
+
+        self.assertEqual(registrar.registered, [])
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email, config.new_account.email],
         )
 
     def test_existing_non_icloud_new_account_still_uses_login(self):

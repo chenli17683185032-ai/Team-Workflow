@@ -3192,6 +3192,64 @@ class Database:
             if cursor.rowcount != 1:
                 raise NotFoundError("account not found")
 
+    def _update_account_credentials_tx(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        *,
+        updates: Mapping[str, Any] | None = None,
+        remove: Iterable[str] = (),
+        timestamp: str | None = None,
+    ) -> bool:
+        row = connection.execute(
+            "SELECT credential_blob FROM accounts WHERE id = ?", (account_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("account not found")
+        purpose = f"account:{account_id}:credentials"
+        plaintext = self._require_secret_store().decrypt(
+            bytes(row["credential_blob"]), purpose
+        )
+        try:
+            credentials = json.loads(plaintext.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DatabaseError("account credentials are invalid") from exc
+        if not isinstance(credentials, dict):
+            raise DatabaseError("account credentials are invalid")
+        candidate = dict(credentials)
+        candidate.update(dict(updates or {}))
+        for key in remove:
+            candidate.pop(str(key), None)
+        if candidate == credentials:
+            return False
+        ciphertext = self._require_secret_store().encrypt(
+            _json_bytes(candidate), purpose
+        )
+        connection.execute(
+            "UPDATE accounts SET credential_blob = ?, updated_at = ? WHERE id = ?",
+            (sqlite3.Binary(ciphertext), timestamp or _now(), account_id),
+        )
+        return True
+
+    def set_account_browser_session(
+        self, account_id: str, session_token: str
+    ) -> None:
+        token = _required_text(session_token, "session_token")
+        with self._write_transaction() as connection:
+            self._update_account_credentials_tx(
+                connection,
+                str(account_id),
+                updates={"browser_session_token": token},
+            )
+
+    def clear_account_browser_session(self, account_id: str) -> None:
+        with self._write_transaction() as connection:
+            self._update_account_credentials_tx(
+                connection,
+                str(account_id),
+                remove=("browser_session_token",),
+            )
+
     def _decode_account_network_identity(
         self,
         account_id: str,
@@ -4398,7 +4456,12 @@ class Database:
                 recovered.append(run_id)
         return recovered
 
-    def retry_run(self, run_id: str) -> dict[str, Any]:
+    def retry_run(
+        self,
+        run_id: str,
+        *,
+        registered_account_id: str | None = None,
+    ) -> dict[str, Any]:
         timestamp = _now()
         with self._write_transaction() as connection:
             run = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -4423,6 +4486,49 @@ class Database:
                 (run["workspace_id"],),
             ).fetchone() is not None:
                 raise StateConflictError("workspace already has an active queue item")
+            if registered_account_id is not None:
+                account_id = _required_text(
+                    registered_account_id, "registered_account_id"
+                )
+                if account_id != str(run["next_account_id"]):
+                    raise StateConflictError(
+                        "registered account does not match the run next account"
+                    )
+                account = connection.execute(
+                    """
+                    SELECT account.credential_blob, account.status, account.source,
+                           alias.role AS icloud_role
+                    FROM accounts AS account
+                    LEFT JOIN icloud_aliases AS alias
+                      ON alias.account_id = account.id
+                    WHERE account.id = ?
+                    """,
+                    (account_id,),
+                ).fetchone()
+                if (
+                    account is None
+                    or str(account["status"]) != "bound_next"
+                    or str(account["source"]) != "icloud_hme"
+                    or str(account["icloud_role"] or "") != "rotating_child"
+                ):
+                    raise StateConflictError(
+                        "only the failed run iCloud next child can be refreshed"
+                    )
+                plaintext = self._require_secret_store().decrypt(
+                    bytes(account["credential_blob"]),
+                    f"account:{account_id}:credentials",
+                )
+                try:
+                    credentials = json.loads(plaintext.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise DatabaseError("account credentials are invalid") from exc
+                if not isinstance(credentials, dict):
+                    raise DatabaseError("account credentials are invalid")
+                credentials["registered_account"] = True
+                credential_blob = self._require_secret_store().encrypt(
+                    _json_bytes(credentials),
+                    f"account:{account_id}:credentials",
+                )
             position = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM queue_items WHERE state IN ('pending', 'running')"
@@ -4444,6 +4550,14 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise StateConflictError("failed queue item is missing")
+            if registered_account_id is not None:
+                connection.execute(
+                    """
+                    UPDATE accounts SET credential_blob = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (sqlite3.Binary(credential_blob), timestamp, account_id),
+                )
             connection.execute(
                 "UPDATE workspaces SET status = 'queued', version = version + 1, updated_at = ? WHERE id = ?",
                 (timestamp, run["workspace_id"]),
@@ -4538,6 +4652,12 @@ class Database:
                     raise StateConflictError(
                         "workspace child accounts no longer match their Team owner"
                     )
+            self._update_account_credentials_tx(
+                connection,
+                str(run["current_account_id"]),
+                remove=("browser_session_token",),
+                timestamp=timestamp,
+            )
             connection.execute(
                 "UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?",
                 (

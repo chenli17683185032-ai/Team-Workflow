@@ -875,8 +875,16 @@ function renderAccountTable() {
       row.append(labeledCell("来源", sourceLabel));
       row.append(labeledCell("更新时间", formatDate(firstValue(account, ["updated_at", "created_at"]))));
       const actions = element("div", {className: "row-actions"});
-      if (status !== "used") actions.append(actionButton("代理", "open-account-proxy", {accountId: id}));
       const binding = accountBinding(account);
+      if (
+        source === "icloud_hme"
+        && safeString(account.icloud_role) === "rotating_child"
+        && rawStatus === "bound_next"
+        && safeString(binding?.workspace?.status) === "failed"
+      ) {
+        actions.append(actionButton("刷新", "refresh-imported-child", {accountId: id}));
+      }
+      if (status !== "used") actions.append(actionButton("代理", "open-account-proxy", {accountId: id}));
       if (binding && ["bound_current", "bound_next"].includes(rawStatus)) {
         actions.append(actionButton("不可用", "invalidate-bound-account", {
           accountId: id,
@@ -2741,6 +2749,18 @@ async function retryWorkspace(id) {
   showToast("重试任务已加入队列", "success");
 }
 
+async function refreshImportedChild(id) {
+  if (!ensureMutable()) return;
+  const path = await chooseLocalPath("json", "");
+  if (!path) return;
+  await api(`/api/accounts/${encodeURIComponent(id)}/refresh`, {
+    method: "POST",
+    body: {path},
+  });
+  await refreshResources(["accounts", "workspaces", "runs", "queue"]);
+  showToast("已确认新 token，失败任务已重新入队", "success");
+}
+
 async function updateAccountStatus(id, nextStatus) {
   if (!ensureMutable()) return;
   if (nextStatus === "retired" && !window.confirm("退役后该账号不会再用于空间绑定。确认继续？")) return;
@@ -3717,6 +3737,7 @@ document.addEventListener("click", (event) => {
     }
     if (action === "enqueue-selected") return enqueueSelected();
     if (action === "retry-workspace") return retryWorkspace(button.dataset.workspaceId);
+    if (action === "refresh-imported-child") return refreshImportedChild(button.dataset.accountId);
     if (action === "open-run-detail") return openRunDetail(button.dataset.runId);
     if (action === "set-account-status") return updateAccountStatus(button.dataset.accountId, button.dataset.status);
     if (action === "account-page-prev") return changeAccountPage(-1);
