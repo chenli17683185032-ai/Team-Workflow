@@ -1127,6 +1127,126 @@ class WebConsoleTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, serialized)
 
+    def test_icloud_team_workspace_lookup_uses_child_network_and_is_secret_safe(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        lookup_calls = []
+
+        class FakeWorkspaceLookup:
+            @staticmethod
+            def lookup(**kwargs):
+                lookup_calls.append(kwargs)
+                return {
+                    "workspace_uid": "looked-up-team",
+                    "member_count": 2,
+                    "verified": True,
+                    "session_token": "must-not-leak-session",
+                    "access_token": "must-not-leak-access",
+                    "members": ["must-not-leak-member"],
+                }
+
+        self.controller.workspace_lookup_service = FakeWorkspaceLookup()
+        request = {
+            "mailbox_id": profile["id"],
+            "owner_email": "lookup-owner@icloud.com",
+            "current_child_email": "lookup-child@icloud.com",
+            "owner_proxy_mode": "lokiproxy_generator",
+            "owner_proxy_source_url": (
+                "socks5://lookup-user:lookup-proxy-secret@proxy.invalid:1080"
+            ),
+            "owner_proxy_bootstrap": "http://127.0.0.1:7897",
+        }
+        app = create_app(self.controller, testing=True)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/icloud-teams/workspace/lookup",
+                json=request,
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json(),
+            {
+                "workspace_uid": "looked-up-team",
+                "member_count": 2,
+                "verified": True,
+            },
+        )
+        self.assertEqual(len(lookup_calls), 1)
+        self.assertEqual(lookup_calls[0]["owner_email"], "lookup-owner@icloud.com")
+        self.assertEqual(lookup_calls[0]["child_email"], "lookup-child@icloud.com")
+        self.assertEqual(lookup_calls[0]["proxy_mode"], "lokiproxy_generator")
+        self.assertIn("imap", lookup_calls[0]["mailbox_secret"])
+        for secret in (
+            "lookup-proxy-secret",
+            "imap-password-secret",
+            "must-not-leak-session",
+            "must-not-leak-access",
+            "must-not-leak-member",
+        ):
+            self.assertNotIn(secret, response.text)
+
+    def test_icloud_team_workspace_lookup_reuses_existing_binding_without_login(self):
+        profile = self.controller.create_icloud_mailbox(self.icloud_payload())
+        self.database.set_icloud_mailbox_status(profile["id"], "ready")
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "bound-owner@icloud.com",
+                    "role": "team_owner",
+                    "remote_metadata": {
+                        "hme": "bound-owner@icloud.com",
+                        "anonymousId": "bound-owner-remote",
+                    },
+                    "owner_proxy": "socks5://bound.invalid:1080",
+                },
+                {
+                    "email": "bound-child@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "bound-owner@icloud.com",
+                    "remote_metadata": {
+                        "hme": "bound-child@icloud.com",
+                        "anonymousId": "bound-child-remote",
+                    },
+                },
+            ],
+        )
+        owner = next(item for item in imported if item["role"] == "team_owner")
+        child = next(item for item in imported if item["role"] == "rotating_child")
+        self.database.create_workspace(
+            name="Bound Team",
+            workspace_uid="bound-workspace-uid",
+            current_account_id=child["account_id"],
+            owner_alias_id=owner["id"],
+        )
+
+        class UnexpectedWorkspaceLookup:
+            @staticmethod
+            def lookup(**_kwargs):
+                raise AssertionError("existing Team lookup performed a live login")
+
+        self.controller.workspace_lookup_service = UnexpectedWorkspaceLookup()
+        result = self.controller.lookup_icloud_team_workspace(
+            {
+                "mailbox_id": profile["id"],
+                "owner_email": "bound-owner@icloud.com",
+                "current_child_email": "bound-child@icloud.com",
+            }
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "workspace_uid": "bound-workspace-uid",
+                "member_count": 2,
+                "verified": True,
+                "source": "existing",
+            },
+        )
+
     def test_icloud_team_import_reuses_existing_unbound_owner_and_child(self):
         profile = self.controller.create_icloud_mailbox(self.icloud_payload())
         self.database.set_icloud_mailbox_status(profile["id"], "ready")
@@ -1899,7 +2019,11 @@ class WebConsoleTests(unittest.TestCase):
         self.assertIn('<select name="sub2api_group_id">', index.text)
         self.assertIn('id="icloud-sync-form"', index.text)
         self.assertIn('id="icloud-owner-proxy-form"', index.text)
+        self.assertIn('id="icloud-team-workspace-status"', index.text)
+        self.assertIn('name="workspace_uid" type="text" maxlength="500" readonly', index.text)
         self.assertIn('/api/sub2api/groups', script.text)
+        self.assertIn('/api/icloud-teams/workspace/lookup', script.text)
+        self.assertIn('submit.textContent = workspaceUid ? "导入 Team" : "识别并导入"', script.text)
         self.assertIn('form.id === "icloud-sync-form"', script.text)
         self.assertIn('form.id === "icloud-owner-proxy-form"', script.text)
         self.assertIn('#icloud-sync-dialog', style.text)

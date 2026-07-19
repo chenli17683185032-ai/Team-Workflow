@@ -576,3 +576,76 @@
 - 2026-07-19：在 `1600x1000` 验证 7 列 Team 表、编辑配置、提拉确认和导入向导，在 `390x844` 验证页面宽度与操作按钮；无页面横向溢出或按钮重叠，模拟远端快照只用于前端只读 QA。
 - 2026-07-19：最终全量 282 项测试中 276 项通过，6 项 Windows DPAPI 按 macOS 平台跳过；JavaScript/Python 语法、diff 检查和高置信敏感信息扫描通过，LaunchAgent 已恢复固定 `http://127.0.0.1:8765/`。
 - 2026-07-19：主实现提交 `ece9c07` 已推送 GitHub `main`；真实数据库、备份、运行产物和凭据均保持在忽略的本地目录，未进入提交。
+
+### 节点 N：iCloud Team Workspace 自动识别（进行中）
+
+#### N.1 现状与目标
+
+导入 iCloud Team 时，前端把 `Workspace ID` 作为人工必填项；本地其实已经具备当前子号 OTP 登录、Session 交换和成员只读接口，却没有把这些测量组合成导入前的闭环。结果是母号与子号都已选中时，提交按钮仍因未知 Workspace ID 被锁死。
+
+目标是把 Workspace ID 从人工配置改为系统测量值：当前子号只读登录后枚举可访问 Team，对每个候选读取成员，只接受“所选母号与当前子号同时存在、成员总数恰好为 2、列表完整”的唯一候选。识别成功后才能继续本地导入；零匹配、多匹配、超员、成员列表不完整或网络身份不一致均停止，不猜测、不复用其他组 ID。
+
+性能与安全指标：
+
+- 正常导入只需选择母号、当前子号和该组代理；提交时自动识别 Workspace ID 并继续原有幂等导入。
+- 识别只允许登录、Session 刷新和成员读取，不调用邀请、退出、删除成员、创建 Alias、创建 PAT 或账号注册。
+- 当前子号登录继续使用 `本机 Clash -> 该组 LokiProxy -> OpenAI`；IMAP 只使用本地资源池当前配置，不使用项目历史或作者遗留凭据。
+- 远端必须恰好 2 名活跃成员且身份完整；任何不确定性均在本地导入前失败。
+- Session、Access Token、代理凭据、Workspace 候选和成员明细不落库、不进入 API 响应、普通日志或 DOM；响应只返回最终唯一 Workspace ID 与人数校验摘要。
+- 已存在且身份一致的本地 Team 直接返回既有 Workspace ID，不重复登录；并发 iCloud 写操作或识别操作保持串行。
+
+#### N.2 GitHub 与既有实现经验
+
+- `gtxx3600/GPTSession2CPAandSub2API` 提交 `a097eb1`：从 `account.id / account_id / chatgpt_account_id`、JWT auth claim 和 `workspace_id` 多种兼容位置提取账号与 Workspace 身份。本项目采用相同的结构化候选提取思路，但不把 Token 或候选明细导出。
+- `Redmig110/Team-Workflow` 及当前分支已有 `AuthContext`、`refresh_session(exchange_workspace_token)` 和 Team 成员读取；本节点复用现有登录与 API 执行器，不另造 OpenAI 协议。
+- 当前组 1 实测闭环：`组1-8` 经共享 Clash 和组 1 LokiProxy 登录后只暴露 1 个 Team 候选，成员读取唯一匹配所选母号与子号，随后本地导入成功；这条已验证路径作为最小充分模型，先固化再扩展兼容字段。
+
+#### N.3 最小充分闭环
+
+```text
+选择 iCloud 资源池、母号、当前子号和子号链路
+    -> 提交导入
+    -> Workspace ID 为空：只读登录当前子号
+    -> 刷新 Session 并提取可访问 Team 候选
+    -> 对候选逐一交换 Workspace Session、读取成员
+    -> 列表完整、active = 2、母号存在、当前子号存在
+    -> 唯一匹配：只返回 Workspace ID + member_count=2
+    -> 服务端按原有远端 Alias 校验与幂等事务执行本地导入
+    -> 主表出现母号、当前子号与已配置链路
+
+任一测量失败或匹配数 != 1
+    -> 停止在导入前
+    -> 不写 Workspace、不接管新 Alias、不改变 Team 成员
+```
+
+控制对象是本地 Team 绑定，测量对象是当前子号可见的远端 Team 成员事实；控制器是唯一匹配规则，执行器仅在反馈稳定后调用既有本地导入。网络时延、OTP 延迟、Session 字段变化、多 Workspace、成员并发变化和代理失效均作为扰动处理，稳定性优先于自动完成。
+
+#### N.4 实施节点
+
+- [x] 新增独立只读 Workspace 识别服务：构造 iCloud IMAP 登录、复用当前代理链、提取候选、交换 Session、校验恰好两人并返回唯一匹配。
+- [x] 新增本地识别 API 与控制器校验；已绑定 Team 幂等返回，未绑定时串行执行远端测量，所有错误脱敏。
+- [x] 修改导入表单：Workspace ID 改为系统识别结果；其为空时提交自动先识别、回填，再调用既有导入 API，期间显示明确忙碌状态且防止重复提交。
+- [x] 覆盖唯一匹配、零匹配、多匹配、超员、成员列表不完整、身份错配、代理链清理、已绑定短路和响应脱敏测试。
+- [x] 完成 Python/JavaScript 语法、聚焦与全量测试、敏感扫描；更新 README 与 CHANGELOG。
+- [x] 重启 LaunchAgent，并在桌面与移动端验证自动识别、错误反馈、按钮状态和无横向溢出。
+- [ ] 提交并推送 GitHub `main`，确认本地与远端一致，清理临时查询文件与测试产物。
+
+#### N.5 验收场景
+
+1. 未填写 Workspace ID，所选当前子号只有一个 Team 且远端恰好为母号与子号两人：一次提交自动识别并完成导入。
+2. 候选 Team 不含母号或当前子号：返回可操作错误，本地不创建 Workspace。
+3. 匹配 Team 有 3 人、服务端 `total` 大于返回列表或存在两个身份相同的匹配候选：识别失败，不继续导入。
+4. 已导入且母号/子号身份一致：直接返回既有 Workspace ID，不发送 OTP、不访问 OpenAI。
+5. LokiProxy 模式始终经过统一 Clash 前置；识别结束或失败后临时 Relay 停止，不残留监听端口。
+6. API 和前端只显示“已识别、2 人校验通过”或脱敏错误，不出现 Session、Token、代理、候选 ID、成员邮箱列表。
+7. 正常换班和提拉测试保持原样通过，证明自动识别没有扩大母号权限或改变 Team 写操作顺序。
+
+#### N.6 实施记录
+
+- 2026-07-19：使用正式组 1 配置完成一次性只读识别；当前子号登录、1 个候选和唯一成员匹配成功，随后本地导入 `组 1 / 组1-8`。正式库现有 2 个 Team，活动队列为 0；本次未执行邀请、退出、成员删除、Alias 创建或换班。
+- 2026-07-19：新增 `WorkspaceLookupService` 与 `/api/icloud-teams/workspace/lookup`；识别服务不暴露 Team 写方法，临时 Relay 在成功和失败路径均停止，API 对额外注入的 Session、Access Token 与成员明细执行二次脱敏。
+- 2026-07-19：导入按钮不再依赖人工 Workspace ID；缺失时自动识别并要求 `verified=true / member_count=2` 后继续原导入。Workspace 字段改为只读反馈，切换资源池、母号或当前子号会清除旧测量值。
+- 2026-07-19：Workspace 识别与 Web 控制器聚焦 47 项测试通过，覆盖唯一匹配、三人超员、分页不完整、零匹配、多匹配、登录身份错配、已绑定短路及响应脱敏。
+- 2026-07-19：全量 290 项测试中 284 项通过，6 项 Windows DPAPI 按 macOS 平台跳过；Python compileall、JavaScript 语法、`git diff --check` 与高置信敏感扫描通过。扫描命中仅为测试假 Cookie 和生产代码中的 Session Cookie 模板，不含真实值。
+- 2026-07-19：LaunchAgent 重启后首次探测即恢复 HTTP `200`；正式库组 1 的识别 API 走已绑定短路并返回 `verified=true / member_count=2`，未发送新 OTP 或访问 Team 写接口。
+- 2026-07-19：Chrome 实机验收确认 `1600×1000` 宽屏导入侧栏和 `390×844` 移动端均无页面/面板横向溢出，Workspace 字段只读，提交文案为“识别并导入”，按钮与字段无重叠；验收后已恢复默认宽屏视口。

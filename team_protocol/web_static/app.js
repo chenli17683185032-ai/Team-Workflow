@@ -1152,6 +1152,7 @@ function renderIcloudTeamImportSnapshot() {
 
 function updateIcloudTeamImportSubmitState() {
   const form = icloudTeamImportForm();
+  const submit = byId("icloud-team-import-submit");
   const owner = selectedIcloudTeamImportAlias("owner_email");
   const direct = safeString(form.elements.namedItem("owner_proxy").value).trim();
   const source = safeString(form.elements.namedItem("owner_proxy_source_url").value).trim();
@@ -1162,14 +1163,23 @@ function updateIcloudTeamImportSubmitState() {
   byId("icloud-team-import-proxy-status").textContent = savedProxy
     ? (direct || source ? "将更新已保存链路" : "已配置，可留空复用")
     : proxyReady ? "待保存" : "未配置";
-  byId("icloud-team-import-submit").disabled = state.icloudTeamImportLoading || !(
+  const workspaceUid = safeString(form.elements.namedItem("workspace_uid").value).trim();
+  submit.disabled = state.icloudTeamImportLoading || !(
     safeString(form.elements.namedItem("name").value).trim()
-    && safeString(form.elements.namedItem("workspace_uid").value).trim()
     && safeString(form.elements.namedItem("mailbox_id").value)
     && safeString(form.elements.namedItem("owner_email").value)
     && safeString(form.elements.namedItem("current_child_email").value)
     && proxyReady
   );
+  if (!state.icloudTeamImportLoading) {
+    submit.textContent = workspaceUid ? "导入 Team" : "识别并导入";
+  }
+}
+
+function resetIcloudTeamWorkspaceLookup() {
+  const form = icloudTeamImportForm();
+  form.elements.namedItem("workspace_uid").value = "";
+  byId("icloud-team-workspace-status").textContent = "待识别";
 }
 
 async function openIcloudTeamImport(ownerId = "", {draft = null, autoLoad = false} = {}) {
@@ -1190,6 +1200,9 @@ async function openIcloudTeamImport(ownerId = "", {draft = null, autoLoad = fals
   const values = draft?.values || {};
   form.elements.namedItem("name").value = safeString(values.name || owner?.label || "");
   form.elements.namedItem("workspace_uid").value = safeString(values.workspace_uid);
+  byId("icloud-team-workspace-status").textContent = values.workspace_uid
+    ? "已识别 · 2 人"
+    : "待识别";
   renderIcloudTeamImportMailboxOptions(values.mailbox_id || owner?.mailbox_id || "");
   form.elements.namedItem("owner_proxy_bootstrap").value = safeString(
     values.owner_proxy_bootstrap,
@@ -1280,7 +1293,34 @@ async function handleIcloudTeamImport(form) {
       ? safeString(form.elements.namedItem("owner_proxy_bootstrap").value).trim()
       : "",
   };
+  state.icloudTeamImportLoading = true;
+  updateIcloudTeamImportSubmitState();
   try {
+    if (!body.workspace_uid) {
+      byId("icloud-team-workspace-status").textContent = "正在识别…";
+      byId("icloud-team-import-submit").textContent = "正在识别 Team…";
+      const lookup = await api("/api/icloud-teams/workspace/lookup", {
+        method: "POST",
+        body: {
+          mailbox_id: body.mailbox_id,
+          owner_email: body.owner_email,
+          current_child_email: body.current_child_email,
+          owner_proxy_mode: body.owner_proxy_mode,
+          owner_proxy: body.owner_proxy,
+          owner_proxy_source_url: body.owner_proxy_source_url,
+          owner_proxy_bootstrap: body.owner_proxy_bootstrap,
+        },
+        timeout: 180000,
+      });
+      const workspaceUid = safeString(lookup?.workspace_uid).trim();
+      if (!workspaceUid || lookup?.verified !== true || Number(lookup?.member_count) !== 2) {
+        throw new ApiError("Team 自动识别结果未通过两人校验", {code: "workspace_lookup_failed"});
+      }
+      body.workspace_uid = workspaceUid;
+      form.elements.namedItem("workspace_uid").value = workspaceUid;
+      byId("icloud-team-workspace-status").textContent = "已识别 · 2 人";
+      byId("icloud-team-import-submit").textContent = "正在导入…";
+    }
     const result = await api("/api/icloud-teams/import", {
       method: "POST",
       body,
@@ -1303,6 +1343,9 @@ async function handleIcloudTeamImport(form) {
     }
     fieldError("icloud-team-import-error", error?.message || String(error));
     throw error;
+  } finally {
+    state.icloudTeamImportLoading = false;
+    updateIcloudTeamImportSubmitState();
   }
 }
 
@@ -3827,6 +3870,7 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", (event) => {
   const target = event.target;
   if (target.name === "mailbox_id" && target.closest("#icloud-team-import-form")) {
+    resetIcloudTeamWorkspaceLookup();
     state.icloudTeamImportAliases = [];
     state.icloudTeamImportMailboxId = safeString(target.value);
     renderIcloudTeamImportSnapshot();
@@ -3834,8 +3878,10 @@ document.addEventListener("change", (event) => {
     byId("icloud-team-alias-count").textContent = "0 个";
     byId("icloud-team-import-status").textContent = "尚未读取";
   } else if (target.name === "owner_email" && target.closest("#icloud-team-import-form")) {
+    resetIcloudTeamWorkspaceLookup();
     renderIcloudTeamImportSelectors({preferredOwner: target.value});
   } else if (target.name === "current_child_email" && target.closest("#icloud-team-import-form")) {
+    resetIcloudTeamWorkspaceLookup();
     updateIcloudTeamImportSubmitState();
   } else if (target.matches("[data-workspace-select]")) {
     const id = target.dataset.workspaceSelect;

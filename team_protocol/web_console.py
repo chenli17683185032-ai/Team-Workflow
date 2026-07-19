@@ -84,6 +84,7 @@ from .proxy_chain import (
 )
 from .sub2api import Sub2APIClient, Sub2APIError
 from .task_queue import TaskQueue, redact_value
+from .workspace_lookup import WorkspaceLookupService
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "web_static"
@@ -182,6 +183,12 @@ _SENSITIVE_RESPONSE_KEYS = frozenset(
         "remote_metadata",
         "anonymousid",
         "recipientmailid",
+        "session_token",
+        "sessiontoken",
+        "access_token",
+        "accesstoken",
+        "members",
+        "workspace_candidates",
     }
 )
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -396,6 +403,16 @@ class ICloudTeamImportRequest(StrictModel):
     owner_proxy_bootstrap: str = Field(default="", max_length=4096)
 
 
+class ICloudTeamWorkspaceLookupRequest(StrictModel):
+    mailbox_id: str = Field(min_length=1)
+    owner_email: str = Field(min_length=3, max_length=320)
+    current_child_email: str = Field(min_length=3, max_length=320)
+    owner_proxy_mode: Literal["direct", "lokiproxy_generator"] | None = None
+    owner_proxy: str = Field(default="", max_length=4096)
+    owner_proxy_source_url: str = Field(default="", max_length=8192)
+    owner_proxy_bootstrap: str = Field(default="", max_length=4096)
+
+
 class ICloudOwnerProxyRequest(StrictModel):
     proxy: str = Field(default="", max_length=4096)
     mode: Literal["direct", "lokiproxy_generator"] = "direct"
@@ -484,6 +501,7 @@ class WebConsoleController:
         imap_checker: Any = check_imap_mailbox,
         proxy_chain_manager: Any | None = None,
         hme_capture_manager: Any | None = None,
+        workspace_lookup_service: Any | None = None,
         enable_proxy_chains: bool = True,
         console_port: int = 8765,
     ) -> None:
@@ -528,6 +546,9 @@ class WebConsoleController:
             on_session=self._save_captured_hme_session,
             on_status=self._publish_hme_capture_status,
             get_session_template=self._get_hme_session_template,
+        )
+        self.workspace_lookup_service = (
+            workspace_lookup_service or WorkspaceLookupService()
         )
         self._proxy_chain_startup_error: str | None = None
         self._icloud_operation_lock = threading.Lock()
@@ -1320,6 +1341,143 @@ class WebConsoleController:
                 "current_child": current_child,
             }
         )
+
+    def _icloud_team_lookup_proxy(
+        self,
+        payload: Mapping[str, Any],
+        existing_owner: Mapping[str, Any] | None,
+    ) -> dict[str, str]:
+        mode = str(payload.get("owner_proxy_mode") or "").strip()
+        direct_proxy = str(payload.get("owner_proxy") or "").strip()
+        source_url = str(payload.get("owner_proxy_source_url") or "").strip()
+        bootstrap = str(payload.get("owner_proxy_bootstrap") or "").strip()
+        if not mode and existing_owner is not None:
+            config = self.database.get_icloud_owner_proxy_config(
+                str(existing_owner["id"])
+            )
+            mode = str(config.get("mode") or "").strip()
+            direct_proxy = str(
+                config.get("proxy") or config.get("effective_proxy") or ""
+            ).strip()
+            source_url = str(config.get("source_url") or "").strip()
+            bootstrap = str(
+                config.get("bootstrap_proxy") or config.get("bootstrap") or ""
+            ).strip()
+        if mode == "direct":
+            if not direct_proxy:
+                raise FieldInputError(
+                    {"owner_proxy": "enter the Team child SOCKS5 proxy"}
+                )
+            try:
+                direct_proxy = validate_proxy_url(direct_proxy)
+            except ValueError as exc:
+                raise FieldInputError({"owner_proxy": str(exc)}) from exc
+        elif mode == "lokiproxy_generator":
+            bootstrap = bootstrap or self.local_clash_proxy
+            try:
+                source_url = validate_lokiproxy_source(source_url)
+                bootstrap = validate_bootstrap_proxy(bootstrap)
+            except ValueError as exc:
+                raise FieldInputError(
+                    {"owner_proxy_source_url": str(exc)}
+                ) from exc
+            if bootstrap != self.local_clash_proxy:
+                raise FieldInputError(
+                    {
+                        "owner_proxy_bootstrap": (
+                            "all Team LokiProxy chains must use the shared local Clash proxy"
+                        )
+                    }
+                )
+        else:
+            raise FieldInputError(
+                {"owner_proxy_mode": "configure the Team child proxy"}
+            )
+        return {
+            "mode": mode,
+            "proxy": direct_proxy,
+            "source_url": source_url,
+            "bootstrap_proxy": bootstrap,
+        }
+
+    def lookup_icloud_team_workspace(
+        self, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        mailbox_id = str(payload.get("mailbox_id") or "").strip()
+        owner_email = self._icloud_team_email(payload, "owner_email")
+        child_email = self._icloud_team_email(payload, "current_child_email")
+        if owner_email == child_email:
+            raise FieldInputError(
+                {"current_child_email": "current child must differ from Team owner"}
+            )
+
+        mailbox = self.database.get_icloud_mailbox(mailbox_id)
+        local_aliases = self.database.list_icloud_aliases(mailbox_id)
+        local_by_email = {
+            str(alias["email"]).casefold(): alias for alias in local_aliases
+        }
+        existing_owner = local_by_email.get(owner_email)
+        existing_child = local_by_email.get(child_email)
+        if existing_owner is not None and existing_owner.get("role") != "team_owner":
+            raise StateConflictError("selected Team owner is already imported as a child")
+        if existing_child is not None and existing_child.get("role") != "rotating_child":
+            raise StateConflictError("selected current child is already a Team owner")
+        if existing_owner is not None and existing_child is not None:
+            parent_id = str(existing_child.get("parent_owner_alias_id") or "")
+            if parent_id not in {"", str(existing_owner["id"])}:
+                raise StateConflictError(
+                    "selected current child belongs to another Team owner"
+                )
+
+        if existing_owner is not None:
+            existing_workspace = next(
+                (
+                    workspace
+                    for workspace in self.database.list_workspaces()
+                    if str(workspace.get("owner_alias_id") or "")
+                    == str(existing_owner["id"])
+                ),
+                None,
+            )
+            if existing_workspace is not None:
+                current = self.database.get_account(
+                    str(existing_workspace["current_account_id"])
+                )
+                if str(current["email"]).casefold() != child_email:
+                    raise StateConflictError(
+                        "selected Team owner is bound to another current child"
+                    )
+                return _safe_payload(
+                    {
+                        "workspace_uid": existing_workspace["workspace_uid"],
+                        "member_count": 2,
+                        "verified": True,
+                        "source": "existing",
+                    }
+                )
+
+        if mailbox["status"] != "ready":
+            raise StateConflictError(
+                "iCloud mailbox must pass detection before Team lookup"
+            )
+        network = self._icloud_team_lookup_proxy(payload, existing_owner)
+        mailbox_secret = self.database.get_icloud_mailbox_secrets(mailbox_id)
+        if not self._icloud_operation_lock.acquire(blocking=False):
+            raise StateConflictError("another iCloud mailbox operation is running")
+        try:
+            result = self.workspace_lookup_service.lookup(
+                mailbox=mailbox,
+                mailbox_secret=mailbox_secret,
+                owner_email=owner_email,
+                child_email=child_email,
+                proxy_mode=network["mode"],
+                proxy=network["proxy"],
+                source_url=network["source_url"],
+                bootstrap_proxy=network["bootstrap_proxy"],
+            )
+        finally:
+            self._icloud_operation_lock.release()
+        return _safe_payload(result)
 
     def import_icloud_team(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         mailbox_id = str(payload.get("mailbox_id") or "").strip()
@@ -2875,6 +3033,15 @@ def create_app(
     async def import_icloud_team(request: ICloudTeamImportRequest):
         return await _call_controller(
             controller.import_icloud_team,
+            request.model_dump(),
+        )
+
+    @app.post("/api/icloud-teams/workspace/lookup")
+    async def lookup_icloud_team_workspace(
+        request: ICloudTeamWorkspaceLookupRequest,
+    ):
+        return await _call_controller(
+            controller.lookup_icloud_team_workspace,
             request.model_dump(),
         )
 

@@ -230,12 +230,12 @@ socks5h://user-b:password-b@proxy-b.example:1080
 
 1. 首次使用时，在“账号库”的“iCloud 隐藏邮箱”中添加资源池，填写真实转发邮箱、IMAP 参数和可选的 HME / IMAP S5。HME Session 可通过“登录更新 HME”自动捕获，也可手动粘贴 cURL/HAR。
 2. 回到“空间任务”，点击“导入新母号”，选择 iCloud 资源池后点击“一键读取 iCloud”。Session 失效时会自动打开登录捕获，验证成功后回到同一导入向导。
-3. 从完整远端快照中选择一个 Team 母号和它当前的子号，再填写 Team 名称、真实 Workspace ID，以及该组的 LokiProxy 或固定 S5。提交只接管这两条 Alias，其他废 Alias 仍只展示。
+3. 从完整远端快照中选择一个 Team 母号和它当前的子号，再填写 Team 名称与该组的 LokiProxy 或固定 S5。提交时控制台用当前子号收取 OTP 并只读登录，自动识别同时包含母号与当前子号且恰好为 2 人的唯一 Team；校验通过后才接管这两条 Alias，其他废 Alias 仍只展示。Workspace ID、Session、Token 和成员明细不需要手填，也不会进入普通日志或页面。
 4. 正常轮换点击 Team 行的“一键换班”。控制台现场创建一个新 Alias，沿用当前子号标签的末尾编号递增，并严格执行“旧号登录 -> 校验成员并邀请 -> 旧号退出反馈 -> 新号注册入组 -> 两人复核 -> PAT / CPA / Sub2”。母号不会参与正常换班。
 5. 代理源或 Clash 前置异常时点击“编辑配置”。该入口只修改该母号名下的子号默认链路，不登录 Team、不邀请、不退出，也不改变成员。
 6. 只有当前子号已经故障时才点击“提拉”。母号会登录 Team，逐人清退除母号外的成员并逐次读取远端确认；只剩母号 1 人后才邀请并登录现场新建的子号，最终必须恰好为母号与新子号 2 人。
 7. 换班或提拉成功后，新子号晋升为当前子号，旧子号进入“已用完”池，空间重新回到无下一子号状态。下一次操作会再次现场创建一个新 Alias。
-8. 第二个母号重复同一导入流程，但必须填写它自己的真实 Workspace ID；控制台不会猜测或复用另一个 Team 的 ID。
+8. 第二个母号重复同一导入流程。控制台会用它所选的当前子号独立识别对应 Team；零匹配、多匹配、成员超员或列表不完整都会停止，不会猜测或复用另一个 Team 的 ID。
 
 本地直连测试只验证网络可达性，不会自动延长 Apple Session。Session 失效时，点击“登录更新 HME”重新登录即可自动捕获或验证最新会话，不必强行打开隐藏邮箱子页面；如果直连后仍立即失效，应优先检查 Apple 登录状态和 Cookie，而不是反复点击检测。
 
@@ -295,7 +295,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、正常子号换班、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 前置、固定/动态 LokiProxy 字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 282 项测试，其中 276 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、正常子号换班、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 前置、固定/动态 LokiProxy 字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 290 项测试，其中 284 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 
