@@ -178,6 +178,7 @@ const state = {
   migration: null,
   migrationBlocked: false,
   selectedWorkspaceIds: new Set(),
+  pendingAccountRefreshIds: new Set(),
   filters: {
     workspaceSearch: "",
     workspaceStatus: "all",
@@ -328,11 +329,21 @@ function asList(payload, keys = []) {
 }
 
 function normalizeQueue(payload) {
-  if (Array.isArray(payload)) return {items: payload, paused: false};
+  if (Array.isArray(payload)) return {items: payload, paused: false, credentialRefresh: null};
   const source = payload && typeof payload === "object" ? payload : {};
   return {
     items: asList(source, ["queue", "queue_items"]),
     paused: Boolean(firstValue(source, ["paused", "is_paused"], false)),
+    credentialRefresh: (
+      source.credential_refresh && typeof source.credential_refresh === "object"
+        ? source.credential_refresh
+        : null
+    ),
+    runOperation: (
+      source.run_operation && typeof source.run_operation === "object"
+        ? source.run_operation
+        : null
+    ),
   };
 }
 
@@ -876,13 +887,29 @@ function renderAccountTable() {
       row.append(labeledCell("更新时间", formatDate(firstValue(account, ["updated_at", "created_at"]))));
       const actions = element("div", {className: "row-actions"});
       const binding = accountBinding(account);
+      const refreshing = state.pendingAccountRefreshIds.has(id) || (
+        safeString(state.queue.credentialRefresh?.state) === "running"
+        && safeString(state.queue.credentialRefresh?.account_id) === id
+      );
+      const appendRefreshAction = (mode) => {
+        const refreshButton = actionButton(
+          refreshing ? "刷新中…" : "刷新",
+          "refresh-imported-child",
+          {accountId: id, refreshMode: mode},
+        );
+        refreshButton.disabled = refreshing;
+        if (refreshing) refreshButton.setAttribute("aria-busy", "true");
+        actions.append(refreshButton);
+      };
       if (
         source === "icloud_hme"
         && safeString(account.icloud_role) === "rotating_child"
-        && rawStatus === "bound_next"
-        && safeString(binding?.workspace?.status) === "failed"
       ) {
-        actions.append(actionButton("刷新", "refresh-imported-child", {accountId: id}));
+        if (rawStatus === "bound_current") {
+          appendRefreshAction("current");
+        } else if (rawStatus === "bound_next" && safeString(binding?.workspace?.status) === "failed") {
+          appendRefreshAction("failed-next");
+        }
       }
       if (status !== "used") actions.append(actionButton("代理", "open-account-proxy", {accountId: id}));
       if (binding && ["bound_current", "bound_next"].includes(rawStatus)) {
@@ -1823,6 +1850,47 @@ function activeQueueItems() {
     .sort((left, right) => Number(firstValue(left, ["position"], 0)) - Number(firstValue(right, ["position"], 0)));
 }
 
+function queueStageGrid(definitions, stages = {}) {
+  return element("div", {className: "queue-refresh-steps"}, definitions.map(([step, label]) => {
+    const stageState = safeString(stages[step], "pending");
+    return element("span", {
+      className: "queue-refresh-step",
+      text: `${label} · ${STEP_STATE_LABELS[stageState] || stageState}`,
+      dataset: {state: stageState},
+    });
+  }));
+}
+
+function runOperationQueueEntry(operation) {
+  const runIdentifier = safeString(operation.run_id);
+  const run = state.runs.find((candidate) => runId(candidate) === runIdentifier) || {
+    id: runIdentifier,
+    kind: operation.kind,
+  };
+  const operationState = safeString(operation.state, "running");
+  const entry = element("li", {
+    className: "queue-item queue-item--refresh",
+    dataset: {state: operationState},
+  });
+  entry.append(element("span", {className: "queue-position", text: "W"}));
+  const copy = element("div", {className: "queue-item__copy"}, [
+    element("strong", {text: `${runKindLabel(run)} · ${runWorkspaceLabel(run)}`}),
+    element("span", {text: RUN_STATUS[operationState]?.[0] || operationState}),
+  ]);
+  const definitions = stepGroupsForRun(run).flatMap(([, steps]) => steps);
+  copy.append(queueStageGrid(definitions, operation.stages));
+  const operationError = safeString(operation.error);
+  if (operationError) copy.append(element("span", {className: "queue-refresh-error", text: operationError}));
+  const actions = element("div", {className: "queue-item__actions"});
+  if (ACTIVE_RUN_STATES.has(operationState)) {
+    const stop = actionButton("■", "stop-run", {runId: runIdentifier}, "queue-icon-button queue-icon-button--danger");
+    stop.setAttribute("aria-label", `停止 ${runWorkspaceLabel(run)}`);
+    actions.append(stop);
+  }
+  entry.append(copy, actions);
+  return entry;
+}
+
 function renderQueue() {
   const drawer = byId("queue-drawer");
   drawer.dataset.expanded = String(state.queueExpanded);
@@ -1831,25 +1899,69 @@ function renderQueue() {
   byId("queue-body").hidden = !state.queueExpanded;
 
   const items = activeQueueItems();
+  const runOperation = state.queue.runOperation;
   const running = items.find((item) => ACTIVE_RUN_STATES.has(queueItemState(item)));
+  const refresh = state.queue.credentialRefresh;
+  const refreshRunning = safeString(refresh?.state) === "running";
+  const refreshAccount = refresh ? findAccount(refresh.account_id) : null;
+  const refreshLabel = refreshAccount ? accountEmail(refreshAccount) : "当前子号";
   const pendingCount = items.filter((item) => ["queued", "pending"].includes(queueItemState(item))).length;
   byId("queue-summary").textContent = `${numberFormatter.format(pendingCount)} 项待执行`;
-  byId("queue-running-summary").textContent = running
-    ? `正在运行：${queueItemWorkspaceName(running)}`
-    : state.queue.paused ? "队列已暂停" : "当前无运行任务";
+  byId("queue-running-summary").textContent = refreshRunning
+    ? `正在刷新令牌：${refreshLabel}`
+    : running
+      ? `正在运行：${queueItemWorkspaceName(running)}`
+      : state.queue.paused ? "队列已暂停" : "当前无运行任务";
   byId("queue-state").textContent = state.queue.paused
     ? "队列已暂停，不会领取新任务。"
-    : running ? "全局顺序执行中，每次仅运行 1 个空间。" : "队列就绪。";
+    : refreshRunning
+      ? "当前子号凭据刷新中；完成前不会领取接力任务。"
+      : running ? "全局顺序执行中，每次仅运行 1 个空间。" : "队列就绪。";
   byId("queue-pause-button").textContent = state.queue.paused ? "继续队列" : "暂停队列";
 
   const list = byId("queue-list");
   list.replaceChildren();
-  if (!items.length) {
+  if (!items.length && !refresh && !runOperation) {
     list.append(element("li", {className: "empty-state", text: state.errors.queue || "队列为空"}));
     return;
   }
   const fragment = document.createDocumentFragment();
-  items.forEach((item, index) => {
+  if (runOperation) fragment.append(runOperationQueueEntry(runOperation));
+  if (refresh) {
+    const refreshState = safeString(refresh.state, "running");
+    const stages = refresh.stages && typeof refresh.stages === "object" ? refresh.stages : {};
+    const stageLabels = [
+      ["old_login", "登录账号"],
+      ["pat", "创建 PAT"],
+      ["sub2api_export", "导出 JSON"],
+    ];
+    const entry = element("li", {
+      className: "queue-item queue-item--refresh",
+      dataset: {state: refreshState},
+    });
+    entry.append(element("span", {className: "queue-position", text: "R"}));
+    const copy = element("div", {className: "queue-item__copy"}, [
+      element("strong", {text: `子号令牌刷新 · ${refreshLabel}`}),
+      element("span", {
+        text: refreshState === "running"
+          ? "执行中"
+          : refreshState === "succeeded"
+            ? refresh.reused ? "已完成 · 重复请求未新建令牌" : "已完成"
+            : "执行失败",
+      }),
+    ]);
+    copy.append(queueStageGrid(stageLabels, stages));
+    const refreshError = safeString(refresh.error);
+    if (refreshError) copy.append(element("span", {className: "queue-refresh-error", text: refreshError}));
+    const outputPath = safeString(refresh.result?.sub2api_path);
+    if (outputPath) copy.append(element("span", {className: "queue-refresh-output", text: `JSON：${outputPath}`}));
+    entry.append(copy, element("div", {className: "queue-item__actions"}));
+    fragment.append(entry);
+  }
+  const visibleItems = items.filter(
+    (item) => queueItemRunId(item) !== safeString(runOperation?.run_id),
+  );
+  visibleItems.forEach((item, index) => {
     const itemState = queueItemState(item);
     const itemId = safeString(firstValue(item, ["id", "queue_item_id"]));
     const runIdentifier = queueItemRunId(item);
@@ -1869,7 +1981,7 @@ function renderQueue() {
       up.disabled = index === 0;
       const down = actionButton("↓", "move-queue-item", {queueItemId: itemId, direction: "down"}, "queue-icon-button");
       down.setAttribute("aria-label", `下移 ${queueItemWorkspaceName(item)}`);
-      down.disabled = index === items.length - 1 || ACTIVE_RUN_STATES.has(queueItemState(items[index + 1]));
+      down.disabled = index === visibleItems.length - 1 || ACTIVE_RUN_STATES.has(queueItemState(visibleItems[index + 1]));
       actions.append(up, down);
     }
     if (ACTIVE_RUN_STATES.has(itemState)) {
@@ -2749,16 +2861,39 @@ async function retryWorkspace(id) {
   showToast("重试任务已加入队列", "success");
 }
 
-async function refreshImportedChild(id) {
+async function refreshImportedChild(id, mode) {
   if (!ensureMutable()) return;
-  const path = await chooseLocalPath("json", "");
-  if (!path) return;
-  await api(`/api/accounts/${encodeURIComponent(id)}/refresh`, {
-    method: "POST",
-    body: {path},
-  });
-  await refreshResources(["accounts", "workspaces", "runs", "queue"]);
-  showToast("已确认新 token，失败任务已重新入队", "success");
+  if (state.pendingAccountRefreshIds.has(id)) {
+    showToast("该子号正在刷新，请等待当前操作完成", "info");
+    return;
+  }
+  state.pendingAccountRefreshIds.add(id);
+  state.queueExpanded = true;
+  renderAccountTable();
+  renderQueue();
+  try {
+    let path = null;
+    if (mode !== "current") {
+      path = await chooseLocalPath("json", "");
+      if (!path) return;
+    } else {
+      showToast("正在重新登录并生成新令牌，请稍候…", "info");
+    }
+    const result = await api(`/api/accounts/${encodeURIComponent(id)}/refresh`, {
+      method: "POST",
+      body: path ? {path} : {},
+    });
+    await refreshResources(["accounts", "workspaces", "runs", "queue"]);
+    if (mode === "current") {
+      const prefix = result.reused ? "刚才已完成，未重复创建令牌" : "新令牌 JSON 已导出";
+      showToast(`${prefix}：${safeString(result.sub2api_path)}`, "success");
+    } else {
+      showToast("已确认新 token，失败任务已重新入队", "success");
+    }
+  } finally {
+    state.pendingAccountRefreshIds.delete(id);
+    renderAccountTable();
+  }
 }
 
 async function updateAccountStatus(id, nextStatus) {
@@ -3737,7 +3872,9 @@ document.addEventListener("click", (event) => {
     }
     if (action === "enqueue-selected") return enqueueSelected();
     if (action === "retry-workspace") return retryWorkspace(button.dataset.workspaceId);
-    if (action === "refresh-imported-child") return refreshImportedChild(button.dataset.accountId);
+    if (action === "refresh-imported-child") {
+      return refreshImportedChild(button.dataset.accountId, button.dataset.refreshMode);
+    }
     if (action === "open-run-detail") return openRunDetail(button.dataset.runId);
     if (action === "set-account-status") return updateAccountStatus(button.dataset.accountId, button.dataset.status);
     if (action === "account-page-prev") return changeAccountPage(-1);

@@ -702,13 +702,14 @@ class WorkflowRunner:
         if not isinstance(session, Mapping):
             raise RuntimeError("login result is not an object")
         self._validate_login_session(spec, session)
-        if (
+        session_token = AuthContext.from_mapping(session).session_token
+        if step == "old_login" and self.config.persist_old_session is not None:
+            self.config.persist_old_session(session_token)
+        elif (
             step in {"new_login", "new_workspace_login"}
             and self.config.persist_new_session is not None
         ):
-            self.config.persist_new_session(
-                AuthContext.from_mapping(session).session_token
-            )
+            self.config.persist_new_session(session_token)
         self.state.set(step, session)
         return session
 
@@ -999,7 +1000,9 @@ class WorkflowRunner:
         )
         return result
 
-    def _create_pat(self, new_session: Mapping[str, Any]) -> dict[str, Any]:
+    def _create_pat(
+        self, new_session: Mapping[str, Any], *, role: str = "new"
+    ) -> dict[str, Any]:
         self._check_cancel()
         cached = self.state.get("pat")
         if isinstance(cached, dict) and cached.get("access_token"):
@@ -1007,7 +1010,7 @@ class WorkflowRunner:
             return cached
         context = AuthContext.from_mapping(new_session)
         self._log(f"[pat] {self.config.pat_name}")
-        result = self._chatgpt_clients["new"].create_personal_access_token(
+        result = self._chatgpt_clients[role].create_personal_access_token(
             context.access_token,
             self.config.workspace_id,
             name=self.config.pat_name,
@@ -1373,6 +1376,31 @@ class WorkflowRunner:
                 "push": push,
                 "sub2api": sub2api,
             }
+            self.state.set("complete", summary)
+            return summary
+        finally:
+            self.close()
+
+
+class CurrentAccountRefreshRunner(WorkflowRunner):
+    """Refresh one active child session, PAT, and Sub2API export only."""
+
+    def run(self) -> dict[str, Any]:
+        try:
+            self._log_network_context()
+            current_session = self._run_stage(
+                "old_login",
+                lambda: self._login(self.config.old_account, "old_login"),
+            )
+            pat = self._run_stage(
+                "pat", lambda: self._create_pat(current_session, role="old")
+            )
+            sub2api_path = self._run_stage(
+                "sub2api_export",
+                lambda: self._write_sub2api_export(current_session, pat),
+            )
+            self._check_cancel()
+            summary = {"sub2api_path": str(sub2api_path.resolve())}
             self.state.set("complete", summary)
             return summary
         finally:

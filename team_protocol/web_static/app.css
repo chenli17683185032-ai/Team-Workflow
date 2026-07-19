@@ -1509,6 +1509,10 @@ input[readonly] {
   background: var(--running-soft);
 }
 
+.queue-item--refresh {
+  grid-column: 1 / -1;
+}
+
 .queue-position {
   color: var(--ink-faint);
   font-family: var(--font-mono);
@@ -1537,6 +1541,55 @@ input[readonly] {
   margin-top: 3px;
   color: var(--ink-soft);
   font-size: 11px;
+}
+
+.queue-item__copy .queue-refresh-steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  gap: 4px;
+  margin-top: 7px;
+  overflow: visible;
+  white-space: normal;
+}
+
+.queue-item__copy .queue-refresh-step {
+  margin: 0;
+  padding: 4px 6px;
+  overflow: visible;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--surface);
+  text-align: center;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.queue-item__copy .queue-refresh-step[data-state="running"] {
+  border-color: #6fb9c7;
+  background: var(--running-soft);
+}
+
+.queue-item__copy .queue-refresh-step[data-state="done"] {
+  border-color: #84b99a;
+  background: var(--success-soft);
+}
+
+.queue-item__copy .queue-refresh-step[data-state="failed"],
+.queue-item__copy .queue-refresh-step[data-state="cancelled"] {
+  border-color: #d59a9a;
+  background: var(--danger-soft);
+}
+
+.queue-item__copy .queue-refresh-error,
+.queue-item__copy .queue-refresh-output {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.queue-item__copy .queue-refresh-error {
+  color: var(--danger);
 }
 
 .queue-item__actions {

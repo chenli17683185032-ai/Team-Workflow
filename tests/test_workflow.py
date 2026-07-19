@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from team_protocol.registrar import MailboxCredentials, RegistrarIdentityError
 from team_protocol.workflow import (
     AccountNetworkSpec,
     AccountSpec,
+    CurrentAccountRefreshRunner,
     RescueWorkflowRunner,
     WorkflowCancelled,
     WorkflowConfig,
@@ -568,12 +570,14 @@ class WorkflowTests(unittest.TestCase):
     def test_expired_child_browser_cookie_clears_and_falls_back_to_login(self):
         with tempfile.TemporaryDirectory() as directory:
             cleared = []
+            persisted = []
             config = make_workflow_config(
                 Path(directory),
                 push=False,
                 sub2api_push=False,
                 old_session_token="old-expired-cookie",
                 clear_old_session=lambda: cleared.append(True),
+                persist_old_session=persisted.append,
             )
 
             class ExpiringChatGPT(FakeChatGPT):
@@ -598,10 +602,60 @@ class WorkflowTests(unittest.TestCase):
             ).run()
 
         self.assertEqual(cleared, [True])
+        self.assertEqual(persisted, ["old-login-session"])
         self.assertEqual(
             [email for email, _proxy in registrar.calls],
             [config.old_account.email, config.new_account.email],
         )
+
+    def test_current_account_refresh_reuses_cookie_creates_pat_and_exports_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persisted = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                old_session_token="old-browser-cookie",
+                persist_old_session=persisted.append,
+            )
+            config = replace(config, new_account=config.old_account)
+            registrar = FakeRegistrar()
+            chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            old_mailbox, _new_mailbox = make_mailboxes(config)
+
+            result = CurrentAccountRefreshRunner(
+                config,
+                checkpoint_store=InMemoryCheckpoint(),
+                old_mailbox=old_mailbox,
+                new_mailbox=old_mailbox,
+                registrar=registrar,
+                chatgpt=chatgpt,
+                verbose=False,
+            ).run()
+
+            export_path = Path(result["sub2api_path"])
+            exported = json.loads(export_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(registrar.calls, [])
+        self.assertEqual(persisted, ["old-workspace-session"])
+        self.assertIn(
+            ("refresh", "old-browser-cookie", config.workspace_id),
+            chatgpt.calls,
+        )
+        self.assertIn(
+            ("pat", config.workspace_id, config.pat_name, config.pat_ttl),
+            chatgpt.calls,
+        )
+        self.assertFalse(any(call[0] in {"invite", "leave", "members"} for call in chatgpt.calls))
+        self.assertEqual(
+            exported["accounts"][0]["credentials"]["access_token"],
+            "at-test",
+        )
+        self.assertNotIn("sessionToken", json.dumps(exported))
 
     def test_new_account_uses_registration_when_adapter_supports_it(self):
         with tempfile.TemporaryDirectory() as directory:

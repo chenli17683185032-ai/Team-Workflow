@@ -4784,10 +4784,58 @@ class Database:
             ):
                 raise StateConflictError("workspace account roles are inconsistent")
 
+            owner_alias_id = str(workspace["owner_alias_id"] or "").strip()
+            if owner_alias_id:
+                child_rows = connection.execute(
+                    """
+                    SELECT account_id, parent_owner_alias_id, role, used_at
+                    FROM icloud_aliases WHERE account_id IN (?, ?)
+                    """,
+                    (previous_id, current_id),
+                ).fetchall()
+                if len(child_rows) != 2 or any(
+                    str(child["role"]) != "rotating_child"
+                    or str(child["parent_owner_alias_id"] or "") != owner_alias_id
+                    or child["used_at"] is not None
+                    for child in child_rows
+                ):
+                    raise StateConflictError(
+                        "workspace child accounts no longer match their Team owner"
+                    )
+                self._update_account_credentials_tx(
+                    connection,
+                    previous_id,
+                    remove=("browser_session_token",),
+                    timestamp=timestamp,
+                )
+                self._update_account_credentials_tx(
+                    connection,
+                    current_id,
+                    updates={"registered_account": True},
+                    timestamp=timestamp,
+                )
+
             connection.execute(
-                "UPDATE accounts SET status = 'exited_pending', updated_at = ? WHERE id = ?",
-                (timestamp, previous_id),
+                "UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?",
+                (
+                    "retired" if owner_alias_id else "exited_pending",
+                    timestamp,
+                    previous_id,
+                ),
             )
+            if owner_alias_id:
+                cursor = connection.execute(
+                    """
+                    UPDATE icloud_aliases SET used_at = ?, updated_at = ?
+                    WHERE account_id = ? AND role = 'rotating_child'
+                      AND parent_owner_alias_id = ? AND used_at IS NULL
+                    """,
+                    (timestamp, timestamp, previous_id, owner_alias_id),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflictError(
+                        "old iCloud child could not enter the used pool"
+                    )
             self._set_allocation_state_tx(
                 connection, previous_id, "retired", timestamp
             )
@@ -4801,12 +4849,16 @@ class Database:
             ).fetchone()
             if promoted is None:
                 raise StateConflictError("promoted account is missing")
-            replacement = self._claim_replacement_account_tx(
-                connection,
-                preferred_primary_email=str(promoted["primary_email"]),
-                after_alias_number=_alias_number(
-                    str(promoted["email"]), str(promoted["primary_email"])
-                ),
+            replacement = (
+                None
+                if owner_alias_id
+                else self._claim_replacement_account_tx(
+                    connection,
+                    preferred_primary_email=str(promoted["primary_email"]),
+                    after_alias_number=_alias_number(
+                        str(promoted["email"]), str(promoted["primary_email"])
+                    ),
+                )
             )
             replacement_id = (
                 None if replacement is None else str(replacement["id"])

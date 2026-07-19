@@ -609,6 +609,83 @@ class DatabaseTests(unittest.TestCase):
                 current_alias["account_id"], "available"
             )
 
+    def test_external_icloud_advance_uses_the_same_used_pool_rules(self):
+        profile = self.database.create_icloud_mailbox(
+            name="External Apple pool",
+            forwarding_email="external-forward@example.com",
+            secrets=self.icloud_secret("external-advance"),
+            status="ready",
+        )
+        imported = self.database.import_icloud_aliases(
+            profile["id"],
+            [
+                {
+                    "email": "external-owner@icloud.com",
+                    "role": "team_owner",
+                    "owner_proxy": (
+                        "socks5h://external:proxy-secret@proxy.invalid:1080"
+                    ),
+                    "remote_metadata": {"anonymousId": "external-owner-remote"},
+                },
+                {
+                    "email": "external-current@icloud.com",
+                    "role": "rotating_child",
+                    "parent_owner_email": "external-owner@icloud.com",
+                    "remote_metadata": {"anonymousId": "external-current-remote"},
+                },
+            ],
+        )
+        owner = next(item for item in imported if item["role"] == "team_owner")
+        previous = next(
+            item for item in imported if item["role"] == "rotating_child"
+        )
+        workspace = self.database.create_workspace(
+            name="External Team",
+            workspace_uid="external-team-workspace",
+            owner_alias_id=owner["id"],
+            current_account_id=previous["account_id"],
+        )
+        prepared = self.database.prepare_icloud_workspace_handoff(
+            workspace["id"],
+            expected_version=workspace["version"],
+            email="external-next@icloud.com",
+            remote_metadata={"anonymousId": "external-next-remote"},
+            label="External next",
+        )
+        next_alias = prepared["alias"]
+        self.database.set_account_browser_session(
+            previous["account_id"], "external-old-cookie"
+        )
+
+        result = self.database.advance_workspace_accounts(
+            workspace["id"],
+            expected_version=prepared["workspace"]["version"],
+        )
+
+        advanced = result["workspace"]
+        self.assertEqual(advanced["current_account_id"], next_alias["account_id"])
+        self.assertIsNone(advanced["next_account_id"])
+        self.assertEqual(advanced["status"], "needs_account")
+        self.assertEqual(advanced["used_child_count"], 1)
+        self.assertIsNone(result["replacement"])
+        self.assertEqual(
+            self.database.get_account(previous["account_id"])["status"],
+            "retired",
+        )
+        self.assertIsNotNone(
+            self.database.get_icloud_alias(previous["id"])["used_at"]
+        )
+        self.assertNotIn(
+            "browser_session_token",
+            self.database.get_account_credentials(previous["account_id"]),
+        )
+        self.assertIs(
+            self.database.get_account_credentials(next_alias["account_id"])[
+                "registered_account"
+            ],
+            True,
+        )
+
     def test_generated_owner_proxy_config_is_encrypted_and_updates_active_children(self):
         profile = self.database.create_icloud_mailbox(
             name="Generated source pool",

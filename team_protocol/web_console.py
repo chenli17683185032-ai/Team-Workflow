@@ -352,7 +352,7 @@ class AccountProxyRequest(StrictModel):
 
 
 class AccountRefreshRequest(StrictModel):
-    path: str = Field(min_length=1)
+    path: str | None = Field(default=None, min_length=1)
 
 
 class ICloudMailboxCreateRequest(StrictModel):
@@ -1020,16 +1020,29 @@ class WebConsoleController:
         return Sub2APIClient(base_url, email, password, **options)
 
     def refresh_imported_child(
-        self, account_id: str, path: str | Path
+        self, account_id: str, path: str | Path | None = None
     ) -> dict[str, Any]:
         account = self.database.get_account(str(account_id))
         if (
             account.get("source") != "icloud_hme"
             or account.get("icloud_role") != "rotating_child"
-            or account.get("status") != "bound_next"
         ):
             raise StateConflictError(
-                "only a failed workspace iCloud next child can be refreshed"
+                "only an iCloud rotating child can be refreshed"
+            )
+        if account.get("status") == "bound_current":
+            result = self.task_queue.refresh_current_account(str(account["id"]))
+            return _safe_payload(
+                {
+                    "verified": True,
+                    "mode": "current",
+                    "account": self.database.get_account(str(account["id"])),
+                    **result,
+                }
+            )
+        if account.get("status") != "bound_next":
+            raise StateConflictError(
+                "only a current child or failed workspace next child can be refreshed"
             )
         workspace = next(
             (
@@ -1054,6 +1067,8 @@ class WebConsoleController:
         ):
             raise StateConflictError("failed run no longer matches this child")
 
+        if path is None:
+            raise FieldInputError({"path": "select a Sub2API JSON file"})
         source = Path(path).expanduser().resolve()
         if source.suffix.casefold() != ".json":
             raise FieldInputError({"path": "select a Sub2API JSON file"})
@@ -1124,6 +1139,7 @@ class WebConsoleController:
         return _safe_payload(
             {
                 "verified": True,
+                "mode": "failed_next",
                 "account": self.database.get_account(str(account["id"])),
                 "workspace": self.database.get_workspace(str(workspace["id"])),
                 "run": retried,

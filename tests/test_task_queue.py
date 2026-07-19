@@ -6,7 +6,7 @@ import unittest
 from collections import deque
 from pathlib import Path
 
-from team_protocol.database import Database
+from team_protocol.database import Database, StateConflictError
 from team_protocol.task_queue import DatabaseCheckpointStore, TaskQueue, redact_text
 from team_protocol.workflow import WorkflowCancelled, WorkflowIdentityError
 
@@ -220,6 +220,142 @@ class TaskQueueTests(unittest.TestCase):
         )
         self.assertNotIn(b"checkpoint-secret-one", raw)
         self.assertNotIn(b"checkpoint-secret-two", raw)
+
+    def test_current_refresh_logs_each_stage_and_reuses_recent_success(self):
+        calls = []
+
+        class RefreshRunner:
+            def __init__(self, **kwargs):
+                self.callback = kwargs["event_callback"]
+
+            def run(self):
+                for step in ("old_login", "pat", "sub2api_export"):
+                    self.callback({"type": "step", "step": step, "state": "active"})
+                    self.callback({"type": "step", "step": step, "state": "done"})
+                return {"sub2api_path": "/private/output/refreshed.json"}
+
+        def refresh_factory(_config, **kwargs):
+            calls.append(kwargs)
+            return RefreshRunner(**kwargs)
+
+        queue = TaskQueue(
+            self.database,
+            refresh_runner_factory=refresh_factory,
+        )
+        self.queues.append(queue)
+        queue._build_current_refresh_inputs = lambda _account_id: (
+            object(),
+            object(),
+            "",
+            object(),
+            (),
+        )
+
+        first = queue.refresh_current_account("current-account")
+        first_snapshot = queue.snapshot()["credential_refresh"]
+        second = queue.refresh_current_account("current-account")
+        second_snapshot = queue.snapshot()["credential_refresh"]
+
+        self.assertEqual(first["sub2api_path"], "/private/output/refreshed.json")
+        self.assertEqual(first_snapshot["state"], "succeeded")
+        self.assertEqual(
+            first_snapshot["stages"],
+            {
+                "old_login": "done",
+                "pat": "done",
+                "sub2api_export": "done",
+            },
+        )
+        self.assertTrue(second["reused"])
+        self.assertTrue(second_snapshot["reused"])
+        self.assertEqual(len(calls), 1)
+
+    def test_current_refresh_rejects_a_concurrent_second_request(self):
+        started = threading.Event()
+        release = threading.Event()
+        results = []
+
+        class BlockingRefreshRunner:
+            def __init__(self, **kwargs):
+                self.callback = kwargs["event_callback"]
+
+            def run(self):
+                self.callback(
+                    {"type": "step", "step": "old_login", "state": "active"}
+                )
+                started.set()
+                release.wait(2.0)
+                self.callback(
+                    {"type": "step", "step": "old_login", "state": "done"}
+                )
+                return {"sub2api_path": "/private/output/one.json"}
+
+        queue = TaskQueue(
+            self.database,
+            refresh_runner_factory=lambda _config, **kwargs: BlockingRefreshRunner(
+                **kwargs
+            ),
+        )
+        self.queues.append(queue)
+        queue._build_current_refresh_inputs = lambda _account_id: (
+            object(),
+            object(),
+            "",
+            object(),
+            (),
+        )
+        worker = threading.Thread(
+            target=lambda: results.append(
+                queue.refresh_current_account("current-account")
+            )
+        )
+        worker.start()
+        self.assertTrue(started.wait(1.0))
+
+        with self.assertRaises(StateConflictError):
+            queue.refresh_current_account("current-account")
+
+        snapshot = queue.snapshot()["credential_refresh"]
+        self.assertEqual(snapshot["state"], "running")
+        self.assertEqual(snapshot["stages"]["old_login"], "running")
+        release.set()
+        worker.join(2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(results), 1)
+
+    def test_current_refresh_failure_log_is_redacted_and_keeps_failed_stage(self):
+        class FailingRefreshRunner:
+            def __init__(self, **kwargs):
+                self.callback = kwargs["event_callback"]
+
+            def run(self):
+                self.callback({"type": "step", "step": "pat", "state": "active"})
+                raise RuntimeError("PAT failed with refresh-secret-canary")
+
+        queue = TaskQueue(
+            self.database,
+            refresh_runner_factory=lambda _config, **kwargs: FailingRefreshRunner(
+                **kwargs
+            ),
+        )
+        self.queues.append(queue)
+        queue._build_current_refresh_inputs = lambda _account_id: (
+            object(),
+            object(),
+            "",
+            object(),
+            ("refresh-secret-canary",),
+        )
+
+        with self.assertRaises(StateConflictError) as caught:
+            queue.refresh_current_account("current-account")
+
+        snapshot = queue.snapshot()["credential_refresh"]
+        self.assertEqual(snapshot["state"], "failed")
+        self.assertEqual(snapshot["stages"]["pat"], "failed")
+        self.assertNotIn("refresh-secret-canary", snapshot["error"])
+        self.assertNotIn("refresh-secret-canary", str(caught.exception))
+        self.assertIn("***", snapshot["error"])
 
     def test_fifo_single_active_failure_continues_and_redacts(self):
         first, _, _ = self.make_workspace("first")

@@ -5,6 +5,7 @@
 ### 新增
 
 - 账号库为失败 Workspace 的 iCloud 下一子号增加“刷新”：选择本地 Sub2API JSON，核对邮箱、Team workspace 和 PAT，匹配后在原账号上记录已注册状态并自动重试原失败 run。
+- 正在使用的 iCloud 当前子号也可直接刷新：复用 cookie 或邮箱 OTP 登录，创建新 PAT 并导出新的 Sub2API JSON，不改变 Team 成员和账号绑定。
 - 新子号登录成功后加密保存最小 ChatGPT browser session cookie；该子号下一次接力优先复用，成功退出并完成轮换时才删除旧号 cookie。
 
 ### 稳定性与安全
@@ -12,11 +13,14 @@
 - 刷新只读取单账号、最多 2 MiB 的本地 JSON，不保存文件路径或 Sub2API PAT，也不改变子号 ID、Alias、母号归属、Team 绑定、代理或旧 checkpoint；格式错误、身份冲突、PAT 缺失和重复点击均在写入前阻断。
 - 已注册标记使失败的新子号恢复时改走现有账号 OTP 登录，不再重复 `create_account`；保存的 browser cookie 过期或被撤销时先清除，再自动回退 OTP。
 - Cookie 只以加密 `session_token` 保存，不落完整 Cookie jar、浏览器 profile、日志、API 响应或 DOM；旧号删除与账号晋升/退役在同一个数据库事务提交。
+- 刷新按钮使用跨 SSE 重绘的页面 pending 状态；服务端串行化刷新与接力，并在成功后 60 秒内幂等复用同账号结果，重复点击不再创建多个 PAT。
+- 底部执行栏保留当前刷新三个阶段，以及正常接力、母号提拉的全部结构化阶段；完成状态、失败阶段和脱敏错误均清晰可见。
+- 外部已完成的 iCloud 子号切换使用与正式接力相同的母号归属、已用池、旧 cookie 删除和不预分配下一号规则。
 
 ### 验证
 
 - 本地 JSON 刷新精确匹配、错误 workspace 零写入、原 run 复用、注册/登录分支、Cookie 保存/复用/失效回退和轮换删除聚焦测试通过。
-- macOS 全量 303 项测试中 297 项通过、6 项 Windows DPAPI 按平台跳过；Python/JavaScript 语法、`git diff --check` 与敏感信息扫描通过。
+- macOS 全量 309 项测试中 303 项通过、6 项 Windows DPAPI 按平台跳过；Python/JavaScript 语法、`git diff --check` 与敏感信息扫描通过。
 
 ## 2026-07-19
 

@@ -57,6 +57,7 @@ class FakeTaskQueue:
         self._revision = 0
         self.started = 0
         self.shutdown_calls = 0
+        self.current_refresh_calls = []
 
     @property
     def revision(self):
@@ -146,6 +147,11 @@ class FakeTaskQueue:
         )
         self.notify_change()
         return result
+
+    def refresh_current_account(self, account_id):
+        self.current_refresh_calls.append(account_id)
+        self.notify_change()
+        return {"sub2api_path": "/private/output/current-child.sub2api.json"}
 
 
 class WebConsoleTests(unittest.TestCase):
@@ -2127,6 +2133,34 @@ class WebConsoleTests(unittest.TestCase):
         self.assertIs(after_credentials["registered_account"], True)
         self.assertNotIn("pat-refresh-canary", response.text)
         self.assertNotIn(str(path), response.text)
+
+    def test_current_icloud_child_refresh_generates_json_without_input_file(self):
+        workspace, _next_account, run = self.failed_icloud_handoff()
+        current_account = self.database.get_account(workspace["current_account_id"])
+        app = create_app(self.controller, testing=True)
+
+        with TestClient(app) as test_client:
+            response = test_client.post(
+                f"/api/accounts/{current_account['id']}/refresh",
+                json={},
+                headers=self.origin_headers,
+            )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()["mode"], "current")
+        self.assertEqual(
+            response.json()["sub2api_path"],
+            "/private/output/current-child.sub2api.json",
+        )
+        self.assertEqual(
+            self.queue.current_refresh_calls,
+            [current_account["id"]],
+        )
+        self.assertEqual(self.database.get_run(run["id"])["state"], "failed")
+        self.assertEqual(
+            self.database.get_workspace(workspace["id"])["current_account_id"],
+            current_account["id"],
+        )
 
     def test_refresh_imported_child_rejects_wrong_json_workspace_without_writes(self):
         workspace, account, run = self.failed_icloud_handoff()
