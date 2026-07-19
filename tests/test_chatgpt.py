@@ -3,7 +3,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from team_protocol.chatgpt import AuthContext, ChatGPTClient
+from team_protocol.chatgpt import AuthContext, ChatGPTApiError, ChatGPTClient
 from team_protocol.cpa import OPENAI_AUTH_CLAIM
 
 
@@ -32,18 +32,34 @@ class AuthContextTests(unittest.TestCase):
 
 
 class CapturingSession:
-    def __init__(self):
+    def __init__(self, *, status_code=200, text=""):
         self.calls = []
+        self.status_code = status_code
+        self.text = text
 
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
-        return SimpleNamespace(status_code=200, json=lambda: {"ok": True}, text="")
+        return SimpleNamespace(
+            status_code=self.status_code,
+            json=lambda: {"ok": True},
+            text=self.text,
+        )
 
     def close(self):
         pass
 
 
 class ChatGPTClientFingerprintTests(unittest.TestCase):
+    def test_api_error_preserves_http_status_for_membership_feedback(self):
+        client = ChatGPTClient()
+        client._session.close()
+        client._session = CapturingSession(status_code=403, text="forbidden")
+
+        with self.assertRaises(ChatGPTApiError) as caught:
+            client._request("GET", "https://chatgpt.com/backend-api/test")
+
+        self.assertEqual(caught.exception.status_code, 403)
+
     def test_session_profile_controls_impersonation_and_headers(self):
         profile = SimpleNamespace(
             impersonate="chrome131",

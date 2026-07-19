@@ -149,21 +149,24 @@ $ErrorActionPreference = 'Stop'
 
 ```text
 01 旧号登录
-02 旧号邀请新号
-03 旧号退出 Team
+02 校验成员上限并邀请新号
+03 旧号退出并确认
 04 新号注册入组
-05 创建令牌
-06 导出 CPA
-07 导出 Sub2API JSON
-08 推送 CPA（可选）
-09 推送 Sub2API（可选）
+05 复核活跃成员不超过 2
+06 创建令牌
+07 导出 CPA
+08 导出 Sub2API JSON
+09 推送 CPA（可选）
+10 推送 Sub2API（可选）
 ```
 
-队列在每个阶段保存 checkpoint。进程异常退出后可以恢复同一次运行，避免重复邀请、重复退出或重复创建远端资源。PAT 创建成功后，本地始终生成 CPA 与 Sub2API 两个 `0600` 文件；Management 和 Sub2API 管理员配置只控制后续可选推送，不会阻断本地导出。Sub2API 文件采用 `exported_at / proxies / accounts` 结构，`credentials.access_token` 使用本次 Team 新建的 PAT，Session 只用于补充账号身份，不写入 `sessionToken`。
+队列在每个阶段保存 checkpoint。进程异常退出后可以恢复同一次运行，避免重复邀请、重复退出或重复创建远端资源。邀请前必须满足活跃成员不超过 2 且不存在其他待接受邀请；旧子号退出后会等待远端成员反馈，只有旧号已消失且剩余成员少于 2，或本次新号已在两名成员之中，才允许继续新号登录/恢复。新子号入组后再次要求总人数不超过 2、旧号缺席且新号存在，验证完成前不能创建 PAT 或提交轮换。
+
+PAT 创建成功后，本地始终生成 CPA 与 Sub2API 两个 `0600` 文件；Management 和 Sub2API 管理员配置只控制后续可选推送，不会阻断本地导出。Sub2API 文件采用 `exported_at / proxies / accounts` 结构，`credentials.access_token` 使用本次 Team 新建的 PAT，Session 只用于补充账号身份，不写入 `sessionToken`。
 
 账号首次参与任务时会先分配稳定 SID，通过该账号代理解析出口国家和 IANA 时区，再生成并加密保存 SessionProfile、BrowserForge 完整 payload 和工具链版本。旧号、新号分别使用独立代理、指纹和 curl 会话；账号由下一账号晋升为当前账号后仍复用原身份。任务开始时会确认代理地域解析、IANA 时区和 UTC 时钟有效；当前出口与已保存地域或语言发生漂移时继续使用账号已锁定的身份。出口 IP 不保存、不写入日志，代理 userinfo 在日志中整体掩码。
 
-在 iCloud 母号空间中，以上九个阶段的执行主体始终是当前子号和下一子号。母号仅作为空间归属、子号默认链路和 HME 资源池生成配置的锚点，不会被登录、邀请、退出或创建令牌。
+在 iCloud 母号空间中，以上十个阶段的执行主体始终是当前子号和下一子号。母号仅作为空间归属、子号默认链路和 HME 资源池生成配置的锚点，不会被登录、邀请、退出或创建令牌。母号与当前子号构成两名活跃成员；新子号在旧子号退出前只保持待接受邀请状态。
 
 账号级 SID 支持 `{sid}` 占位符和 NovProxy 的 `-sid-<value>` 格式。例如：
 
@@ -232,7 +235,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 5. 为两个 Team 母号分别保存各自的 LokiProxy 生成链接或固定 SOCKS5 端点；二者的“统一 Clash 前置”保持相同。页面不会回显来源凭据，这一步不会登录或操作母号。
 6. 新建或编辑两个空间：每个空间选择一个 Team 母号和它当前的子号，下一子号保持为空。
 7. 需要轮换时，在空间行点击“更换子号”。控制台此时才通过 HME 资源池创建一个全新 Alias，沿用当前子号的编号递增（例如 `组 1-7` 生成 `组 1-8`），按空间母号绑定并继承子号默认链路；母号没有任何 Team 动作。
-8. 接力严格按“旧号登录 -> 旧号邀请新号 -> 旧号退出 Team -> 新号登录并进入空间 -> 创建令牌/推送”的顺序执行。接力成功后，新子号晋升为当前子号，旧子号进入“已用完”池，空间重新回到无下一子号状态。下一次点击会再次现场创建一个新 Alias。
+8. 接力严格按“旧号登录 -> 校验成员并邀请新号 -> 旧号退出并确认成员反馈 -> 新号登录并进入空间 -> 再次复核两人上限 -> 创建令牌/推送”的顺序执行。接力成功后，新子号晋升为当前子号，旧子号进入“已用完”池，空间重新回到无下一子号状态。下一次点击会再次现场创建一个新 Alias。
 
 本地直连测试只验证网络可达性，不会自动延长 Apple Session。Session 失效时，点击“登录更新 HME”重新登录即可自动捕获或验证最新会话，不必强行打开隐藏邮箱子页面；如果直连后仍立即失效，应优先检查 Apple 登录状态和 Cookie，而不是反复点击检测。
 
@@ -277,7 +280,7 @@ Team-Workflow/
 │  ├─ proxy_chain.py        # 统一 Clash 前置与按母号隔离的 LokiProxy 本地中继
 │  ├─ task_queue.py         # 全局顺序队列与恢复
 │  ├─ sub2api.py            # PAT + Session 的 Sub2API 导出与可选推送
-│  ├─ workflow.py           # 九阶段接力与凭据导出工作流
+│  ├─ workflow.py           # 十阶段接力、两人上限复核与凭据导出工作流
 │  └─ web_console.py        # FastAPI 控制台服务
 ├─ tests/                   # 单元与服务层回归测试
 ├─ run_web.py               # 推荐启动入口
@@ -292,7 +295,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、选择性 Alias 接管、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、双账号网络隔离、统一 Clash 前置、固定/动态 LokiProxy 字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 262 项测试，其中 256 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、选择性 Alias 接管、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 前置、固定/动态 LokiProxy 字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 271 项测试，其中 265 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 
@@ -302,7 +305,7 @@ python -B -m unittest discover -s '.\tests' -v
 $ErrorActionPreference = 'Stop'
 git status --short
 git diff --cached --name-only
-git grep -n -I -E 'BEGIN .*PRIVATE KEY|github_pat_|ghp_|Bearer [A-Za-z0-9._~-]{20,}' --cached
+git grep --cached -n -I -E 'BEGI[N] .*PRIVATE KEY|github[_]pat_|gh[p]_|Beare[r] [A-Za-z0-9._~-]{20,}'
 ```
 
 确保暂存区仅包含源码、测试、依赖清单和公开文档，不包含任何运行数据或真实账号信息。

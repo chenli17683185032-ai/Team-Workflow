@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from team_protocol.chatgpt import ChatGPTApiError
 from team_protocol.cpa import OPENAI_AUTH_CLAIM, OPENAI_PROFILE_CLAIM
 from team_protocol.registrar import MailboxCredentials, RegistrarIdentityError
 from team_protocol.workflow import (
@@ -159,13 +160,27 @@ class FakeRegistrar:
 
 
 class FakeChatGPT:
-    def __init__(self, workspace_id, old_email, new_email):
+    def __init__(self, workspace_id, old_email, new_email, member_state=None):
         self.workspace_id = workspace_id
         self.old_email = old_email
         self.new_email = new_email
         self.calls = []
+        self.owner_user_id = "user-owner"
         self.old_user_id = "user-old"
         self.new_user_id = "user-new"
+        self.member_state = member_state or {
+            "members": {
+                self.owner_user_id: {
+                    "id": self.owner_user_id,
+                    "email": "owner@example.com",
+                },
+                self.old_user_id: {
+                    "id": self.old_user_id,
+                    "email": self.old_email,
+                },
+            },
+            "invites": set(),
+        }
 
     def close(self):
         self.calls.append(("close",))
@@ -175,6 +190,12 @@ class FakeChatGPT:
         is_old = session_token.startswith("old-")
         email = self.old_email if is_old else self.new_email
         user_id = self.old_user_id if is_old else self.new_user_id
+        if not is_old and account_id == self.workspace_id:
+            self.member_state["members"][self.new_user_id] = {
+                "id": self.new_user_id,
+                "email": self.new_email,
+            }
+            self.member_state["invites"].discard(self.new_email.casefold())
         return {
             "user": {"id": user_id, "email": email},
             "account": {"id": self.workspace_id, "planType": "team"},
@@ -185,25 +206,28 @@ class FakeChatGPT:
     def get_members(self, access_token_value, account_id):
         del access_token_value
         self.calls.append(("members", account_id))
-        return {
-            "items": [
-                {"id": self.old_user_id, "email": self.old_email},
-            ]
-        }
+        items = list(self.member_state["members"].values())
+        return {"items": items, "total": len(items)}
 
     def get_invites(self, access_token_value, account_id):
         del access_token_value
         self.calls.append(("invites", account_id))
-        return {"items": []}
+        items = [
+            {"email": email, "status": "pending"}
+            for email in sorted(self.member_state["invites"])
+        ]
+        return {"items": items, "total": len(items)}
 
     def invite(self, access_token_value, account_id, email):
         del access_token_value
         self.calls.append(("invite", account_id, email))
+        self.member_state["invites"].add(email.casefold())
         return {"ok": True}
 
     def leave(self, access_token_value, account_id, user_id):
         del access_token_value
         self.calls.append(("leave", account_id, user_id))
+        self.member_state["members"].pop(user_id, None)
         return {"ok": True}
 
     def create_personal_access_token(self, access_token_value, account_id, *, name, ttl):
@@ -784,6 +808,16 @@ class WorkflowTests(unittest.TestCase):
             self.assertIs(registrar.login_profiles[0], registrar.login_profiles[1])
             self.assertEqual(result["invite"], "invited")
             self.assertEqual(result["old_leave"], "left")
+            self.assertEqual(
+                result["member_guard"],
+                {
+                    "verified": True,
+                    "active_members": 2,
+                    "member_limit": 2,
+                    "old_child_absent": True,
+                    "new_child_present": True,
+                },
+            )
             self.assertTrue(Path(result["cpa_path"]).exists())
             self.assertEqual(Path(result["cpa_path"]).stat().st_mode & 0o777, 0o600)
             cpa = json.loads(Path(result["cpa_path"]).read_text(encoding="utf-8"))
@@ -828,7 +862,12 @@ class WorkflowTests(unittest.TestCase):
             Path(result["sub2api_path"]).unlink()
 
             second_registrar = FakeRegistrar()
-            second_chatgpt = FakeChatGPT(workspace_id, old_email, new_email)
+            second_chatgpt = FakeChatGPT(
+                workspace_id,
+                old_email,
+                new_email,
+                chatgpt.member_state,
+            )
             second_management = FakeManagement()
             second_sub2api = FakeSub2API()
             resumed = WorkflowRunner(
@@ -852,7 +891,7 @@ class WorkflowTests(unittest.TestCase):
                 registrar.resolved_profiles[0].profile_id,
             )
 
-    def test_nine_stage_event_order_marks_disabled_pushes_skipped(self):
+    def test_ten_stage_event_order_marks_disabled_pushes_skipped(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_workflow_config(
                 Path(directory),
@@ -885,6 +924,8 @@ class WorkflowTests(unittest.TestCase):
                 ("old_leave", "done"),
                 ("new_login", "active"),
                 ("new_login", "done"),
+                ("member_verify", "active"),
+                ("member_verify", "done"),
                 ("pat", "active"),
                 ("pat", "done"),
                 ("cpa", "active"),
@@ -899,6 +940,346 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIsNone(result["push"])
         self.assertIsNone(result["sub2api"])
+
+    def test_member_limit_blocks_before_any_handoff_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+            registrar = FakeRegistrar()
+            chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            chatgpt.member_state["members"]["user-third"] = {
+                "id": "user-third",
+                "email": "third@example.com",
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "member limit exceeded"):
+                WorkflowRunner(
+                    config,
+                    **run_dependencies(config, checkpoint),
+                    registrar=registrar,
+                    chatgpt=chatgpt,
+                    verbose=False,
+                ).run()
+
+        self.assertFalse(
+            any(call[0] in {"invite", "leave", "pat"} for call in chatgpt.calls)
+        )
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+        self.assertIsNone(checkpoint.get("invite"))
+        self.assertIsNone(checkpoint.get("new_login"))
+
+    def test_unrelated_pending_invite_blocks_target_invite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+            registrar = FakeRegistrar()
+            chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            chatgpt.member_state["invites"].add("other@example.com")
+
+            with self.assertRaisesRegex(RuntimeError, "unrelated pending invites"):
+                WorkflowRunner(
+                    config,
+                    **run_dependencies(config, checkpoint),
+                    registrar=registrar,
+                    chatgpt=chatgpt,
+                    verbose=False,
+                ).run()
+
+        self.assertFalse(any(call[0] == "invite" for call in chatgpt.calls))
+        self.assertFalse(any(call[0] == "leave" for call in chatgpt.calls))
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+
+    def test_leave_failure_prevents_new_child_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+            registrar = FakeRegistrar()
+
+            class FailingLeaveChatGPT(FakeChatGPT):
+                def leave(self, access_token_value, account_id, user_id):
+                    del access_token_value
+                    self.calls.append(("leave", account_id, user_id))
+                    raise RuntimeError("leave request failed")
+
+            chatgpt = FailingLeaveChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "leave request failed"):
+                WorkflowRunner(
+                    config,
+                    **run_dependencies(config, checkpoint),
+                    registrar=registrar,
+                    chatgpt=chatgpt,
+                    verbose=False,
+                ).run()
+
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+        self.assertEqual(checkpoint.get("old_leave")["action"], "started")
+        self.assertIsNone(checkpoint.get("new_login"))
+        self.assertFalse(any(call[0] == "pat" for call in chatgpt.calls))
+
+    def test_old_child_residue_blocks_new_login_before_join(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+            registrar = FakeRegistrar()
+
+            class NonRemovingLeaveChatGPT(FakeChatGPT):
+                def leave(self, access_token_value, account_id, user_id):
+                    del access_token_value
+                    self.calls.append(("leave", account_id, user_id))
+                    return {"ok": True}
+
+            chatgpt = NonRemovingLeaveChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+
+            with patch(
+                "team_protocol.workflow._MEMBER_FEEDBACK_TIMEOUT_SECONDS", 0
+            ):
+                with self.assertRaisesRegex(RuntimeError, "old child is still active"):
+                    WorkflowRunner(
+                        config,
+                        **run_dependencies(config, checkpoint),
+                        registrar=registrar,
+                        chatgpt=chatgpt,
+                        verbose=False,
+                    ).run()
+
+        self.assertIsNone(checkpoint.get("new_login"))
+        self.assertIsNone(checkpoint.get("member_verify"))
+        self.assertIsNone(checkpoint.get("pat"))
+        self.assertFalse(any(call[0] == "pat" for call in chatgpt.calls))
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+
+    def test_no_free_slot_after_old_leave_blocks_new_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+            registrar = FakeRegistrar()
+
+            class ConcurrentMemberChatGPT(FakeChatGPT):
+                def leave(self, access_token_value, account_id, user_id):
+                    result = super().leave(access_token_value, account_id, user_id)
+                    self.member_state["members"]["user-third"] = {
+                        "id": "user-third",
+                        "email": "third@example.com",
+                    }
+                    return result
+
+            chatgpt = ConcurrentMemberChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+
+            with patch(
+                "team_protocol.workflow._MEMBER_FEEDBACK_TIMEOUT_SECONDS", 0
+            ):
+                with self.assertRaisesRegex(RuntimeError, "no free member slot"):
+                    WorkflowRunner(
+                        config,
+                        **run_dependencies(config, checkpoint),
+                        registrar=registrar,
+                        chatgpt=chatgpt,
+                        verbose=False,
+                    ).run()
+
+        self.assertIsNone(checkpoint.get("new_login"))
+        self.assertIsNone(checkpoint.get("member_verify"))
+        self.assertIsNone(checkpoint.get("pat"))
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+
+    def test_resume_after_leave_crash_accepts_revoked_old_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+
+            class CrashAfterLeaveChatGPT(FakeChatGPT):
+                def leave(self, access_token_value, account_id, user_id):
+                    super().leave(access_token_value, account_id, user_id)
+                    raise RuntimeError("simulated crash after leave")
+
+            first_chatgpt = CrashAfterLeaveChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            with self.assertRaisesRegex(RuntimeError, "simulated crash after leave"):
+                WorkflowRunner(
+                    config,
+                    **run_dependencies(config, checkpoint),
+                    registrar=FakeRegistrar(),
+                    chatgpt=first_chatgpt,
+                    verbose=False,
+                ).run()
+
+            self.assertEqual(checkpoint.get("old_leave")["action"], "started")
+            self.assertIsNone(checkpoint.get("new_login"))
+
+            class RevokedOldAccessChatGPT(FakeChatGPT):
+                def get_members(self, access_token_value, account_id):
+                    old_token = access_token(
+                        self.old_email,
+                        self.workspace_id,
+                        self.old_user_id,
+                    )
+                    if access_token_value == old_token:
+                        self.calls.append(("members", account_id))
+                        raise ChatGPTApiError("HTTP 403", status_code=403)
+                    return super().get_members(access_token_value, account_id)
+
+            resumed_chatgpt = RevokedOldAccessChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                first_chatgpt.member_state,
+            )
+            resumed_registrar = FakeRegistrar()
+            result = WorkflowRunner(
+                config,
+                **run_dependencies(config, checkpoint),
+                registrar=resumed_registrar,
+                chatgpt=resumed_chatgpt,
+                verbose=False,
+            ).run()
+
+        self.assertTrue(result["member_guard"]["verified"])
+        self.assertEqual(
+            checkpoint.get("old_leave")["departure_guard"]["measurement"],
+            "access-revoked",
+        )
+        self.assertEqual(
+            [email for email, _proxy in resumed_registrar.calls],
+            [config.new_account.email],
+        )
+        self.assertFalse(
+            any(call[0] in {"invite", "leave"} for call in resumed_chatgpt.calls)
+        )
+
+    def test_member_verification_rejects_missing_new_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+
+            class MissingJoinChatGPT(FakeChatGPT):
+                def refresh_session(self, session_token, account_id=None):
+                    result = super().refresh_session(
+                        session_token, account_id=account_id
+                    )
+                    if (
+                        session_token.startswith("new-")
+                        and account_id == self.workspace_id
+                    ):
+                        self.member_state["members"].pop(self.new_user_id, None)
+                    return result
+
+            chatgpt = MissingJoinChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "new child is missing"):
+                WorkflowRunner(
+                    config,
+                    **run_dependencies(config, checkpoint),
+                    registrar=FakeRegistrar(),
+                    chatgpt=chatgpt,
+                    verbose=False,
+                ).run()
+
+        self.assertIsNone(checkpoint.get("member_verify"))
+        self.assertIsNone(checkpoint.get("pat"))
+        self.assertFalse(any(call[0] == "pat" for call in chatgpt.calls))
+
+    def test_resume_with_pat_checkpoint_still_rechecks_member_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory), push=False, sub2api_push=False
+            )
+            checkpoint = InMemoryCheckpoint()
+            first_chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            WorkflowRunner(
+                config,
+                **run_dependencies(config, checkpoint),
+                registrar=FakeRegistrar(),
+                chatgpt=first_chatgpt,
+                verbose=False,
+            ).run()
+            self.assertIsInstance(checkpoint.get("pat"), dict)
+            first_chatgpt.member_state["members"]["user-third"] = {
+                "id": "user-third",
+                "email": "third@example.com",
+            }
+            resumed_chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+                first_chatgpt.member_state,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "member limit exceeded"):
+                WorkflowRunner(
+                    config,
+                    **run_dependencies(config, checkpoint),
+                    registrar=FakeRegistrar(),
+                    chatgpt=resumed_chatgpt,
+                    verbose=False,
+                ).run()
+
+        self.assertFalse(
+            any(
+                call[0] in {"invite", "leave", "pat", "refresh"}
+                for call in resumed_chatgpt.calls
+            )
+        )
 
     def test_sub2api_export_rejects_embedded_session_material(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -988,6 +1369,7 @@ class WorkflowTests(unittest.TestCase):
                 config.workspace_id,
                 config.old_account.email,
                 config.new_account.email,
+                first_chatgpt.member_state,
             )
             resumed_management = FakeManagement()
             resumed_sub2api = FakeSub2API()
@@ -1007,12 +1389,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(first_management.calls), 1)
         self.assertEqual(len(first_sub2api.calls), 1)
         self.assertEqual(resumed_registrar.calls, [])
-        self.assertEqual(resumed_chatgpt.calls, [])
+        self.assertFalse(
+            any(
+                call[0] in {"invite", "leave", "pat", "refresh"}
+                for call in resumed_chatgpt.calls
+            )
+        )
         self.assertEqual(resumed_management.calls, [])
         self.assertEqual(resumed_sub2api.calls, [])
         for name in (
             "invite",
             "old_leave",
+            "member_verify",
             "pat",
             "sub2api_export",
             "push",
@@ -1113,15 +1501,24 @@ class WorkflowTests(unittest.TestCase):
                 proxy_geo=geo,
                 fingerprint_profile=new_profile.to_legacy_dict(),
             )
+            member_state = {
+                "members": {
+                    "user-owner": {"id": "user-owner", "email": "owner@example.com"},
+                    "user-old": {"id": "user-old", "email": config.old_account.email},
+                },
+                "invites": set(),
+            }
             old_chatgpt = FakeChatGPT(
                 config.workspace_id,
                 config.old_account.email,
                 config.new_account.email,
+                member_state,
             )
             new_chatgpt = FakeChatGPT(
                 config.workspace_id,
                 config.old_account.email,
                 config.new_account.email,
+                member_state,
             )
 
             with patch(
@@ -1263,16 +1660,17 @@ class WorkflowTests(unittest.TestCase):
             fixed_proxy = "http://fixed-user:fixed-pass@proxy.example:9000"
             first_registrar = FakeRegistrar()
 
+            first_chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
             WorkflowRunner(
                 config,
                 **run_dependencies(config, checkpoint),
                 expanded_proxy=fixed_proxy,
                 registrar=first_registrar,
-                chatgpt=FakeChatGPT(
-                    config.workspace_id,
-                    config.old_account.email,
-                    config.new_account.email,
-                ),
+                chatgpt=first_chatgpt,
                 verbose=False,
             ).run()
 
@@ -1296,6 +1694,7 @@ class WorkflowTests(unittest.TestCase):
                     config.workspace_id,
                     config.old_account.email,
                     config.new_account.email,
+                    first_chatgpt.member_state,
                 ),
                 verbose=False,
             ).run()

@@ -13,7 +13,9 @@ DEFAULT_PAT_SCOPES = [
 
 
 class ChatGPTApiError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -129,7 +131,10 @@ class ChatGPTClient:
         response = self._session.request(method, url, **kwargs)
         if not 200 <= response.status_code < 300:
             detail = response.text.strip()
-            raise ChatGPTApiError(f"HTTP {response.status_code}: {detail[:1000]}")
+            raise ChatGPTApiError(
+                f"HTTP {response.status_code}: {detail[:1000]}",
+                status_code=response.status_code,
+            )
         try:
             data = response.json()
         except Exception as exc:

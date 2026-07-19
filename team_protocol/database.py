@@ -48,6 +48,7 @@ WORKFLOW_STEPS = (
     "invite",
     "old_leave",
     "new_login",
+    "member_verify",
     "pat",
     "cpa",
     "sub2api_export",

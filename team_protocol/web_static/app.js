@@ -3,9 +3,10 @@
 const STEP_GROUPS = [
   ["账号接力", [
     ["old_login", "旧子号登录"],
-    ["invite", "旧子号邀请新号"],
-    ["old_leave", "旧子号退出 Team"],
+    ["invite", "校验成员并邀请新号"],
+    ["old_leave", "旧子号退出并确认"],
     ["new_login", "新子号注册入组"],
+    ["member_verify", "复核活跃成员 ≤ 2"],
   ]],
   ["凭据导出", [
     ["pat", "新子号创建 PAT"],
@@ -608,7 +609,7 @@ function renderWorkspaceTable() {
       const rotationCount = Number(firstValue(workspace, ["rotation_count"], 0));
       const ownerEmail = safeString(firstValue(workspace, ["owner_email"]));
       const workspaceDetail = ownerEmail
-        ? `归属母号 ${ownerEmail}（母号不操作） · 已用完 ${numberFormatter.format(Number(workspace.used_child_count || 0))} · 接力 ${numberFormatter.format(rotationCount)} 次`
+        ? `归属母号 ${ownerEmail}（母号不操作） · 2 人硬上限 · 已用完 ${numberFormatter.format(Number(workspace.used_child_count || 0))} · 接力 ${numberFormatter.format(rotationCount)} 次`
         : `轮换 ${numberFormatter.format(rotationCount)} 次`;
       row.append(labeledCell("空间", primarySecondary(workspaceName(workspace), workspaceDetail)));
 
@@ -2070,6 +2071,8 @@ function stageStatesFromRun(run, events) {
     for (const [step] of STEP_DEFINITIONS) {
       if (step === "sub2api_export") {
         result[step] = firstValue(output, ["sub2api_path", "sub2api_export_path"]) ? "done" : "skipped";
+      } else if (step === "member_verify") {
+        result[step] = output.member_guard?.verified ? "done" : "skipped";
       } else if (step === "push") {
         result[step] = output.push ? "done" : "skipped";
       } else if (step === "push_sub2api") {
@@ -2114,6 +2117,11 @@ function renderRunDetail(run, events = []) {
   const id = runId(run);
   const runState = safeString(firstValue(run, ["state", "status"], "queued"));
   const [current, next] = runAccountSnapshot(run);
+  const result = runResultObject(run);
+  const memberGuard = firstValue(result, ["member_guard"], null);
+  const memberGuardText = memberGuard?.verified
+    ? `${numberFormatter.format(Number(memberGuard.active_members || 0))} / 2 · 已复核`
+    : "2 人硬上限";
   byId("run-dialog-title").textContent = runWorkspaceLabel(run);
   const identity = element("div", {className: "run-identity"});
   const identityItems = [
@@ -2121,6 +2129,7 @@ function renderRunDetail(run, events = []) {
     ["运行 ID", element("strong", {className: "cell-code", text: shortId(id), attrs: {title: id}})],
     ["当前账号快照", element("strong", {text: current, attrs: {title: current}})],
     ["下一账号快照", element("strong", {text: next, attrs: {title: next}})],
+    ["活跃成员", element("strong", {text: memberGuardText})],
   ];
   for (const [label, value] of identityItems) {
     const item = element("div", {}, [element("span", {text: label}), value]);
@@ -2188,7 +2197,6 @@ function renderRunDetail(run, events = []) {
   details.append(log);
   container.append(details);
 
-  const result = runResultObject(run);
   const outputs = [
     ["CPA 文件", firstValue(result, ["cpa_path", "output_path"], firstValue(run, ["cpa_path"]))],
     ["Sub2API 文件", firstValue(result, ["sub2api_path", "sub2api_export_path"], firstValue(run, ["sub2api_path"]))],
@@ -3074,9 +3082,10 @@ async function replaceIcloudWorkspaceChild(id) {
     throw new ApiError("空间未绑定 iCloud 归属母号", {code: "owner_missing"});
   }
   const hasPreparedNext = Boolean(workspace.next_account_id);
+  const memberLimitNotice = "\n\n活跃成员硬上限为 2；旧子号退出成功后才允许新子号登录。";
   const message = hasPreparedNext
-    ? `下一子号 ${workspaceAccountLabel(workspace, "next")} 已准备好，立即由当前子号开始接力？`
-    : `将通过 HME 资源池为 ${safeString(workspace.owner_email)} 名下新建一个隐藏邮箱，并由当前子号启动接力。母号不会登录或操作。确认继续？`;
+    ? `下一子号 ${workspaceAccountLabel(workspace, "next")} 已准备好，立即由当前子号开始接力？${memberLimitNotice}`
+    : `将通过 HME 资源池为 ${safeString(workspace.owner_email)} 名下新建一个隐藏邮箱，并由当前子号启动接力。母号不会登录或操作。确认继续？${memberLimitNotice}`;
   if (!window.confirm(message)) return;
   const result = await api(
     `/api/workspaces/${encodeURIComponent(id)}/replace-icloud-child`,

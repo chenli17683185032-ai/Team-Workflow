@@ -4,8 +4,9 @@ from __future__ import annotations
 STEP_DEFINITIONS = (
     ("old_login", "旧号登录"),
     ("invite", "邀请新号"),
-    ("old_leave", "旧号退出"),
+    ("old_leave", "旧号退出并确认"),
     ("new_login", "新号注册"),
+    ("member_verify", "复核两人上限"),
     ("pat", "创建令牌"),
     ("cpa", "导出 CPA"),
     ("sub2api_export", "导出 Sub2 JSON"),

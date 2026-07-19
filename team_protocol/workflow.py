@@ -4,12 +4,13 @@ import json
 import os
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
-from .chatgpt import AuthContext, ChatGPTClient
+from .chatgpt import AuthContext, ChatGPTApiError, ChatGPTClient
 from .cpa import build_cpa, build_cpa_filename
 from .management import ManagementClient
 from .registrar import (
@@ -31,6 +32,9 @@ _BROWSERFORGE_STATE_STEP = "_browserforge_fingerprint"
 _BROWSER_TOOLCHAIN_STATE_STEP = "_browser_toolchain"
 _PROXY_GEO_STATE_STEP = "_proxy_geo"
 _REGISTRAR_PROVIDER_STATE_STEP = "_registrar_provider_state"
+_TEAM_MEMBER_LIMIT = 2
+_MEMBER_FEEDBACK_TIMEOUT_SECONDS = 15.0
+_MEMBER_FEEDBACK_POLL_SECONDS = 0.5
 _FINGERPRINT_BOUND_STEPS = (
     "old_login",
     "old_workspace",
@@ -38,6 +42,7 @@ _FINGERPRINT_BOUND_STEPS = (
     "old_leave",
     "new_login",
     "new_workspace",
+    "member_verify",
     "pat",
 )
 _MAX_CLOCK_SKEW_SECONDS = 60.0
@@ -139,11 +144,49 @@ def _email_from_item(item: Mapping[str, Any]) -> str:
 
 
 def _items(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    for key in ("items", "users", "account_invites"):
+    for key in ("items", "users", "members", "account_invites", "invites"):
         value = payload.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _counted_items(payload: Mapping[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    items = _items(payload)
+    raw_total = payload.get("total")
+    if isinstance(raw_total, bool):
+        return items, len(items)
+    try:
+        reported_total = int(raw_total)
+    except (TypeError, ValueError):
+        reported_total = len(items)
+    return items, max(len(items), max(0, reported_total))
+
+
+def _identity_present(
+    items: list[dict[str, Any]], *, user_id: str, email: str
+) -> bool:
+    normalized_id = str(user_id or "").strip()
+    normalized_email = str(email or "").strip().casefold()
+    for item in items:
+        item_id = str(item.get("id") or item.get("user_id") or "").strip()
+        if normalized_id and item_id == normalized_id:
+            return True
+        if normalized_email and _email_from_item(item) == normalized_email:
+            return True
+    return False
+
+
+def _active_invites(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    terminal_states = frozenset(
+        {"accepted", "cancelled", "canceled", "deleted", "expired", "revoked"}
+    )
+    return [
+        item
+        for item in _items(payload)
+        if str(item.get("status") or item.get("state") or "").strip().casefold()
+        not in terminal_states
+    ]
 
 
 class WorkflowRunner:
@@ -323,7 +366,13 @@ class WorkflowRunner:
     def _account_bound_steps(role: str) -> tuple[str, ...]:
         if role == "old":
             return ("old_login", "old_workspace", "invite", "old_leave")
-        return ("new_login", "new_workspace_login", "new_workspace", "pat")
+        return (
+            "new_login",
+            "new_workspace_login",
+            "new_workspace",
+            "member_verify",
+            "pat",
+        )
 
     def _resolve_account_network(
         self,
@@ -641,18 +690,34 @@ class WorkflowRunner:
     def _ensure_invited(self, old_session: Mapping[str, Any]) -> dict[str, Any]:
         self._check_cancel()
         cached = self.state.get("invite")
-        if isinstance(cached, dict):
-            self._log("[resume] invite")
+        leave_checkpoint = self.state.get("old_leave")
+        if isinstance(cached, dict) and isinstance(leave_checkpoint, dict):
+            self._log("[resume] invite handoff already entered leave stage")
             return cached
         context = AuthContext.from_mapping(old_session)
         target = self.config.new_account.email.casefold()
         client = self._chatgpt_clients["old"]
         members = client.get_members(context.access_token, self.config.workspace_id)
-        if any(_email_from_item(item) == target for item in _items(members)):
+        member_items, active_member_count = _counted_items(members)
+        if active_member_count != len(member_items):
+            raise RuntimeError("Team member list is incomplete")
+        if active_member_count > _TEAM_MEMBER_LIMIT:
+            raise RuntimeError(
+                f"Team active member limit exceeded ({active_member_count}/{_TEAM_MEMBER_LIMIT})"
+            )
+        invites = client.get_invites(context.access_token, self.config.workspace_id)
+        active_invites = _active_invites(invites)
+        if any(_email_from_item(item) != target for item in active_invites):
+            raise RuntimeError("Team has unrelated pending invites")
+        if isinstance(cached, dict):
+            self._log(
+                f"[resume] invite active_members={active_member_count}/{_TEAM_MEMBER_LIMIT}"
+            )
+            return cached
+        if any(_email_from_item(item) == target for item in member_items):
             result = {"action": "already-member", "email": self.config.new_account.email}
         else:
-            invites = client.get_invites(context.access_token, self.config.workspace_id)
-            if any(_email_from_item(item) == target for item in _items(invites)):
+            if any(_email_from_item(item) == target for item in active_invites):
                 result = {"action": "already-invited", "email": self.config.new_account.email}
             else:
                 response = client.invite(
@@ -661,6 +726,8 @@ class WorkflowRunner:
                     self.config.new_account.email,
                 )
                 result = {"action": "invited", "email": self.config.new_account.email, "response": response}
+        result["active_members_before"] = active_member_count
+        result["member_limit"] = _TEAM_MEMBER_LIMIT
         self.state.set("invite", result)
         self._log(f"[invite] {result['action']} {self.config.new_account.email}")
         if self.config.invite_settle_seconds:
@@ -671,32 +738,211 @@ class WorkflowRunner:
                 threading.Event().wait(self.config.invite_settle_seconds)
         return result
 
+    def _wait_for_old_departure(
+        self,
+        old_session: Mapping[str, Any],
+        *,
+        deletion_started: bool,
+    ) -> dict[str, Any]:
+        context = AuthContext.from_mapping(old_session)
+        client = self._chatgpt_clients["old"]
+        new_login = self.state.get("new_login")
+        new_context = (
+            AuthContext.from_mapping(new_login)
+            if isinstance(new_login, Mapping)
+            else None
+        )
+        deadline = time.monotonic() + _MEMBER_FEEDBACK_TIMEOUT_SECONDS
+        while True:
+            self._check_cancel()
+            try:
+                members = client.get_members(
+                    context.access_token,
+                    self.config.workspace_id,
+                )
+            except ChatGPTApiError as exc:
+                if deletion_started and exc.status_code in {401, 403}:
+                    result = {
+                        "verified": True,
+                        "active_members": None,
+                        "member_limit": _TEAM_MEMBER_LIMIT,
+                        "old_child_absent": True,
+                        "measurement": "access-revoked",
+                    }
+                    self._log("[leave-verify] old child access revoked")
+                    return result
+                raise
+
+            member_items, active_member_count = _counted_items(members)
+            if active_member_count != len(member_items):
+                raise RuntimeError("Team member list is incomplete after old child leave")
+            if active_member_count > _TEAM_MEMBER_LIMIT:
+                raise RuntimeError(
+                    f"Team active member limit exceeded before new child login "
+                    f"({active_member_count}/{_TEAM_MEMBER_LIMIT})"
+                )
+            old_child_present = _identity_present(
+                member_items,
+                user_id=context.user_id,
+                email=self.config.old_account.email,
+            )
+            new_child_present = _identity_present(
+                member_items,
+                user_id=new_context.user_id if new_context is not None else "",
+                email=self.config.new_account.email,
+            )
+            has_join_capacity = active_member_count < _TEAM_MEMBER_LIMIT
+            if not old_child_present and (has_join_capacity or new_child_present):
+                result = {
+                    "verified": True,
+                    "active_members": active_member_count,
+                    "member_limit": _TEAM_MEMBER_LIMIT,
+                    "old_child_absent": True,
+                    "new_child_present": new_child_present,
+                    "measurement": "member-list",
+                }
+                self._log(
+                    f"[leave-verify] active_members={active_member_count}/{_TEAM_MEMBER_LIMIT}"
+                )
+                return result
+
+            if time.monotonic() >= deadline:
+                if old_child_present:
+                    raise RuntimeError(
+                        "Team departure verification failed before new child login: "
+                        "old child is still active"
+                    )
+                raise RuntimeError(
+                    "Team departure verification failed before new child login: "
+                    "no free member slot"
+                )
+
+            wait_seconds = min(
+                _MEMBER_FEEDBACK_POLL_SECONDS,
+                max(0.0, deadline - time.monotonic()),
+            )
+            if self.stop_event is not None:
+                if self.stop_event.wait(wait_seconds):
+                    raise WorkflowCancelled("workflow cancelled")
+            else:
+                threading.Event().wait(wait_seconds)
+
     def _leave_old_account(self, old_session: Mapping[str, Any]) -> dict[str, Any]:
         self._check_cancel()
         cached = self.state.get("old_leave")
-        if isinstance(cached, dict):
-            self._log("[resume] old_leave")
-            return cached
         context = AuthContext.from_mapping(old_session)
         if not context.user_id:
             raise RuntimeError("old account session has no user id")
         client = self._chatgpt_clients["old"]
-        members = client.get_members(context.access_token, self.config.workspace_id)
-        member_ids = {
-            str(item.get("id") or item.get("user_id") or "").strip()
-            for item in _items(members)
-        }
-        if context.user_id not in member_ids:
-            result = {"action": "already-left", "user_id": context.user_id}
-        else:
-            response = client.leave(
-                context.access_token,
-                self.config.workspace_id,
-                context.user_id,
+        if isinstance(cached, dict) and cached.get("action") != "started":
+            departure_guard = self._wait_for_old_departure(
+                old_session,
+                deletion_started=True,
             )
-            result = {"action": "left", "user_id": context.user_id, "response": response}
+            result = dict(cached)
+            result["departure_guard"] = departure_guard
+            self.state.set("old_leave", result)
+            self._log("[resume] old_leave verified")
+            return result
+
+        deletion_started = isinstance(cached, dict)
+        try:
+            members = client.get_members(context.access_token, self.config.workspace_id)
+        except ChatGPTApiError as exc:
+            if not deletion_started or exc.status_code not in {401, 403}:
+                raise
+            result = {
+                "action": "already-left",
+                "user_id": context.user_id,
+                "departure_guard": {
+                    "verified": True,
+                    "active_members": None,
+                    "member_limit": _TEAM_MEMBER_LIMIT,
+                    "old_child_absent": True,
+                    "measurement": "access-revoked",
+                },
+            }
+        else:
+            member_items, active_member_count = _counted_items(members)
+            if active_member_count != len(member_items):
+                raise RuntimeError("Team member list is incomplete before old child leave")
+            old_child_present = _identity_present(
+                member_items,
+                user_id=context.user_id,
+                email=self.config.old_account.email,
+            )
+            response = None
+            action = "already-left"
+            if old_child_present:
+                self.state.set(
+                    "old_leave",
+                    {"action": "started", "user_id": context.user_id},
+                )
+                deletion_started = True
+                response = client.leave(
+                    context.access_token,
+                    self.config.workspace_id,
+                    context.user_id,
+                )
+                action = "left"
+            departure_guard = self._wait_for_old_departure(
+                old_session,
+                deletion_started=deletion_started,
+            )
+            result = {
+                "action": action,
+                "user_id": context.user_id,
+                "departure_guard": departure_guard,
+            }
+            if response is not None:
+                result["response"] = response
         self.state.set("old_leave", result)
         self._log(f"[leave] {result['action']} {context.user_id}")
+        return result
+
+    def _verify_team_membership(
+        self,
+        new_session: Mapping[str, Any],
+        old_session: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        self._check_cancel()
+        new_context = AuthContext.from_mapping(new_session)
+        old_context = AuthContext.from_mapping(old_session)
+        members = self._chatgpt_clients["new"].get_members(
+            new_context.access_token,
+            self.config.workspace_id,
+        )
+        member_items, active_member_count = _counted_items(members)
+        if active_member_count != len(member_items):
+            raise RuntimeError("Team member list is incomplete after handoff")
+        if active_member_count > _TEAM_MEMBER_LIMIT:
+            raise RuntimeError(
+                f"Team active member limit exceeded after handoff "
+                f"({active_member_count}/{_TEAM_MEMBER_LIMIT})"
+            )
+        if _identity_present(
+            member_items,
+            user_id=old_context.user_id,
+            email=self.config.old_account.email,
+        ):
+            raise RuntimeError("Team membership verification failed: old child is still active")
+        if not _identity_present(
+            member_items,
+            user_id=new_context.user_id,
+            email=self.config.new_account.email,
+        ):
+            raise RuntimeError("Team membership verification failed: new child is missing")
+        result = {
+            "verified": True,
+            "active_members": active_member_count,
+            "member_limit": _TEAM_MEMBER_LIMIT,
+            "old_child_absent": True,
+            "new_child_present": True,
+        }
+        self.state.set("member_verify", result)
+        self._log(
+            f"[member-verify] active_members={active_member_count}/{_TEAM_MEMBER_LIMIT}"
+        )
         return result
 
     def _create_pat(self, new_session: Mapping[str, Any]) -> dict[str, Any]:
@@ -1023,7 +1269,7 @@ class WorkflowRunner:
                 ),
             )
 
-            def pat_stage() -> tuple[dict[str, Any], dict[str, Any]]:
+            def member_verify_stage() -> tuple[dict[str, Any], dict[str, Any]]:
                 try:
                     new_workspace = self._switch_workspace(new_login, "new_workspace")
                 except _WorkspaceSwitchError:
@@ -1036,9 +1282,16 @@ class WorkflowRunner:
                         workspace_login,
                         "new_workspace",
                     )
-                return new_workspace, self._create_pat(new_workspace)
+                member_verify = self._verify_team_membership(
+                    new_workspace,
+                    old_workspace,
+                )
+                return new_workspace, member_verify
 
-            new_workspace, pat = self._run_stage("pat", pat_stage)
+            new_workspace, member_verify = self._run_stage(
+                "member_verify", member_verify_stage
+            )
+            pat = self._run_stage("pat", lambda: self._create_pat(new_workspace))
             cpa_path = self._run_stage(
                 "cpa", lambda: self._write_cpa(new_workspace, pat)
             )
@@ -1057,6 +1310,7 @@ class WorkflowRunner:
                 "workspace_id": self.config.workspace_id,
                 "invite": invite.get("action"),
                 "old_leave": old_leave.get("action"),
+                "member_guard": member_verify,
                 "cpa_path": str(cpa_path.resolve()),
                 "sub2api_path": str(sub2api_path.resolve()),
                 "push": push,

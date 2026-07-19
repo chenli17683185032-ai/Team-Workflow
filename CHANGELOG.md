@@ -13,6 +13,8 @@
 - PAT 创建后无条件导出 CPA 与 Sub2API JSON；Sub2API 管理端未配置时仍能得到可导入文件。
 - Sub2API 导出对齐 `GPTSession2CPAandSub2API` 的 `exported_at / proxies / accounts` 结构，使用新建 Team PAT 作为账号令牌，并由 Session 补齐账号身份。
 - 运行详情按“账号接力 / 凭据导出 / 可选交付”重排，分别展示 CPA 与 Sub2API 文件路径及两种推送结果。
+- Team 接力增加固定两人硬上限：邀请前校验活跃人数和无关待邀请，新号入组后复核旧号缺席、新号存在且总人数不超过 2。
+- 工作流与运行详情扩展为十阶段，独立显示“成员校验并邀请”和“复核活跃成员 ≤ 2”；空间行固定显示 `2 人硬上限`。
 
 ### 稳定性与安全
 
@@ -21,12 +23,13 @@
 - iCloud 转发 OTP 等待窗口放宽到 90 秒；资源池显式留空代理时 IMAP 保持直连，不继承子号工作流代理。
 - Chromium 端将本地 `socks5h` 中继规范化为兼容的 `socks5`；CPA/PAT 产物从创建起即使用 `0600` 权限。
 - CPA 与 Sub2API 文件改为原子写入并保持 `0600`；Sub2API 文件不包含 Web `sessionToken`，断点恢复只重建缺失文件，不重复创建 PAT。
+- 旧号退出增加“开始退出”断点与最长 15 秒成员反馈：旧号仍残留或剩余两名无关成员时，新号不会登录；退出后崩溃且旧号权限已撤销时可安全恢复。成员超限、无关 pending 或新号缺失仍会在 PAT 和轮换提交前中止。
 
 ### 验证
 
-- macOS：全量 262 项测试中 256 项通过，6 项 Windows DPAPI 测试按平台跳过；Python、JavaScript 语法与 `git diff --check` 通过。
+- macOS：全量 271 项测试中 265 项通过，6 项 Windows DPAPI 测试按平台跳过；Python、JavaScript 语法与 `git diff --check` 通过。
 - `组2-9` 真实 Sub2API 文件与既有可用样本的顶层、账号、credentials 和 extra 字段结构完全一致；PAT、workspace、session 排除及 `0600` 权限校验通过。
-- 控制台在 `1600×1000` 和 `390×844` 验证九阶段、四项输出及长路径展示，无横向溢出或文字裁切；历史 OAuth `state/code/token` 查询参数在 API/日志中统一脱敏。
+- 控制台在 `1600×1000` 和 `390×844` 实测十阶段运行详情：桌面保持 `960px` 宽、移动端单列显示，均无横向溢出；旧运行的成员复核明确显示“跳过”，历史 OAuth `state/code/token` 查询参数在 API/日志中统一脱敏。
 
 ## 2026-07-18
 
