@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import stat
 import threading
 import time
 import unittest
@@ -19,6 +22,7 @@ from team_protocol.icloud_hme_capture import (
     _click_icloud_sign_in,
     _is_authenticated_setup_response,
     _macos_browser_command,
+    _prepare_capture_profile,
     _session_from_authenticated_context,
 )
 
@@ -88,6 +92,74 @@ class ICloudHmeCaptureTests(unittest.TestCase):
         serialized = json.dumps(statuses, ensure_ascii=False)
         self.assertNotIn("captured-session-secret", serialized)
         self.assertTrue(manager.shutdown())
+
+    def test_manager_reuses_one_private_hashed_profile_per_mailbox(self):
+        observed_profiles = []
+
+        def runner(**kwargs):
+            profile_dir = Path(kwargs["profile_dir"])
+            observed_profiles.append(profile_dir)
+            (profile_dir / "profile-state").write_text("kept", encoding="utf-8")
+            kwargs["on_waiting"]()
+            return captured_session()
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile_root = Path(directory) / "icloud-hme"
+            manager = ICloudHmeCaptureManager(
+                on_session=lambda *_args: None,
+                runner=runner,
+                profile_root=profile_root,
+            )
+
+            manager.start("mailbox-one")
+            self.assertEqual(
+                self.wait_for_terminal(manager, "mailbox-one")["state"],
+                "captured",
+            )
+            manager.start("mailbox-one")
+            self.assertEqual(
+                self.wait_for_terminal(manager, "mailbox-one")["state"],
+                "captured",
+            )
+            manager.start("mailbox-two")
+            self.assertEqual(
+                self.wait_for_terminal(manager, "mailbox-two")["state"],
+                "captured",
+            )
+
+            first, repeated, second = observed_profiles
+            self.assertEqual(first, repeated)
+            self.assertNotEqual(first, second)
+            self.assertEqual(
+                first.name,
+                hashlib.sha256(b"mailbox-one").hexdigest(),
+            )
+            self.assertNotIn("mailbox-one", str(first))
+            self.assertEqual((first / "profile-state").read_text(), "kept")
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(profile_root.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o700)
+            self.assertTrue(manager.shutdown())
+
+    def test_capture_profile_cleanup_only_applies_to_internal_temporary_dirs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistent = Path(directory) / "persistent"
+            prepared, should_cleanup = _prepare_capture_profile(persistent)
+
+            self.assertEqual(prepared, persistent)
+            self.assertFalse(should_cleanup)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(prepared.stat().st_mode), 0o700)
+
+        temporary, should_cleanup = _prepare_capture_profile(None)
+        try:
+            self.assertTrue(should_cleanup)
+            self.assertTrue(temporary.is_dir())
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+        finally:
+            temporary.rmdir()
 
     def test_manager_rejects_concurrent_capture_and_cancels_cleanly(self):
         entered = threading.Event()

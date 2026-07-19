@@ -118,6 +118,7 @@ $ErrorActionPreference = 'Stop'
 | 应用数据库（Windows） | `%LOCALAPPDATA%\TeamWorkflowConsole\console.db` | 敏感字段使用 Windows DPAPI 加密 |
 | 应用数据库（macOS） | `~/Library/Application Support/TeamWorkflowConsole/console.db` | Keychain 主密钥 + AES-GCM |
 | iCloud 资源池、母号与 Alias | 应用数据库内的独立表 | HME Cookie、IMAP 密码、各母号名下子号默认链路和远端 ID 分用途认证加密 |
+| iCloud 登录浏览器 profile | 应用数据目录下的 `browser-profiles/icloud-hme/<邮箱 ID 哈希>/` | 每个资源池独立，目录权限 `0700`；包含敏感 Cookie 和本地密码管理状态，不进入 Git 或项目加密备份 |
 | 加密备份 | 项目目录下的 `backups/` | 完整性校验 + 当前系统用户密钥绑定 |
 | CPA / session 导出 | 项目目录下的 `output\` | 明文凭据边界，仅在显式导出时产生 |
 | 邮箱源文件 | 用户选择的位置 | 仅在显式导入时读取，不由应用自动删除 |
@@ -202,7 +203,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 
 ### 准备信息
 
-1. 推荐直接使用控制台的“登录更新 HME”：应用会打开一次性的可见 Chrome for Testing 窗口，并自动进入 Apple 登录表单。你只需在其中登录 [中国区 iCloud](https://www.icloud.com.cn/) 并完成双重验证；登录验证成功后，应用优先等待 `GET /v2/hme/list`，即使 Hide My Email 子页面打不开，也会用新登录 Cookie 做一次 HME 只读校验并自动保存。
+1. 推荐直接使用控制台的“登录更新 HME”：应用会打开独立的可见 Chrome for Testing 窗口，并自动进入 Apple 登录页。首次在其中登录 [中国区 iCloud](https://www.icloud.com.cn/) 并完成双重验证后，同一资源池会长期复用该浏览器的 Cookie 和设备信任状态。登录验证成功后，应用优先等待 `GET /v2/hme/list`，即使 Hide My Email 子页面打不开，也会用当前 Cookie 做一次 HME 只读校验并自动保存。
 2. 准备隐藏邮箱实际转发到的邮箱 IMAP 信息。使用 iCloud Mail 时，通常为 `imap.mail.me.com:993`、完整 iCloud 邮箱地址，以及在 [Apple Account](https://account.apple.com/) 生成的 App 专用密码；其他邮箱使用对应服务商的 IMAP 参数。iCloud 转发 OTP 最长等待 90 秒，资源池代理显式留空时 IMAP 不会继承子号工作流代理。
 3. 按需准备资源池的 HME / IMAP S5。若希望 iCloud HME 直连，保持此字段为空；应用会显式忽略系统 `HTTP_PROXY/ALL_PROXY` 环境变量。若使用代理，建议填写稳定的 `socks5h://user:password@host:port`，不要使用会频繁轮换的动态源。
 4. 分别准备每个 Team 的完整代理链接，例如 CliProxy 提供的 `http://user:password@host:port`，也可使用固定 SOCKS5；历史 Loki `/gen` 链接继续兼容。新建子号会按归属继承对应本地中继地址，这不是母号登录代理。
@@ -222,7 +223,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 
 如本机 Clash 端口不同，可通过 `TEAM_WORKFLOW_LOCAL_CLASH_PROXY` 覆盖统一前置。HME / IMAP 仍按资源池自己的直连或独立 S5 设置运行，不进入上述工作流链路。
 
-自动捕获使用隔离的临时 Chrome for Testing profile，不读取你现有的 Chrome profile。登录期间浏览器可能在临时目录中写入 Cookie 和缓存；捕获完成、取消或超时后，应用会关闭浏览器并删除该目录。应用不接收 Apple 密码、验证码或 2FA 内容，也不保存 HAR、截图或 storage state；只把通过白名单校验并经过 HME 只读列表验证的最小 Session 加密写入资源池。
+自动捕获为每个 iCloud 资源池使用一个隔离的持久 Chrome for Testing profile，不读取你日常使用的 Chrome profile，也不在不同 iCloud 资源池间共享状态。捕获完成、取消或超时后应用会关闭浏览器进程，但保留 profile 中的 Cookie、站点存储、Apple 设备信任和本地密码管理数据，供下次登录复用。该目录位于 Git 工作区外、权限为 `0700`，不进入项目加密备份；应当按照已登录浏览器处理这个敏感目录。应用不接收或记录 Apple 密码、验证码或 2FA 内容，也不保存 HAR、截图或额外 storage state；只把通过白名单校验并经过 HME 只读列表验证的最小 Session 加密写入资源池。Apple 仍可根据服务端策略让 Cookie 过期或再次要求 2FA。
 
 手动导入仍然可用：如果自动捕获无法启动，在已登录的 iCloud 页面 Network 中找到 `/v2/hme/list`，使用“Copy as cURL”或导出 HAR，再在资源池编辑窗口粘贴。控制台只解析允许的 Apple HME host/path，导入原文不落盘。
 
@@ -295,7 +296,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、正常子号换班、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 290 项测试，其中 284 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、正常子号换班、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 292 项测试，其中 286 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 

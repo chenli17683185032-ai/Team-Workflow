@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import signal
 import shutil
@@ -111,6 +112,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
         "+00:00", "Z"
     )
+
+
+def _ensure_private_directory(path: Path) -> Path:
+    directory = path.expanduser()
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    except OSError as exc:
+        raise HmeCaptureUnavailableError(
+            "无法创建安全的 iCloud 登录资料目录"
+        ) from exc
+    return directory
+
+
+def _prepare_capture_profile(
+    profile_dir: str | Path | None,
+) -> tuple[Path, bool]:
+    if profile_dir is not None:
+        return _ensure_private_directory(Path(profile_dir)), False
+    try:
+        temporary = Path(tempfile.mkdtemp(prefix="teamworkflow-icloud-login-"))
+        temporary.chmod(0o700)
+    except OSError as exc:
+        raise HmeCaptureUnavailableError(
+            "无法创建安全的 iCloud 登录资料目录"
+        ) from exc
+    return temporary, True
 
 
 def _browser_executable() -> Path | None:
@@ -360,8 +388,9 @@ def capture_hme_session(
     timeout_seconds: float = DEFAULT_ICLOUD_CAPTURE_TIMEOUT_SECONDS,
     start_url: str = DEFAULT_ICLOUD_CAPTURE_URL,
     session_template: ICloudHmeSession | None = None,
+    profile_dir: str | Path | None = None,
 ) -> ICloudHmeSession:
-    """Open a temporary visible browser and wait for a valid HME list response."""
+    """Open a visible browser and wait for a valid HME list response."""
 
     try:
         from playwright.sync_api import Error as PlaywrightError
@@ -370,7 +399,7 @@ def capture_hme_session(
     except Exception as exc:
         raise HmeCaptureUnavailableError("Playwright is unavailable") from exc
 
-    profile_dir = Path(tempfile.mkdtemp(prefix="teamworkflow-icloud-login-"))
+    profile_path, cleanup_profile = _prepare_capture_profile(profile_dir)
     context: Any = None
     browser: Any = None
     external_browser: _ExternalBrowser | None = None
@@ -435,7 +464,7 @@ def capture_hme_session(
             if cancel_event.is_set():
                 raise HmeCaptureError("iCloud HME capture was cancelled")
             if sys.platform == "darwin":
-                external_browser = _launch_macos_browser(playwright, profile_dir)
+                external_browser = _launch_macos_browser(playwright, profile_path)
                 browser = playwright.chromium.connect_over_cdp(
                     external_browser.endpoint,
                     timeout=15_000,
@@ -458,7 +487,7 @@ def capture_hme_session(
                 if executable is not None:
                     launch_options["executable_path"] = str(executable)
                 context = playwright.chromium.launch_persistent_context(
-                    str(profile_dir),
+                    str(profile_path),
                     **launch_options,
                 )
             context.on("response", handle_response)
@@ -522,7 +551,8 @@ def capture_hme_session(
                 pass
         if external_browser is not None:
             _terminate_browser_process(external_browser.pid)
-        shutil.rmtree(profile_dir, ignore_errors=True)
+        if cleanup_profile:
+            shutil.rmtree(profile_path, ignore_errors=True)
 
 
 def _click_icloud_sign_in(page: Any) -> bool:
@@ -564,15 +594,28 @@ class ICloudHmeCaptureManager:
         get_session_template: SessionTemplateProvider | None = None,
         runner: CaptureRunner = capture_hme_session,
         timeout_seconds: float = DEFAULT_ICLOUD_CAPTURE_TIMEOUT_SECONDS,
+        profile_root: str | Path | None = None,
     ) -> None:
         self.on_session = on_session
         self.on_status = on_status
         self.get_session_template = get_session_template
         self.runner = runner
         self.timeout_seconds = max(30.0, float(timeout_seconds))
+        self.profile_root = (
+            None
+            if profile_root is None
+            else _ensure_private_directory(Path(profile_root).expanduser().resolve())
+        )
         self._lock = threading.RLock()
         self._jobs: dict[str, _CaptureJob] = {}
         self._active_mailbox_id: str | None = None
+
+    def _profile_dir(self, mailbox_id: str) -> Path | None:
+        if self.profile_root is None:
+            return None
+        root = _ensure_private_directory(self.profile_root)
+        digest = hashlib.sha256(mailbox_id.encode("utf-8")).hexdigest()
+        return _ensure_private_directory(root / digest)
 
     def _publish(self, status: HmeCaptureStatus) -> HmeCaptureStatus:
         with self._lock:
@@ -663,13 +706,19 @@ class ICloudHmeCaptureManager:
                 if self.get_session_template is not None
                 else None
             )
+            runner_options: dict[str, Any] = {
+                "cancel_event": job.cancel_event,
+                "on_waiting": waiting,
+                "on_authenticated": authenticated,
+                "timeout_seconds": self.timeout_seconds,
+                "start_url": DEFAULT_ICLOUD_CAPTURE_URL,
+                "session_template": session_template,
+            }
+            profile_dir = self._profile_dir(mailbox_id)
+            if profile_dir is not None:
+                runner_options["profile_dir"] = profile_dir
             session = self.runner(
-                cancel_event=job.cancel_event,
-                on_waiting=waiting,
-                on_authenticated=authenticated,
-                timeout_seconds=self.timeout_seconds,
-                start_url=DEFAULT_ICLOUD_CAPTURE_URL,
-                session_template=session_template,
+                **runner_options,
             )
             if job.cancel_event.is_set():
                 self._transition(

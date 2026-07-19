@@ -175,6 +175,11 @@ class WebConsoleTests(unittest.TestCase):
 
     def test_default_runtime_uses_local_relays_with_one_shared_clash_front(self):
         self.assertTrue(self.controller.enable_proxy_chains)
+        self.assertEqual(
+            self.controller.hme_capture.profile_root,
+            (self.root / "browser-profiles" / "icloud-hme").resolve(),
+        )
+        self.assertTrue(self.controller.hme_capture.profile_root.is_dir())
         payload = self.controller.list_proxy_chain_nodes()
         self.assertTrue(payload["enabled"])
         self.assertTrue(payload["shared"])

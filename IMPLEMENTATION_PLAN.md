@@ -761,3 +761,74 @@ Team 工作流 -> 本地隔离中继 -> 共享 Clash -> CliProxy/其他固定代
 - 2026-07-19：LaunchAgent 重启后首次探测即返回 HTTP `200`；现有组 1 配置自动呈现为 `clash_chain`，只读链路测量为 `shared_clash=true / healthy=true / PH / Asia/Manila`，未创建 Alias、运行或 Team 写请求。
 - 2026-07-19：浏览器实测导入与编辑入口均只显示密码型完整代理链接输入和只读 Clash 第一跳，已保存源未回填 DOM；`1280x720` 与 `390x844` 均无页面/对话框横向溢出、字段裁切或按钮遮挡，控制台无 warning/error。
 - 2026-07-19：实现、测试与文档提交 `1c916e1` 已推送 GitHub `main`；真实数据库、代理密文、运行产物与下载副本均未进入版本控制。
+
+### 节点 Q：iCloud 登录浏览器长期会话记忆（完成）
+
+#### Q.1 现状、目标与性能指标
+
+当前“登录更新 HME”每次都为 Chrome for Testing 创建临时 profile，捕获结束后无条件删除。浏览器因此无法在两次捕获间保留 Cookie、Apple 设备信任、站点存储和本地密码管理数据，导致用户反复输入密码和双重验证。
+
+目标是为每个 iCloud 资源池提供独立、长期保留的浏览器 profile：同一资源池后续捕获复用同一登录状态，不同资源池绝不共享 Cookie。捕获结束仍关闭浏览器进程，但不再删除持久 profile。
+
+性能、稳定性与安全指标：
+
+- 同一邮箱 ID 无论服务重启多少次都映射到同一目录；不同 ID 映射到不同目录。
+- profile 放在 Git 工作区外的应用数据目录，邮箱 ID 只以稳定哈希出现在路径中，目录权限固定为 `0700`。
+- 不读取或锁定用户日常 Chrome profile；继续使用项目独立的 Chrome for Testing/Chromium。
+- Cookie、密码库、Local Storage、缓存和 Apple 信任状态不进入 SQLite、API、DOM、日志、测试产物或 Git。
+- Apple 服务端主动过期、撤销 Session 或再次要求 2FA 时仍以真实反馈为准，不伪造或绕过验证。
+
+#### Q.2 GitHub 与既有实现经验
+
+- 官方 `microsoft/playwright-python` 的持久上下文接口以 `launch_persistent_context(user_data_dir)` 保留 Cookie 和站点状态；非 macOS 路径已经使用这一模式。
+- macOS 路径已通过 `--user-data-dir=<profile>` 启动可见 Chrome for Testing，且没有无痕参数；当前丢失状态的唯一直接原因是 profile 每次临时创建并在 `finally` 删除。
+- 采用最小修改：保留现有浏览器启动、CDP 捕获、白名单验证和 Session 加密保存逻辑，只改变 profile 的分配和清理边界。
+
+#### Q.3 最小充分闭环
+
+```text
+点击“登录更新 HME”
+    -> 管理器用 mailbox_id 计算稳定哈希目录
+    -> 创建/校正 profile 根目录和子目录的 0700 权限
+    -> Chrome for Testing/Chromium 使用该 user-data-dir
+    -> 已有 Apple 会话可用时直接读取并验证 HME
+    -> 不可用时由用户正常登录/2FA
+    -> 只读验证 Session 后加密保存
+    -> 关闭浏览器，保留 profile 供下次反馈复用
+```
+
+控制对象是每个 iCloud 资源池的登录会话，测量是浏览器实际 Cookie 和 HME 只读响应，执行器是独立持久 profile 的可见浏览器。以 Apple 返回的认证状态作为反馈，允许会话过期这一外部扰动，但不再由本地清理人为制造每次失效。
+
+#### Q.4 实施节点
+
+- [x] 为捕获函数增加可选持久 profile 路径；只有函数自己创建的降级临时目录才在结束时删除。
+- [x] 为捕获管理器增加 profile 根目录，以 mailbox ID 的稳定哈希派生隔离目录并设置 `0700`。
+- [x] 将 Web 控制器接线到 `Application Support/TeamWorkflowConsole/browser-profiles/icloud-hme`，不改变对外 API 或登录按钮操作。
+- [x] 增加聚焦测试，覆盖同邮箱复用、异邮箱隔离、哈希路径、权限和临时/持久目录清理分界。
+- [x] 更新 README 与 CHANGELOG，明确 profile 包含敏感登录状态、不会进入 Git，以及 Apple 仍可主动要求再验证。
+- [x] 执行聚焦测试、全量回归、语法/diff/敏感扫描，不启动需要人工交互的真实 iCloud 捕获。
+- [x] 以小于 1 分钟的短暂重启部署 LaunchAgent，验证 HTTP `200`、持久 profile 根目录位于应用数据目录且权限为 `0700`。
+- [x] 提交并推送 GitHub `main`，确认工作树干净，且 Git 中无 profile、Cookie、密码库或真实会话数据。
+
+#### Q.5 验收场景
+
+1. 同一资源池连续启动两次捕获：两次 runner 收到完全相同的 profile 路径，第一次产生的状态文件结束后仍存在。
+2. 两个资源池分别启动捕获：profile 路径不同，路径不包含原始 mailbox ID，不共享 Cookie 或密码数据。
+3. 应用数据根目录或已有 profile 权限过宽：下次使用时自动校正为 `0700`。
+4. 捕获成功、失败、取消和超时：浏览器进程都会关闭，持久 profile 都保留；无 profile 参数的独立调用仍清理自建临时目录。
+5. 服务重启后再次登录更新 HME：稳定路径不变，浏览器可复用 Apple 本地会话；若 Apple 判定失效，正常显示登录/2FA 而不降低安全校验。
+6. 代码、测试、文档和提交中不包含 profile 内容、Cookie 值、Apple 密码或真实邮箱标识。
+
+#### Q.6 回滚与边界
+
+- 回滚代码只会恢复临时 profile 行为；不自动删除已产生的持久 profile，避免回滚时误删用户登录资料。
+- 本节点不改变 HME API、手动 cURL/HAR 导入、IMAP、Clash 或 Team 换班流程，也不尝试绕过 Apple 的登录和 2FA 策略。
+- 当前不增加自动清理或前端“清除登录记忆”操作；先证明长期复用闭环稳定，再根据实际需求扩展管理能力。
+
+#### Q.7 实施记录
+
+- 2026-07-19：完成每资源池 SHA-256 隔离目录、`0700` 权限校正、持久/临时 profile 清理分界和 Web 控制器接线；不读取用户日常 Chrome profile。
+- 2026-07-19：iCloud HME 捕获聚焦 8 项测试全部通过；未启动真实 iCloud 浏览器或发起 Apple 写操作。
+- 2026-07-19：全量 292 项测试中 286 项通过、6 项 Windows DPAPI 按 macOS 平台跳过；Python compileall、`git diff --check` 和高置信凭据扫描通过。
+- 2026-07-19：LaunchAgent 重启约 2 秒后恢复 HTTP `200`，持久 profile 根目录位于应用数据目录且权限为 `0700`。
+- 2026-07-19：用户重新执行捕获后完成真实闭环验收；浏览器进程关闭后 profile 仍保留 iCloud Cookie 和本地登录记录，未读取或输出任何凭据值。

@@ -555,6 +555,7 @@ class WebConsoleController:
             on_session=self._save_captured_hme_session,
             on_status=self._publish_hme_capture_status,
             get_session_template=self._get_hme_session_template,
+            profile_root=self.app_dir / "browser-profiles" / "icloud-hme",
         )
         self.workspace_lookup_service = (
             workspace_lookup_service or WorkspaceLookupService()
