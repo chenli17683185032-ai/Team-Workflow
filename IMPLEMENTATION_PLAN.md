@@ -1275,7 +1275,7 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-20：TaskQueue 与 Web 聚焦 68 项通过；macOS 全量 312 项中 306 项通过、6 项 Windows DPAPI 按平台跳过。Python compileall、JavaScript 语法、diff 检查与新增行高置信凭据扫描通过。
 - 2026-07-20：部署前真实队列、活动 run 和活动 refresh 均为空；LaunchAgent 重启后 4 秒恢复 HTTP 200，线上静态资源包含新日志框，队列仍为空，错误日志没有新增内容。隔离日志进程、临时视口和浏览器标签页均已清理。
 
-### 节点 X：Sub2API JSON 全分组一键推送（进行中）
+### 节点 X：Sub2API JSON 全分组一键推送（完成）
 
 #### X.1 目标与性能指标
 
@@ -1326,7 +1326,7 @@ Workflow/Refresh runner 原始反馈
 - [x] 运行 Sub2API/Workflow/TaskQueue/Web 聚焦测试、全量测试、Python/JavaScript 语法、compileall、`git diff --check` 和高置信秘密扫描。
 - [x] 先对真实生产 JSON 执行只读/预演，再备份受影响账号配置并执行一次 canary 推送；确认只新增或校正目标账号，不改变其他账号和分组。
 - [x] 配置本地加密管理员凭据与自动推送开关；重启 LaunchAgent 后在 1 分钟内恢复 HTTP 200，并验证无活动任务、错误日志干净。
-- [ ] 更新 README、CHANGELOG、本节点记录和桌面唯一云贝运维手册；提交并推送 GitHub `main`，清理临时文件并确认工作树与远端一致。
+- [x] 更新 README、CHANGELOG、本节点记录和桌面唯一云贝运维手册；提交并推送 GitHub `main`，清理临时文件并确认工作树与远端一致。
 
 #### X.5 验收场景
 
@@ -1358,3 +1358,4 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-21：canary 将账号 500 校正为 `concurrency=9999`、`load_factor=9999`、分组 `2/3/6/9`，回读验证成功；再次预演返回 `skipped verified=true`。
 - 2026-07-21：生成生产管理员 API Key 并只写入本机 Keychain 加密设置；本地数据库写前备份通过 `quick_check`，未保存管理员密码或 TOTP。
 - 2026-07-21：Sub2API/Caddy/PostgreSQL/Redis 均保持原容器 healthy、restart=0；本地 LaunchAgent 5 秒恢复 HTTP 200，桌面与移动设置页无横向溢出，浏览器控制台错误为 0。
+- 2026-07-21：功能提交 `d05f1eb` 已推送 GitHub `main`；README、CHANGELOG 和桌面唯一云贝运维手册已更新，临时浏览器标签与视口已清理。
