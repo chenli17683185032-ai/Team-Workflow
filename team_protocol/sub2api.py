@@ -481,6 +481,12 @@ class Sub2APIClient:
             raise Sub2APIError("Sub2API account response is not an object")
         return dict(data)
 
+    def get_account_usage(self, account_id: int) -> Any:
+        return self._request(
+            "GET",
+            f"/admin/accounts/{int(account_id)}/usage?source=active&force=false",
+        )
+
     def verify_step_up(self) -> None:
         if not self._use_session_auth or not self.totp_secret:
             raise Sub2APIError(

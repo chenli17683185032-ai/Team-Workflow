@@ -110,6 +110,39 @@ class ImapMailboxConfig:
 ConnectionFactory = Callable[[ImapMailboxConfig, float], Any]
 
 
+def login_imap_mailbox(
+    config: ImapMailboxConfig,
+    *,
+    timeout: float = 15.0,
+    connection_factory: ConnectionFactory | None = None,
+) -> Any:
+    factory = connection_factory or _create_imap_connection
+    try:
+        connection = factory(config, max(1.0, min(float(timeout), 30.0)))
+    except (OSError, TimeoutError, socks.ProxyError) as exc:
+        raise ImapMailboxError("IMAP connection failed") from exc
+    try:
+        status, _ = connection.login(config.username, config.password)
+    except imaplib.IMAP4.error as exc:
+        _logout(connection)
+        raise MailboxCredentialsInvalidError(
+            "iCloud forwarding mailbox rejected login"
+        ) from exc
+    except Exception as exc:
+        _logout(connection)
+        raise ImapMailboxError("IMAP login failed") from exc
+    if str(status).upper() != "OK":
+        _logout(connection)
+        raise MailboxCredentialsInvalidError(
+            "iCloud forwarding mailbox rejected login"
+        )
+    return connection
+
+
+def close_imap_mailbox(connection: Any) -> None:
+    _logout(connection)
+
+
 class ImapOtpReader:
     def __init__(
         self,
@@ -164,24 +197,11 @@ class ImapOtpReader:
             _logout(connection)
 
     def _login(self, timeout: float) -> Any:
-        try:
-            connection = self.connection_factory(
-                self.config, max(1.0, min(float(timeout), 30.0))
-            )
-        except (OSError, TimeoutError, socks.ProxyError) as exc:
-            raise ImapMailboxError("IMAP connection failed") from exc
-        try:
-            status, _ = connection.login(self.config.username, self.config.password)
-        except imaplib.IMAP4.error as exc:
-            _logout(connection)
-            raise MailboxCredentialsInvalidError("iCloud forwarding mailbox rejected login") from exc
-        except Exception as exc:
-            _logout(connection)
-            raise ImapMailboxError("IMAP login failed") from exc
-        if str(status).upper() != "OK":
-            _logout(connection)
-            raise MailboxCredentialsInvalidError("iCloud forwarding mailbox rejected login")
-        return connection
+        return login_imap_mailbox(
+            self.config,
+            timeout=timeout,
+            connection_factory=self.connection_factory,
+        )
 
     def _candidate_uids(self, connection: Any, alias: str) -> list[str]:
         matched: set[str] = set()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import tempfile
 import unittest
@@ -134,6 +135,70 @@ class CliCutoverTests(unittest.TestCase):
         )
         client.push_production_account.assert_called_once()
         self.assertTrue(client.push_production_account.call_args.kwargs["dry_run"])
+
+    def test_configure_sub2api_alerts_encrypts_stdin_imap_config(self) -> None:
+        database = MagicMock()
+        secret = json.dumps(
+            {
+                "host": "imap.example.com",
+                "port": 993,
+                "username": "monitor@example.com",
+                "password": "app-password",
+                "folder": "INBOX",
+                "recipient": "monitor@example.com",
+            }
+        ).encode("utf-8")
+
+        with (
+            patch("team_protocol.cli.SecretStore"),
+            patch("team_protocol.cli.Database", return_value=database),
+            patch("team_protocol.cli.sys.stdin", SimpleNamespace(buffer=io.BytesIO(secret))),
+        ):
+            result = main(
+                [
+                    "configure-sub2api-alerts",
+                    "--imap-json-stdin",
+                    "--sender",
+                    "support@yunbay.xyz",
+                ]
+            )
+
+        self.assertEqual(0, result)
+        database.initialize.assert_called_once_with()
+        encrypted = database.set_secret_setting.call_args
+        self.assertEqual("sub2api_alert_imap", encrypted.args[0])
+        self.assertEqual("app-password", json.loads(encrypted.args[1])["password"])
+        self.assertEqual(
+            [
+                ("sub2api_alert_sender", "support@yunbay.xyz"),
+                ("sub2api_alert_enabled", "1"),
+            ],
+            [call.args for call in database.set_text_setting.call_args_list],
+        )
+
+    def test_configure_sub2api_alerts_rejects_invalid_stdin_config(self) -> None:
+        database = MagicMock()
+
+        with (
+            patch("team_protocol.cli.SecretStore"),
+            patch("team_protocol.cli.Database", return_value=database),
+            patch(
+                "team_protocol.cli.sys.stdin",
+                SimpleNamespace(buffer=io.BytesIO(b'{"host":"imap.example.com"}')),
+            ),
+        ):
+            result = main(
+                [
+                    "configure-sub2api-alerts",
+                    "--imap-json-stdin",
+                    "--sender",
+                    "support@yunbay.xyz",
+                ]
+            )
+
+        self.assertEqual(1, result)
+        database.set_secret_setting.assert_not_called()
+        database.set_text_setting.assert_not_called()
 
 
 if __name__ == "__main__":

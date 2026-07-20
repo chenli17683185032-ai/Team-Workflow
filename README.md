@@ -167,6 +167,19 @@ PAT 创建成功后，本地始终生成 CPA 与 Sub2API 两个 `0600` 文件；
 
 启用 Sub2API 自动推送后，系统在每次推送时实时读取全部有效 OpenAI 分组，并把账号并发数与负载因子固定为 `9999`。同一 Token 已存在时不创建重复账号，只校正这三项调度配置并回读验证；同身份但不同 Token 时停止，不静默覆盖。管理员 API Key 保存在系统加密设置中，不写入脚本或命令行。
 
+### Sub2API 邮件告警自动控制
+
+云贝监控会把两个 Team 当前子号的 `90%` 用量和明确 `401` 认证错误作为告警邮件发送到专用 QQ 邮箱。本机只把邮件当作唤醒信号，收到后重新读取 Sub2API 账号详情、用量和 Team workspace 身份；`401` 优先触发当前子号刷新，`90%` 才触发对应 workspace 的一键换班。普通账号、模糊测活失败、邮件正文中的伪造数字和无关账号都不会触发动作。
+
+首次配置时，从受保护的凭据管道输入 IMAP JSON；授权码只进入 macOS Keychain 加密设置，不写入参数、文件、日志或 Git：
+
+```bash
+python3 -m team_protocol configure-sub2api-alerts \
+  --imap-json-stdin --sender 10256345@qq.com
+```
+
+配置完成后重启控制台即可启用；需要临时停用时运行 `python3 -m team_protocol configure-sub2api-alerts --disable`。协调器使用 IMAP UID/UIDVALIDITY 游标、断线退避和持久化动作 latch，重复邮件或重启不会重复执行。健康状态只显示启用、最近轮询、映射和脱敏错误码，不回显邮件正文或凭据。
+
 需要对最近一次成功换班生成的 JSON 手工重试时，可以先预演，再执行同一个有界脚本；macOS 也可双击仓库根目录的 `push_latest_sub2api.command`：
 
 ```bash
@@ -312,7 +325,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与详细日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 312 项测试，其中 306 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、Sub2API 告警 UID 消费与动作幂等、现场新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与详细日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 336 项测试，其中 330 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 

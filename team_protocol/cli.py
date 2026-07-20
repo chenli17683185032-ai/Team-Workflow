@@ -297,6 +297,47 @@ def command_push_sub2api(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_configure_sub2api_alerts(args: argparse.Namespace) -> int:
+    from .sub2api_alerts import (
+        ALERT_ACTIONS_SETTING,
+        ALERT_CURSOR_SETTING,
+        ALERT_ENABLED_SETTING,
+        ALERT_IMAP_SETTING,
+        ALERT_SENDER_SETTING,
+        imap_config_from_secret,
+        imap_config_secret,
+    )
+
+    database = Database(secret_store=SecretStore())
+    database.initialize()
+    if args.disable:
+        database.set_text_setting(ALERT_ENABLED_SETTING, "0")
+        print("Sub2API alert coordinator: disabled")
+        return 0
+
+    sender = str(args.sender or "").strip().casefold()
+    if sender.count("@") != 1:
+        raise ValueError("--sender must be a valid email address")
+    if not args.imap_json_stdin:
+        raise ValueError("--imap-json-stdin is required when enabling alerts")
+    raw_secret = sys.stdin.buffer.read(16_385)
+    if len(raw_secret) > 16_384:
+        raise ValueError("IMAP config exceeds 16 KiB")
+    config = imap_config_from_secret(raw_secret)
+    database.set_secret_setting(
+        ALERT_IMAP_SETTING,
+        json.dumps(imap_config_secret(config), separators=(",", ":")),
+    )
+    database.set_text_setting(ALERT_SENDER_SETTING, sender)
+    database.set_text_setting(ALERT_ENABLED_SETTING, "1")
+    database.delete_setting(ALERT_CURSOR_SETTING)
+    database.delete_setting(ALERT_ACTIONS_SETTING)
+    print("Sub2API alert coordinator: enabled")
+    print(f"Mailbox: {config.username}")
+    print(f"Sender: {sender}")
+    return 0
+
+
 def _add_live_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--impersonate", default="chrome145")
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -355,6 +396,15 @@ def build_parser() -> argparse.ArgumentParser:
     push_sub2api.add_argument("--dry-run", action="store_true")
     push_sub2api.add_argument("--timeout", type=float, default=30.0)
     push_sub2api.set_defaults(func=command_push_sub2api)
+
+    configure_sub2api_alerts = subparsers.add_parser(
+        "configure-sub2api-alerts",
+        help="enable or disable IMAP-triggered Sub2API child automation",
+    )
+    configure_sub2api_alerts.add_argument("--imap-json-stdin", action="store_true")
+    configure_sub2api_alerts.add_argument("--sender")
+    configure_sub2api_alerts.add_argument("--disable", action="store_true")
+    configure_sub2api_alerts.set_defaults(func=command_configure_sub2api_alerts)
 
     invite = subparsers.add_parser("invite", help="send a Team invite")
     invite.add_argument("--auth-json", required=True)

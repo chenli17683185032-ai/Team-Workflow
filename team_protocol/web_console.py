@@ -86,6 +86,7 @@ from .proxy_chain import (
     validate_proxy_source,
 )
 from .sub2api import Sub2APIClient, Sub2APIError
+from .sub2api_alerts import Sub2APIAlertCoordinator
 from .task_queue import TaskQueue, redact_value
 from .workspace_lookup import WorkspaceLookupService
 
@@ -518,6 +519,7 @@ class WebConsoleController:
         proxy_chain_manager: Any | None = None,
         hme_capture_manager: Any | None = None,
         workspace_lookup_service: Any | None = None,
+        sub2api_alert_coordinator: Any | None = None,
         enable_proxy_chains: bool = True,
         console_port: int = 8765,
     ) -> None:
@@ -566,6 +568,15 @@ class WebConsoleController:
         )
         self.workspace_lookup_service = (
             workspace_lookup_service or WorkspaceLookupService()
+        )
+        self.sub2api_alerts = (
+            sub2api_alert_coordinator
+            or Sub2APIAlertCoordinator(
+                self.database,
+                client_factory=self._sub2api_client,
+                handoff_callback=self._start_alert_handoff,
+                refresh_callback=self._start_alert_refresh,
+            )
         )
         self._proxy_chain_startup_error: str | None = None
         self._icloud_operation_lock = threading.Lock()
@@ -629,11 +640,13 @@ class WebConsoleController:
                 else:
                     self._proxy_chain_startup_error = None
                 self.task_queue.start()
+                self.sub2api_alerts.start()
             self._started = True
             return self.health()
 
     def shutdown(self) -> bool:
         with self._lifecycle_lock:
+            self.sub2api_alerts.request_stop()
             shutdown_hme_capture = getattr(self.hme_capture, "shutdown", None)
             hme_capture_stopped = (
                 bool(shutdown_hme_capture())
@@ -641,6 +654,7 @@ class WebConsoleController:
                 else True
             )
             queue_stopped = self.task_queue.shutdown()
+            alerts_stopped = self.sub2api_alerts.wait_stopped()
             shutdown_proxy_chains = getattr(self.proxy_chains, "shutdown", None)
             relay_stopped = (
                 bool(shutdown_proxy_chains())
@@ -648,7 +662,12 @@ class WebConsoleController:
                 else True
             )
             self._started = False
-            return bool(hme_capture_stopped and queue_stopped and relay_stopped)
+            return bool(
+                hme_capture_stopped
+                and queue_stopped
+                and alerts_stopped
+                and relay_stopped
+            )
 
     def health(self) -> dict[str, Any]:
         return {
@@ -660,6 +679,7 @@ class WebConsoleController:
                 "ready": self._proxy_chain_startup_error is None,
                 "error": self._proxy_chain_startup_error,
             },
+            "sub2api_alerts": self.sub2api_alerts.snapshot(),
         }
 
     def migration_status(self) -> dict[str, Any]:
@@ -1020,6 +1040,17 @@ class WebConsoleController:
         if totp_secret:
             options["totp_secret"] = totp_secret
         return Sub2APIClient(base_url, email, password, **options)
+
+    def _start_alert_handoff(
+        self, workspace_id: str, workspace_version: int
+    ) -> dict[str, Any]:
+        return self.replace_icloud_workspace_child(
+            workspace_id,
+            {"version": int(workspace_version)},
+        )
+
+    def _start_alert_refresh(self, account_id: str) -> dict[str, Any]:
+        return self.refresh_imported_child(account_id)
 
     def refresh_imported_child(
         self, account_id: str, path: str | Path | None = None
@@ -2786,6 +2817,8 @@ class WebConsoleController:
             raise StateConflictError("queue must be paused before restore")
         if snapshot.get("active_run_id"):
             raise StateConflictError("active run blocks restore")
+        self.sub2api_alerts.request_stop()
+        self.sub2api_alerts.wait_stopped()
         self.task_queue.shutdown()
         try:
             result = restore_backup(path, self.secret_store, self.database)
@@ -2808,6 +2841,7 @@ class WebConsoleController:
             if self._migration_status == "ready":
                 self.task_queue.start()
                 self.task_queue.notify_change()
+                self.sub2api_alerts.start()
         return _safe_payload(result)
 
     def choose_path(self, kind: str, current: str = "") -> dict[str, str]:

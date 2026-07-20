@@ -182,6 +182,25 @@ class Sub2APIAccountTests(unittest.TestCase):
         self.assertEqual(headers["X-Admin-UI-Request"], "1")
         self.assertNotIn("Authorization", headers)
 
+    def test_reads_structured_account_usage(self):
+        session = QueueSession(
+            [wrapped({"primary": {"utilization": 91.5}})]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example",
+            api_key="admin-key",
+            session=session,
+        )
+
+        usage = client.get_account_usage(501)
+
+        self.assertEqual(91.5, usage["primary"]["utilization"])
+        self.assertTrue(
+            session.calls[0][1].endswith(
+                "/admin/accounts/501/usage?source=active&force=false"
+            )
+        )
+
     def test_totp_session_is_verified_and_preferred_over_api_key(self):
         session = QueueSession(
             [
