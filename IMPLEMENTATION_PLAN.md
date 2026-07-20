@@ -1417,9 +1417,9 @@ Workflow/Refresh runner 原始反馈
 - [x] 持久化邮件 UID 和 action latch；覆盖重复邮件、重启恢复、换班后当前邮箱变化、401 恢复后解锁、动作失败重试和同时满足两个条件的优先级。
 - [x] 将协调器接入 WebConsoleController 生命周期与 health/snapshot 的无秘密状态；启动失败不得阻止控制台和人工换班。
 - [x] 运行 Team Workflow 聚焦/全量测试、云贝监控测试、Python 语法与 compileall、`git diff --check` 和新增行高置信秘密扫描。
-- [ ] 使用假 IMAP 与假 Sub2API 完成端到端闭环，不触发真实换班；随后在真实邮箱做只读新邮件/UID canary，只验证收信、映射和低于阈值不动作。
-- [ ] 部署前备份本机 SQLite 并校验；原子安装服务器监控脚本，执行 `--dry-run` 和测试邮件，确认生产容器不重启。
-- [ ] 在真实队列空闲时最小中断重启本机 LaunchAgent，60 秒 watchdog 验证 HTTP 200、协调器健康、IMAP 成功和无意外 run/refresh。
+- [x] 使用假 IMAP 与假 Sub2API 完成端到端闭环，不触发真实换班；随后在真实邮箱做只读新邮件/UID canary，只验证收信、映射和低于阈值不动作。
+- [x] 部署前备份本机 SQLite 并校验；原子安装服务器监控脚本，执行 `--dry-run` 和测试邮件，确认生产容器不重启。
+- [x] 在真实队列空闲时最小中断重启本机 LaunchAgent，60 秒 watchdog 验证 HTTP 200、协调器健康、IMAP 成功和无意外 run/refresh。
 - [ ] 更新 README、CHANGELOG、云贝仓库维护手册和桌面唯一运维手册；分别提交并合并/推送两个仓库 GitHub `main`，清理临时文件与工作树。
 
 #### Y.5 验收场景
@@ -1449,4 +1449,7 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-21：完成只读基线与控制设计。生产账号 `500` 和 `501` 分别与本机组 1、组 2 当前邮箱精确匹配；初始用量未达到自动动作阈值，真实队列为空，因此本轮开发和 canary 不应触发换班或刷新。
 - 2026-07-21：服务器监控已保留 SSE 401 错误并仅对 Team Workflow 导入的 iCloud PAT 账号增加 90%/401 动作告警；24 项聚焦测试通过，普通账号 100%、非 401 测活失败和原半小时报告不误触发该告警。
 - 2026-07-21：本机协调器已完成 UIDVALIDITY/UID 游标、只读邮件头过滤、持久化动作 latch、Sub2API 邮箱与 Team workspace 双身份复核、401 优先和控制器生命周期接入；协调器 9 项、Sub2API/CLI 25 项、既有 IMAP 12 项及 Web 46 项聚焦测试通过。
-- 2026-07-21：CLI 告警配置改为命令内延迟导入，离线 CLI 不加载 registrar 网络依赖；Team Workflow 全量 335 项中 329 项通过、6 项 Windows DPAPI 按平台跳过，云贝监控 26 项通过，compileall、Python/shell 语法、diff 检查和新增行秘密扫描通过。
+- 2026-07-21：CLI 告警配置改为命令内延迟导入，离线 CLI 不加载 registrar 网络依赖；Team Workflow 全量 336 项中 330 项通过、6 项 Windows DPAPI 按平台跳过，云贝监控 26 项通过，compileall、Python/shell 语法、diff 检查和新增行秘密扫描通过。
+- 2026-07-21：本机 SQLite 在线备份 `/Users/ethan/Library/Application Support/TeamWorkflowConsole/.backups/sub2api-alerts-20260721-030834/console.db` 两次 `quick_check=ok`；QQ 授权码由服务器 `0600` 备份经 SSH stdout 直达 CLI stdin，只写入 Keychain 加密设置，真实 IMAP TLS 登录和 UIDVALIDITY 基线成功。
+- 2026-07-21：服务器监控、安装器和独立 `0600` SMTP 环境完成原子部署，回滚点为 `/opt/new-api/backups/sub2api-alerts-20260720T191838Z`；真实 dry-run 为账号 500 约 75%、账号 501 约 9%、均无 401，无关账号 100% 未触发控制告警，所有业务容器 ID、启动时间和 restart count 不变。
+- 2026-07-21：真实 `[测试]` 邮件发送成功，QQ IMAP 从 UID 557 推进到 671 且严格过滤命中；LaunchAgent 9 秒内恢复 HTTP 200，协调器 `running=true / last_error=null`，两目标回读正常，queue/run/refresh/action latch 均为空，没有启动真实换班或刷新。
