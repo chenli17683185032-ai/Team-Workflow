@@ -1420,7 +1420,7 @@ Workflow/Refresh runner 原始反馈
 - [x] 使用假 IMAP 与假 Sub2API 完成端到端闭环，不触发真实换班；随后在真实邮箱做只读新邮件/UID canary，只验证收信、映射和低于阈值不动作。
 - [x] 部署前备份本机 SQLite 并校验；原子安装服务器监控脚本，执行 `--dry-run` 和测试邮件，确认生产容器不重启。
 - [x] 在真实队列空闲时最小中断重启本机 LaunchAgent，60 秒 watchdog 验证 HTTP 200、协调器健康、IMAP 成功和无意外 run/refresh。
-- [ ] 更新 README、CHANGELOG、云贝仓库维护手册和桌面唯一运维手册；分别提交并合并/推送两个仓库 GitHub `main`，清理临时文件与工作树。
+- [x] 更新 README、CHANGELOG、云贝仓库维护手册和桌面唯一运维手册；分别提交并合并/推送两个仓库 GitHub `main`，清理临时文件与工作树。
 
 #### Y.5 验收场景
 
@@ -1453,3 +1453,4 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-21：本机 SQLite 在线备份 `/Users/ethan/Library/Application Support/TeamWorkflowConsole/.backups/sub2api-alerts-20260721-030834/console.db` 两次 `quick_check=ok`；QQ 授权码由服务器 `0600` 备份经 SSH stdout 直达 CLI stdin，只写入 Keychain 加密设置，真实 IMAP TLS 登录和 UIDVALIDITY 基线成功。
 - 2026-07-21：服务器监控、安装器和独立 `0600` SMTP 环境完成原子部署，回滚点为 `/opt/new-api/backups/sub2api-alerts-20260720T191838Z`；真实 dry-run 为账号 500 约 75%、账号 501 约 9%、均无 401，无关账号 100% 未触发控制告警，所有业务容器 ID、启动时间和 restart count 不变。
 - 2026-07-21：真实 `[测试]` 邮件发送成功，QQ IMAP 从 UID 557 推进到 671 且严格过滤命中；LaunchAgent 9 秒内恢复 HTTP 200，协调器 `running=true / last_error=null`，两目标回读正常，queue/run/refresh/action latch 均为空，没有启动真实换班或刷新。
+- 2026-07-21：Team Workflow 提交 `0440717`（功能）与 `a0bffd8`（计划/部署记录）已推送 `main`；云贝功能分支 `e6f2626c` 经 `764d0f20` 合并远端 main、部署记录 `7f5ce6b8` 已推送 `main`。专用 worktree 与本轮生成缓存已清理，用户已有 `outputs/` 和设计稿保留。
