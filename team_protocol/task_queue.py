@@ -44,6 +44,7 @@ _SENSITIVE_QUERY_VALUE_RE = re.compile(
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off", ""})
 _REFRESH_IDEMPOTENCY_SECONDS = 60.0
+_OPERATION_LOG_LIMIT = 300
 
 
 def redact_text(value: Any, secrets: tuple[str, ...] | list[str] = ()) -> str:
@@ -170,6 +171,52 @@ class TaskQueue:
         self._revision += 1
         self._condition.notify_all()
         return self._revision
+
+    @staticmethod
+    def _append_operation_log_locked(
+        operation: dict[str, Any],
+        *,
+        step: str | None,
+        level: str,
+        message: str,
+        routine: bool = False,
+        created_at: str | None = None,
+        seq: int | None = None,
+    ) -> None:
+        entry = {
+            "step": step,
+            "level": str(level or "info"),
+            "message": str(message),
+            "routine": bool(routine),
+            "created_at": created_at
+            or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if seq is not None:
+            entry["seq"] = int(seq)
+        logs = operation.setdefault("logs", [])
+        logs.append(entry)
+        if len(logs) > _OPERATION_LOG_LIMIT:
+            del logs[:-_OPERATION_LOG_LIMIT]
+
+    def _record_run_operation_event_locked(
+        self, run_id: str, event: Mapping[str, Any]
+    ) -> None:
+        operation = self._run_operation
+        if operation is None or operation.get("run_id") != str(run_id):
+            return
+        self._append_operation_log_locked(
+            operation,
+            step=str(event.get("step") or "") or None,
+            level=str(event.get("level") or "info"),
+            message=str(event.get("message") or ""),
+            routine=bool(event.get("routine")),
+            created_at=str(event.get("created_at") or "") or None,
+            seq=(
+                int(event["seq"])
+                if event.get("seq") is not None
+                else None
+            ),
+        )
 
     def notify_change(self) -> int:
         with self._condition:
@@ -350,7 +397,14 @@ class TaskQueue:
                         "sub2api_export": "done",
                     },
                     "result": dict(recent[1]),
+                    "logs": [],
                 }
+                self._append_operation_log_locked(
+                    self._refresh_operation,
+                    step=None,
+                    level="info",
+                    message="recent credential refresh result reused",
+                )
                 self._bump_locked()
                 return {**recent[1], "reused": True}
             self._active_refresh_account_id = account_id
@@ -367,7 +421,14 @@ class TaskQueue:
                 },
                 "result": None,
                 "error": "",
+                "logs": [],
             }
+            self._append_operation_log_locked(
+                self._refresh_operation,
+                step=None,
+                level="info",
+                message="credential refresh started",
+            )
             self._bump_locked()
         try:
             (
@@ -377,6 +438,22 @@ class TaskQueue:
                 network,
                 secrets,
             ) = self._build_current_refresh_inputs(account_id)
+            active_step: list[str | None] = [None]
+
+            def on_log(message: str) -> None:
+                clean = redact_text(message, secrets)
+                with self._condition:
+                    operation = self._refresh_operation
+                    if operation is None or operation.get("account_id") != account_id:
+                        return
+                    self._append_operation_log_locked(
+                        operation,
+                        step=active_step[0],
+                        level=log_level(clean),
+                        message=clean,
+                        routine=is_routine_log(clean),
+                    )
+                    self._bump_locked()
 
             def on_event(event: Mapping[str, Any]) -> None:
                 if event.get("type") != "step":
@@ -394,13 +471,29 @@ class TaskQueue:
                 }.get(state)
                 if stage_state is None:
                     return
+                if state == "active":
+                    active_step[0] = step
                 with self._condition:
                     operation = self._refresh_operation
                     if operation is None or operation.get("account_id") != account_id:
                         return
                     operation["stages"][step] = stage_state
                     operation["current_step"] = step if state == "active" else None
+                    self._append_operation_log_locked(
+                        operation,
+                        step=step,
+                        level=(
+                            "error"
+                            if state == "error"
+                            else "warning"
+                            if state == "cancelled"
+                            else "info"
+                        ),
+                        message=f"stage {state}",
+                    )
                     self._bump_locked()
+                if state != "active" and active_step[0] == step:
+                    active_step[0] = None
 
             runner = self.refresh_runner_factory(
                 config,
@@ -412,6 +505,7 @@ class TaskQueue:
                 new_network=network,
                 verbose=False,
                 stop_event=stop_event,
+                logger=on_log,
                 event_callback=on_event,
             )
             result = runner.run()
@@ -424,6 +518,12 @@ class TaskQueue:
                     dict(safe_result),
                 )
                 if self._refresh_operation is not None:
+                    self._append_operation_log_locked(
+                        self._refresh_operation,
+                        step=None,
+                        level="info",
+                        message="credential refresh succeeded",
+                    )
                     self._refresh_operation.update(
                         {
                             "state": "succeeded",
@@ -440,11 +540,18 @@ class TaskQueue:
                     current_step = self._refresh_operation.get("current_step")
                     if current_step:
                         self._refresh_operation["stages"][current_step] = "failed"
+                    safe_error = redact_text(exc, secrets)
+                    self._append_operation_log_locked(
+                        self._refresh_operation,
+                        step=str(current_step or "") or None,
+                        level="error",
+                        message=f"credential refresh failed: {safe_error}",
+                    )
                     self._refresh_operation.update(
                         {
                             "state": "failed",
                             "current_step": None,
-                            "error": redact_text(exc, secrets),
+                            "error": safe_error,
                         }
                     )
                     self._bump_locked()
@@ -456,6 +563,12 @@ class TaskQueue:
                     current_step = self._refresh_operation.get("current_step")
                     if current_step:
                         self._refresh_operation["stages"][current_step] = "failed"
+                    self._append_operation_log_locked(
+                        self._refresh_operation,
+                        step=str(current_step or "") or None,
+                        level="error",
+                        message=f"credential refresh failed: {safe_error}",
+                    )
                     self._refresh_operation.update(
                         {
                             "state": "failed",
@@ -563,6 +676,7 @@ class TaskQueue:
                         for step, _label in step_definitions
                     },
                     "error": "",
+                    "logs": [],
                 }
                 self._bump_locked()
             (
@@ -1372,7 +1486,9 @@ class TaskQueue:
             message=message,
             routine=routine,
         )
-        self.notify_change()
+        with self._condition:
+            self._record_run_operation_event_locked(run_id, event)
+            self._bump_locked()
         return event
 
     def _append_event_locked(
@@ -1391,5 +1507,6 @@ class TaskQueue:
             message=message,
             routine=routine,
         )
+        self._record_run_operation_event_locked(run_id, event)
         self._bump_locked()
         return event

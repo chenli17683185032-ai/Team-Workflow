@@ -227,10 +227,12 @@ class TaskQueueTests(unittest.TestCase):
         class RefreshRunner:
             def __init__(self, **kwargs):
                 self.callback = kwargs["event_callback"]
+                self.logger = kwargs["logger"]
 
             def run(self):
                 for step in ("old_login", "pat", "sub2api_export"):
                     self.callback({"type": "step", "step": step, "state": "active"})
+                    self.logger(f"refresh detail for {step}")
                     self.callback({"type": "step", "step": step, "state": "done"})
                 return {"sub2api_path": "/private/output/refreshed.json"}
 
@@ -266,8 +268,17 @@ class TaskQueueTests(unittest.TestCase):
                 "sub2api_export": "done",
             },
         )
+        first_messages = [item["message"] for item in first_snapshot["logs"]]
+        self.assertEqual(first_messages[0], "credential refresh started")
+        self.assertIn("refresh detail for old_login", first_messages)
+        self.assertEqual(first_messages[-1], "credential refresh succeeded")
+        self.assertTrue(all(item.get("created_at") for item in first_snapshot["logs"]))
         self.assertTrue(second["reused"])
         self.assertTrue(second_snapshot["reused"])
+        self.assertEqual(
+            [item["message"] for item in second_snapshot["logs"]],
+            ["recent credential refresh result reused"],
+        )
         self.assertEqual(len(calls), 1)
 
     def test_current_refresh_rejects_a_concurrent_second_request(self):
@@ -278,11 +289,13 @@ class TaskQueueTests(unittest.TestCase):
         class BlockingRefreshRunner:
             def __init__(self, **kwargs):
                 self.callback = kwargs["event_callback"]
+                self.logger = kwargs["logger"]
 
             def run(self):
                 self.callback(
                     {"type": "step", "step": "old_login", "state": "active"}
                 )
+                self.logger("waiting for mailbox feedback")
                 started.set()
                 release.wait(2.0)
                 self.callback(
@@ -318,6 +331,8 @@ class TaskQueueTests(unittest.TestCase):
         snapshot = queue.snapshot()["credential_refresh"]
         self.assertEqual(snapshot["state"], "running")
         self.assertEqual(snapshot["stages"]["old_login"], "running")
+        self.assertEqual(snapshot["logs"][-1]["step"], "old_login")
+        self.assertEqual(snapshot["logs"][-1]["message"], "waiting for mailbox feedback")
         release.set()
         worker.join(2.0)
         self.assertFalse(worker.is_alive())
@@ -327,9 +342,11 @@ class TaskQueueTests(unittest.TestCase):
         class FailingRefreshRunner:
             def __init__(self, **kwargs):
                 self.callback = kwargs["event_callback"]
+                self.logger = kwargs["logger"]
 
             def run(self):
                 self.callback({"type": "step", "step": "pat", "state": "active"})
+                self.logger("PAT request used refresh-secret-canary")
                 raise RuntimeError("PAT failed with refresh-secret-canary")
 
         queue = TaskQueue(
@@ -356,6 +373,51 @@ class TaskQueueTests(unittest.TestCase):
         self.assertNotIn("refresh-secret-canary", snapshot["error"])
         self.assertNotIn("refresh-secret-canary", str(caught.exception))
         self.assertIn("***", snapshot["error"])
+        serialized_logs = json.dumps(snapshot["logs"])
+        self.assertNotIn("refresh-secret-canary", serialized_logs)
+        self.assertIn("***", serialized_logs)
+        self.assertEqual(snapshot["logs"][-1]["level"], "error")
+
+    def test_run_operation_logs_are_redacted_and_bounded(self):
+        workspace, _, _ = self.make_workspace("bounded-logs")
+
+        class ChattyRunner:
+            def __init__(self, **kwargs):
+                self.callback = kwargs["event_callback"]
+                self.logger = kwargs["logger"]
+
+            def run(self):
+                self.callback({"type": "step", "step": "old_login", "state": "active"})
+                for index in range(325):
+                    self.logger(
+                        f"detail {index} secret=refresh-bounded-logs-current"
+                    )
+                self.callback({"type": "step", "step": "old_login", "state": "done"})
+                return {"status": "ok"}
+
+        queue = TaskQueue(
+            self.database,
+            runner_factory=lambda _config, **kwargs: ChattyRunner(**kwargs),
+        )
+        self.queues.append(queue)
+        run = queue.enqueue([workspace["id"]])[0]
+        queue.start()
+        self.assertTrue(
+            wait_until(
+                lambda: self.database.get_run(run["id"])["state"] == "succeeded"
+                and queue.snapshot()["run_operation"]["state"] == "succeeded"
+            )
+        )
+
+        operation = queue.snapshot()["run_operation"]
+        self.assertEqual(operation["state"], "succeeded")
+        self.assertEqual(len(operation["logs"]), 300)
+        self.assertEqual(operation["logs"][-1]["message"], "run succeeded")
+        self.assertIn("detail 324", operation["logs"][-3]["message"])
+        self.assertTrue(all(item.get("created_at") for item in operation["logs"]))
+        serialized_logs = json.dumps(operation["logs"])
+        self.assertNotIn("refresh-bounded-logs-current", serialized_logs)
+        self.assertIn("***", serialized_logs)
 
     def test_fifo_single_active_failure_continues_and_redacts(self):
         first, _, _ = self.make_workspace("first")

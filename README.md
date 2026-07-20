@@ -241,7 +241,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 
 新子号登录成功后，控制台会把最小的 ChatGPT browser session cookie 加密绑定到该子号。它成为当前子号后，下一次接力优先复用这份会话；若 cookie 已失效则清除并回退邮箱 OTP。只有下一次接力完成、旧子号退出并提交轮换时，旧子号 cookie 才会与退役状态一起原子删除。完整 Cookie jar、浏览器 profile 和 token 不会进入账号列表、API 或日志。
 
-当前子号刷新时，第一次点击会立即把账号行切换为“刷新中…”并展开底部执行栏；其中依次显示“登录账号、创建 PAT、导出 JSON”的等待、进行中、完成或失败状态。账号表被实时事件重绘后按钮仍保持禁用；同账号成功后 60 秒内的重复请求只返回刚才的导出路径，不会再次创建 PAT。正常接力和母号提拉也在同一底部执行栏显示各自全部阶段，并在结束后保留最后状态和脱敏错误。
+当前子号刷新时，第一次点击会立即把账号行切换为“刷新中…”并展开底部执行栏；其中以实时详细日志显示本地时间、当前阶段、级别和每一步脱敏消息。正常接力和母号提拉使用同一日志框，不再用步骤卡概括执行过程。日志位于底部时自动跟随新消息，向上查看历史时保持阅读位置，可用向下按钮回到最新；账号表被实时事件重绘后刷新按钮仍保持禁用。同账号成功后 60 秒内的重复请求只返回刚才的导出路径，不会再次创建 PAT，操作结束后日志框继续保留最后状态、脱敏错误和输出路径。
 
 本地直连测试只验证网络可达性，不会自动延长 Apple Session。Session 失效时，点击“登录更新 HME”重新登录即可自动捕获或验证最新会话，不必强行打开隐藏邮箱子页面；如果直连后仍立即失效，应优先检查 Apple 登录状态和 Cookie，而不是反复点击检测。
 
@@ -301,7 +301,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与阶段日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 311 项测试，其中 305 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与详细日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 312 项测试，其中 306 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 

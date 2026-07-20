@@ -149,6 +149,7 @@ const VIEW_NAMES = new Set(["spaces", "accounts", "runs", "settings"]);
 const ACTIVE_RUN_STATES = new Set(["running", "stopping"]);
 const ACTIVE_QUEUE_STATES = new Set(["queued", "pending", "running", "stopping"]);
 const MAX_DIAGNOSTIC_ROWS = 300;
+const MAX_QUEUE_LOG_ROWS = 300;
 const MAX_EVENT_MEMORY = 1000;
 const ACCOUNT_PAGE_SIZE = 50;
 const MOBILE_ACCOUNT_PAGE_SIZE = 20;
@@ -160,6 +161,12 @@ const CHAIN_PROXY_MODE = "clash_chain";
 const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
   day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+const timeFormatter = new Intl.DateTimeFormat("zh-CN", {
   hour: "2-digit",
   minute: "2-digit",
   second: "2-digit",
@@ -193,6 +200,7 @@ const state = {
   sub2apiGroups: [],
   clearSecrets: new Set(),
   queueExpanded: false,
+  queueLogView: {key: "", follow: true, scrollTop: 0},
   accountPage: 1,
   accountView: "used",
   inventoryResults: [],
@@ -516,6 +524,12 @@ function formatDate(value) {
   if (!value) return "-";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? safeString(value) : dateTimeFormatter.format(date);
+}
+
+function formatTime(value) {
+  if (!value) return "--:--:--";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "--:--:--" : timeFormatter.format(date);
 }
 
 function formatDuration(run) {
@@ -1853,15 +1867,120 @@ function activeQueueItems() {
     .sort((left, right) => Number(firstValue(left, ["position"], 0)) - Number(firstValue(right, ["position"], 0)));
 }
 
-function queueStageGrid(definitions, stages = {}) {
-  return element("div", {className: "queue-refresh-steps"}, definitions.map(([step, label]) => {
-    const stageState = safeString(stages[step], "pending");
-    return element("span", {
-      className: "queue-refresh-step",
-      text: `${label} · ${STEP_STATE_LABELS[stageState] || stageState}`,
-      dataset: {state: stageState},
-    });
-  }));
+function queueLogMessage(record) {
+  const message = safeString(firstValue(record, ["message"]));
+  return {
+    "stage active": "阶段开始",
+    "stage done": "阶段完成",
+    "stage skipped": "阶段跳过",
+    "stage error": "阶段失败",
+    "stage cancelled": "阶段停止",
+  }[message] || message;
+}
+
+function queueLogLevel(record) {
+  const level = safeString(firstValue(record, ["level"], "info"));
+  return {
+    error: "错误",
+    warning: "警告",
+    success: "成功",
+    info: "信息",
+  }[level] || level;
+}
+
+function queueOperationLog(operation, operationKey) {
+  const records = Array.isArray(operation?.logs)
+    ? operation.logs.slice(-MAX_QUEUE_LOG_ROWS)
+    : [];
+  const frame = element("div", {className: "queue-log-frame"});
+  const toolbar = element("div", {className: "queue-log-toolbar"}, [
+    element("strong", {text: "实时详细日志"}),
+    element("span", {text: `${numberFormatter.format(records.length)} 条`}),
+  ]);
+  const followButton = element("button", {
+    className: "queue-log-follow",
+    text: "↓",
+    attrs: {
+      type: "button",
+      title: "回到最新日志",
+      "aria-label": "回到最新日志",
+    },
+  });
+  toolbar.append(followButton);
+  const log = element("div", {
+    className: "queue-operation-log",
+    dataset: {operationLog: operationKey},
+    attrs: {
+      tabindex: "0",
+      role: "log",
+      "aria-label": "实时详细执行日志",
+      "aria-live": "polite",
+      "aria-relevant": "additions",
+    },
+  });
+  if (!records.length) {
+    log.append(element("div", {className: "queue-log-line", dataset: {level: "info"}}, [
+      element("time", {text: "--:--:--"}),
+      element("span", {className: "queue-log-stage", text: "系统"}),
+      element("span", {className: "queue-log-level", text: "信息"}),
+      element("span", {className: "queue-log-message", text: "等待详细日志"}),
+    ]));
+  } else {
+    for (const record of records) {
+      const step = safeString(firstValue(record, ["step"]));
+      const stage = STEP_LABELS[step] || step || "系统";
+      log.append(element("div", {
+        className: "queue-log-line",
+        dataset: {level: safeString(firstValue(record, ["level"], "info"))},
+      }, [
+        element("time", {text: formatTime(firstValue(record, ["created_at", "timestamp"]))}),
+        element("span", {className: "queue-log-stage", text: stage, attrs: {title: stage}}),
+        element("span", {className: "queue-log-level", text: queueLogLevel(record)}),
+        element("span", {className: "queue-log-message", text: queueLogMessage(record)}),
+      ]));
+    }
+  }
+  const syncFollowState = () => {
+    const follow = log.scrollHeight - log.scrollTop - log.clientHeight <= 24;
+    state.queueLogView = {key: operationKey, follow, scrollTop: log.scrollTop};
+    followButton.dataset.paused = String(!follow);
+  };
+  log.addEventListener("scroll", syncFollowState, {passive: true});
+  followButton.addEventListener("click", () => {
+    log.scrollTop = log.scrollHeight;
+    syncFollowState();
+    log.focus({preventScroll: true});
+  });
+  frame.append(toolbar, log);
+  return frame;
+}
+
+function captureQueueLogView(list) {
+  const log = list.querySelector("[data-operation-log]");
+  if (!log || log.clientHeight <= 0) return;
+  const follow = log.scrollHeight - log.scrollTop - log.clientHeight <= 24;
+  state.queueLogView = {
+    key: safeString(log.dataset.operationLog),
+    follow,
+    scrollTop: log.scrollTop,
+  };
+}
+
+function restoreQueueLogView(list) {
+  const log = list.querySelector("[data-operation-log]");
+  if (!log) {
+    state.queueLogView = {key: "", follow: true, scrollTop: 0};
+    return;
+  }
+  const key = safeString(log.dataset.operationLog);
+  const sameOperation = state.queueLogView.key === key;
+  const follow = !sameOperation || state.queueLogView.follow;
+  log.scrollTop = follow
+    ? log.scrollHeight
+    : Math.min(state.queueLogView.scrollTop, Math.max(0, log.scrollHeight - log.clientHeight));
+  state.queueLogView = {key, follow, scrollTop: log.scrollTop};
+  const followButton = log.parentElement?.querySelector(".queue-log-follow");
+  if (followButton) followButton.dataset.paused = String(!follow);
 }
 
 function runOperationQueueEntry(operation) {
@@ -1878,10 +1997,13 @@ function runOperationQueueEntry(operation) {
   entry.append(element("span", {className: "queue-position", text: "W"}));
   const copy = element("div", {className: "queue-item__copy"}, [
     element("strong", {text: `${runKindLabel(run)} · ${runWorkspaceLabel(run)}`}),
-    element("span", {text: RUN_STATUS[operationState]?.[0] || operationState}),
+    element("span", {
+      text: operation.current_step
+        ? `${RUN_STATUS[operationState]?.[0] || operationState} / ${STEP_LABELS[operation.current_step] || operation.current_step}`
+        : RUN_STATUS[operationState]?.[0] || operationState,
+    }),
   ]);
-  const definitions = stepGroupsForRun(run).flatMap(([, steps]) => steps);
-  copy.append(queueStageGrid(definitions, operation.stages));
+  copy.append(queueOperationLog(operation, `run:${runIdentifier}`));
   const operationError = safeString(operation.error);
   if (operationError) copy.append(element("span", {className: "queue-refresh-error", text: operationError}));
   const actions = element("div", {className: "queue-item__actions"});
@@ -1896,10 +2018,11 @@ function runOperationQueueEntry(operation) {
 
 function renderQueue() {
   const drawer = byId("queue-drawer");
+  const body = byId("queue-body");
+  const wasExpanded = !body.hidden;
   drawer.dataset.expanded = String(state.queueExpanded);
   const toggle = drawer.querySelector("[data-action='toggle-queue']");
   toggle.setAttribute("aria-expanded", String(state.queueExpanded));
-  byId("queue-body").hidden = !state.queueExpanded;
 
   const items = activeQueueItems();
   const runOperation = state.queue.runOperation;
@@ -1923,8 +2046,11 @@ function renderQueue() {
   byId("queue-pause-button").textContent = state.queue.paused ? "继续队列" : "暂停队列";
 
   const list = byId("queue-list");
+  if (wasExpanded) captureQueueLogView(list);
+  body.hidden = !state.queueExpanded;
   list.replaceChildren();
   if (!items.length && !refresh && !runOperation) {
+    state.queueLogView = {key: "", follow: true, scrollTop: 0};
     list.append(element("li", {className: "empty-state", text: state.errors.queue || "队列为空"}));
     return;
   }
@@ -1932,12 +2058,6 @@ function renderQueue() {
   if (runOperation) fragment.append(runOperationQueueEntry(runOperation));
   if (refresh) {
     const refreshState = safeString(refresh.state, "running");
-    const stages = refresh.stages && typeof refresh.stages === "object" ? refresh.stages : {};
-    const stageLabels = [
-      ["old_login", "登录账号"],
-      ["pat", "创建 PAT"],
-      ["sub2api_export", "导出 JSON"],
-    ];
     const entry = element("li", {
       className: "queue-item queue-item--refresh",
       dataset: {state: refreshState},
@@ -1946,14 +2066,16 @@ function renderQueue() {
     const copy = element("div", {className: "queue-item__copy"}, [
       element("strong", {text: `子号令牌刷新 · ${refreshLabel}`}),
       element("span", {
-        text: refreshState === "running"
+        text: refresh.current_step
+          ? `${refreshState === "running" ? "执行中" : RUN_STATUS[refreshState]?.[0] || refreshState} / ${STEP_LABELS[refresh.current_step] || refresh.current_step}`
+          : refreshState === "running"
           ? "执行中"
           : refreshState === "succeeded"
             ? refresh.reused ? "已完成 · 重复请求未新建令牌" : "已完成"
             : "执行失败",
       }),
     ]);
-    copy.append(queueStageGrid(stageLabels, stages));
+    copy.append(queueOperationLog(refresh, `refresh:${safeString(refresh.account_id)}`));
     const refreshError = safeString(refresh.error);
     if (refreshError) copy.append(element("span", {className: "queue-refresh-error", text: refreshError}));
     const outputPath = safeString(refresh.result?.sub2api_path);
@@ -1996,6 +2118,7 @@ function renderQueue() {
     fragment.append(entry);
   });
   list.append(fragment);
+  if (state.queueExpanded) restoreQueueLogView(list);
 }
 
 function configuredSecret(secrets, keys, fallback) {

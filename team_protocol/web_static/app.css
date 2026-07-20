@@ -54,7 +54,7 @@ body {
 }
 
 body:has(.queue-drawer[data-expanded="true"]) {
-  padding-bottom: 304px;
+  padding-bottom: 420px;
 }
 
 button,
@@ -1469,7 +1469,7 @@ input[readonly] {
 }
 
 .queue-drawer__body {
-  max-height: 244px;
+  max-height: min(52vh, 390px);
   overflow: auto;
   overscroll-behavior: contain;
   border-top: 1px solid var(--line);
@@ -1511,6 +1511,7 @@ input[readonly] {
 
 .queue-item--refresh {
   grid-column: 1 / -1;
+  align-items: start;
 }
 
 .queue-position {
@@ -1543,41 +1544,130 @@ input[readonly] {
   font-size: 11px;
 }
 
-.queue-item__copy .queue-refresh-steps {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
-  gap: 4px;
-  margin-top: 7px;
-  overflow: visible;
-  white-space: normal;
+.queue-log-frame {
+  margin-top: 8px;
+  overflow: hidden;
+  border: 1px solid #3c4741;
+  color: #dce5df;
+  background: #202824;
+  border-radius: 4px;
 }
 
-.queue-item__copy .queue-refresh-step {
+.queue-log-toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 28px;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 5px 0 9px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background: #28322d;
+}
+
+.queue-item__copy .queue-log-toolbar strong,
+.queue-item__copy .queue-log-toolbar span {
+  display: block;
   margin: 0;
-  padding: 4px 6px;
-  overflow: visible;
-  border: 1px solid var(--line);
+  overflow: hidden;
+  color: #b9c7c0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item__copy .queue-log-toolbar strong {
+  color: #e4ece7;
+  font-size: 11px;
+}
+
+.queue-log-follow {
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  color: #a9bbb2;
+  background: transparent;
   border-radius: 3px;
-  background: var(--surface);
-  text-align: center;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 15px;
+}
+
+.queue-log-follow:hover,
+.queue-log-follow[data-paused="true"] {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.queue-operation-log {
+  height: clamp(180px, 28vh, 250px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: #202824;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  scrollbar-color: #65756d #202824;
+}
+
+.queue-log-line {
+  display: grid;
+  grid-template-columns: 68px minmax(92px, 132px) 40px minmax(0, 1fr);
+  min-height: 27px;
+  align-items: start;
+  gap: 8px;
+  padding: 6px 8px;
+}
+
+.queue-log-line:nth-child(even) {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.queue-log-line time,
+.queue-item__copy .queue-log-line > span {
+  display: block;
+  min-width: 0;
+  margin: 0;
+  overflow: visible;
+  color: #dce5df;
   text-overflow: clip;
   white-space: normal;
 }
 
-.queue-item__copy .queue-refresh-step[data-state="running"] {
-  border-color: #6fb9c7;
-  background: var(--running-soft);
+.queue-log-line time {
+  color: #8ea099;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
-.queue-item__copy .queue-refresh-step[data-state="done"] {
-  border-color: #84b99a;
-  background: var(--success-soft);
+.queue-item__copy .queue-log-stage {
+  overflow: hidden;
+  color: #aebdb6;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.queue-item__copy .queue-refresh-step[data-state="failed"],
-.queue-item__copy .queue-refresh-step[data-state="cancelled"] {
-  border-color: #d59a9a;
-  background: var(--danger-soft);
+.queue-item__copy .queue-log-level {
+  color: #91aaa0;
+}
+
+.queue-item__copy .queue-log-message {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.queue-log-line[data-level="warning"] .queue-log-level,
+.queue-log-line[data-level="warning"] .queue-log-message {
+  color: #f3cb78;
+}
+
+.queue-log-line[data-level="error"] .queue-log-level,
+.queue-log-line[data-level="error"] .queue-log-message {
+  color: #ff9dac;
+}
+
+.queue-log-line[data-level="success"] .queue-log-level,
+.queue-log-line[data-level="success"] .queue-log-message {
+  color: #89d7ad;
 }
 
 .queue-item__copy .queue-refresh-error,
@@ -2393,6 +2483,10 @@ dialog::backdrop {
     grid-template-columns: 1fr;
   }
 
+  .queue-operation-log {
+    height: min(38vh, 270px);
+  }
+
   .side-dialog,
   .side-dialog--detail {
     width: 100vw;
@@ -2544,6 +2638,31 @@ dialog::backdrop {
   .queue-drawer__bar > .button {
     min-width: 58px;
     padding-inline: 8px;
+  }
+
+  .queue-log-line {
+    grid-template-areas:
+      "time level stage"
+      "time message message";
+    grid-template-columns: 62px 38px minmax(0, 1fr);
+    gap: 3px 7px;
+    padding: 6px 7px;
+  }
+
+  .queue-log-line time {
+    grid-area: time;
+  }
+
+  .queue-item__copy .queue-log-stage {
+    grid-area: stage;
+  }
+
+  .queue-item__copy .queue-log-level {
+    grid-area: level;
+  }
+
+  .queue-item__copy .queue-log-message {
+    grid-area: message;
   }
 
   .queue-toggle__copy {
