@@ -350,15 +350,18 @@ function normalizeQueue(payload) {
 function normalizedError(payload, status) {
   const source = payload && typeof payload === "object" ? payload : {};
   const detail = source.detail;
+  const fields = source.fields || source.field_errors || (detail && detail.fields) || null;
   let message = "";
   if (typeof detail === "string") message = detail;
   if (!message && detail && typeof detail === "object") {
     message = safeString(firstValue(detail, ["message", "detail", "error"]));
   }
   if (!message) message = safeString(firstValue(source, ["message", "error"]));
+  if (!message && fields && typeof fields === "object") {
+    message = safeString(Object.values(fields).find((value) => safeString(value)));
+  }
   if (!message) message = `请求失败 (${status})`;
   const code = safeString(firstValue(source, ["code", "error_code"], firstValue(detail, ["code"], "request_failed")));
-  const fields = source.fields || source.field_errors || (detail && detail.fields) || null;
   return new ApiError(message, {status, code, fields});
 }
 
@@ -1539,7 +1542,7 @@ function renderIcloudSyncRows() {
         maxlength: "8192",
         placeholder: item.imported
           ? "已接管"
-          : "http://user:password@host:port",
+          : "代理 URL 或 curl 命令",
         autocomplete: "new-password",
         spellcheck: "false",
         "aria-label": `${safeString(item.email)} CliProxy 或代理链接`,
@@ -3522,7 +3525,7 @@ async function openIcloudOwnerProxyDialog(aliasId) {
       : "未配置";
   form.elements.namedItem("source_url").placeholder = chained
     ? "未更改"
-    : "http://user:password@host:port";
+    : "代理 URL 或 curl 命令";
   form.elements.namedItem("bootstrap").value = state.sharedClashProxy;
   form.elements.namedItem("mode").value = CHAIN_PROXY_MODE;
   fieldError("icloud-owner-proxy-error", "");
@@ -3541,7 +3544,7 @@ async function handleIcloudOwnerProxySubmit(form) {
   if (!aliasId || !owner) return;
   const existingChained = owner.proxy_mode === CHAIN_PROXY_MODE;
   if (!sourceUrl && !existingChained) {
-    fieldError("icloud-owner-proxy-error", "请输入完整的 HTTP 或 SOCKS 代理链接");
+    fieldError("icloud-owner-proxy-error", "请输入代理 URL 或 curl -x / --socks5 命令");
     return;
   }
   if (!bootstrap) {

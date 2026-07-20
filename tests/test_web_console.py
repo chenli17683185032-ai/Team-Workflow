@@ -20,6 +20,7 @@ from team_protocol.proxy_chain import (
     LokiProxyEndpoint,
     OwnerChainConfig,
     ProxyConfigurationError,
+    validate_proxy_source,
 )
 from team_protocol.web_console import (
     ConsoleAlreadyRunningError,
@@ -1445,7 +1446,7 @@ class WebConsoleTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(response.json()["detail"]["code"], "icloud_session_invalid")
 
-    def test_cliproxy_http_api_applies_clash_chain_without_echoing_source(self):
+    def test_curl_http_proxy_api_applies_clash_chain_without_echoing_source(self):
         profile = self.controller.create_icloud_mailbox(self.icloud_payload())
         self.database.set_icloud_mailbox_status(profile["id"], "ready")
         owner = self.database.import_icloud_aliases(
@@ -1470,7 +1471,7 @@ class WebConsoleTests(unittest.TestCase):
             def prepare(self, owner_id, source_url, bootstrap):
                 return OwnerChainConfig(
                     owner_id=owner_id,
-                    source_url=source_url,
+                    source_url=validate_proxy_source(source_url),
                     bootstrap_proxy=bootstrap,
                     listener_port=18881,
                     effective_proxy="socks5h://127.0.0.1:18881",
@@ -1502,9 +1503,11 @@ class WebConsoleTests(unittest.TestCase):
         chains = FakeProxyChains()
         self.controller.proxy_chains = chains
         self.controller.enable_proxy_chains = True
-        source_url = (
-            "http://cliproxy-user:cliproxy-secret@proxy.example:3010"
+        source_command = (
+            'curl -x proxy.example:3010 '
+            '-U "cliproxy-user:cliproxy-secret" mayips.com'
         )
+        source_url = "http://cliproxy-user:cliproxy-secret@proxy.example:3010"
         app = create_app(self.controller, testing=True)
         with TestClient(app) as client:
             configured = client.put(
@@ -1512,7 +1515,7 @@ class WebConsoleTests(unittest.TestCase):
                 headers=self.origin_headers,
                 json={
                     "mode": "clash_chain",
-                    "source_url": source_url,
+                    "source_url": source_command,
                     "bootstrap": "http://127.0.0.1:7897",
                 },
             )

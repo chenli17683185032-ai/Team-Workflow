@@ -267,6 +267,45 @@ class ProxyChainTests(unittest.TestCase):
                     ),
                 )
 
+    def test_curl_proxy_commands_are_normalized_without_the_probe_target(self):
+        cases = (
+            (
+                'curl -x proxy.example:3010 -U "region-JP:proxy-pass" mayips.com',
+                "http://region-JP:proxy-pass@proxy.example:3010",
+            ),
+            (
+                "curl --socks5 proxy.example:3010 "
+                "-U 'region-JP:p@ss word' https://mayips.com",
+                "socks5://region-JP:p%40ss%20word@proxy.example:3010",
+            ),
+            (
+                "curl --proxy=proxy.example:3010 "
+                "--proxy-user=region-JP:proxy-pass mayips.com",
+                "http://region-JP:proxy-pass@proxy.example:3010",
+            ),
+        )
+
+        for command, expected in cases:
+            with self.subTest(command=command.split()[1]):
+                self.assertEqual(validate_proxy_source(command), expected)
+
+    def test_curl_proxy_commands_reject_ambiguous_or_incomplete_input(self):
+        invalid = (
+            "curl mayips.com",
+            "curl -x proxy.example:3010",
+            "curl -x proxy.example:3010 -U region-JP mayips.com",
+            "curl -x proxy.example:3010 --socks5 proxy.example:3011 mayips.com",
+            "curl -x user:pass@proxy.example:3010 -U other:pass mayips.com",
+            "curl --silent -x proxy.example:3010 mayips.com",
+            "curl -x proxy.example:70000 mayips.com",
+            "curl -x 'proxy.example:3010 mayips.com",
+        )
+
+        for command in invalid:
+            with self.subTest(command=command):
+                with self.assertRaises(ValueError):
+                    validate_proxy_source(command)
+
     def test_lokiproxy_parser_accepts_json_and_plain_text(self):
         endpoint = parse_lokiproxy_response(
             {

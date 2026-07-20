@@ -414,7 +414,7 @@
           </div>
           <input type="hidden" name="owner_proxy_mode" value="clash_chain">
           <div class="form-grid form-grid--two" id="icloud-team-import-chain-fields">
-            <label class="field field--wide"><span>CliProxy / 代理链接</span><input name="owner_proxy_source_url" type="password" maxlength="8192" placeholder="http://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
+            <label class="field field--wide"><span>代理 URL / curl 命令</span><input name="owner_proxy_source_url" type="password" maxlength="8192" placeholder="curl -x ... 或 curl --socks5 ..." autocomplete="new-password" spellcheck="false"></label>
             <label class="field"><span>Clash 第一跳</span><input name="owner_proxy_bootstrap" type="text" readonly autocomplete="off" spellcheck="false"></label>
           </div>
         </section>
@@ -658,7 +658,7 @@
           <div><dt>子号默认链路</dt><dd id="icloud-owner-proxy-state">未配置</dd></div>
         </dl>
         <div class="form-grid form-grid--two" id="icloud-owner-chain-fields">
-          <label class="field field--wide"><span>CliProxy / 代理链接</span><input name="source_url" type="password" maxlength="8192" placeholder="http://user:password@host:port" autocomplete="new-password" spellcheck="false"></label>
+          <label class="field field--wide"><span>代理 URL / curl 命令</span><input name="source_url" type="password" maxlength="8192" placeholder="curl -x ... 或 curl --socks5 ..." autocomplete="new-password" spellcheck="false"></label>
           <label class="field field--wide"><span>Clash 第一跳</span><input name="bootstrap" type="text" maxlength="4096" value="http://127.0.0.1:7897" readonly autocomplete="off" spellcheck="false"></label>
         </div>
         <div class="form-error" id="icloud-owner-proxy-error" role="alert" hidden></div>

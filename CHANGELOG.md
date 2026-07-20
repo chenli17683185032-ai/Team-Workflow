@@ -4,12 +4,14 @@
 
 ### 新增
 
+- Team 子号默认链路可直接识别供应商提供的 `curl -x ... -U ...` HTTP 代理命令和 `curl --socks5 ... -U ...` SOCKS5 代理命令，规范化后只加密保存代理 URL，不执行命令或保存探针目标。
 - 账号库为失败 Workspace 的 iCloud 下一子号增加“刷新”：选择本地 Sub2API JSON，核对邮箱、Team workspace 和 PAT，匹配后在原账号上记录已注册状态并自动重试原失败 run。
 - 正在使用的 iCloud 当前子号也可直接刷新：复用 cookie 或邮箱 OTP 登录，创建新 PAT 并导出新的 Sub2API JSON，不改变 Team 成员和账号绑定。
 - 新子号登录成功后加密保存最小 ChatGPT browser session cookie；该子号下一次接力优先复用，成功退出并完成轮换时才删除旧号 cookie。
 
 ### 稳定性与安全
 
+- 代理 curl 输入只接受一个代理选项、可选的一组 `USER:PASS` 和一个目标；缺失、冲突或额外命令选项会在写入前返回具体字段错误，不再只显示通用 422。
 - 刷新只读取单账号、最多 2 MiB 的本地 JSON，不保存文件路径或 Sub2API PAT，也不改变子号 ID、Alias、母号归属、Team 绑定、代理或旧 checkpoint；格式错误、身份冲突、PAT 缺失和重复点击均在写入前阻断。
 - 已注册标记使失败的新子号恢复时改走现有账号 OTP 登录，不再重复 `create_account`；保存的 browser cookie 过期或被撤销时先清除，再自动回退 OTP。
 - Cookie 只以加密 `session_token` 保存，不落完整 Cookie jar、浏览器 profile、日志、API 响应或 DOM；旧号删除与账号晋升/退役在同一个数据库事务提交。
@@ -19,8 +21,9 @@
 
 ### 验证
 
+- 固定 HTTP/SOCKS URL、`curl -x`、`curl --socks5`、特殊字符凭据、无效/冲突命令和 Web API 脱敏存储测试通过。
 - 本地 JSON 刷新精确匹配、错误 workspace 零写入、原 run 复用、注册/登录分支、Cookie 保存/复用/失效回退和轮换删除聚焦测试通过。
-- macOS 全量 309 项测试中 303 项通过、6 项 Windows DPAPI 按平台跳过；Python/JavaScript 语法、`git diff --check` 与敏感信息扫描通过。
+- macOS 全量 311 项测试中 305 项通过、6 项 Windows DPAPI 按平台跳过；Python/JavaScript 语法、`git diff --check` 与敏感信息扫描通过。
 
 ## 2026-07-19
 

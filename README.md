@@ -206,7 +206,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 1. 推荐直接使用控制台的“登录更新 HME”：应用会打开独立的可见 Chrome for Testing 窗口，并自动进入 Apple 登录页。首次在其中登录 [中国区 iCloud](https://www.icloud.com.cn/) 并完成双重验证后，同一资源池会长期复用该浏览器的 Cookie 和设备信任状态。登录验证成功后，应用优先等待 `GET /v2/hme/list`，即使 Hide My Email 子页面打不开，也会用当前 Cookie 做一次 HME 只读校验并自动保存。
 2. 准备隐藏邮箱实际转发到的邮箱 IMAP 信息。使用 iCloud Mail 时，通常为 `imap.mail.me.com:993`、完整 iCloud 邮箱地址，以及在 [Apple Account](https://account.apple.com/) 生成的 App 专用密码；其他邮箱使用对应服务商的 IMAP 参数。iCloud 转发 OTP 最长等待 90 秒，资源池代理显式留空时 IMAP 不会继承子号工作流代理。
 3. 按需准备资源池的 HME / IMAP S5。若希望 iCloud HME 直连，保持此字段为空；应用会显式忽略系统 `HTTP_PROXY/ALL_PROXY` 环境变量。若使用代理，建议填写稳定的 `socks5h://user:password@host:port`，不要使用会频繁轮换的动态源。
-4. 分别准备每个 Team 的完整代理链接，例如 CliProxy 提供的 `http://user:password@host:port`，也可使用固定 SOCKS5；历史 Loki `/gen` 链接继续兼容。新建子号会按归属继承对应本地中继地址，这不是母号登录代理。
+4. 分别准备每个 Team 的代理。可以粘贴完整的 `http://user:password@host:port` / SOCKS5 URL，也可以直接粘贴供应商给出的 `curl -x HOST:PORT -U "USER:PASS" TARGET` 或 `curl --socks5 HOST:PORT -U "USER:PASS" TARGET`；历史 Loki `/gen` 链接继续兼容。curl 文本只做受限参数解析，不会执行，探针目标也不会保存。新建子号会按归属继承对应本地中继地址，这不是母号登录代理。
 
 #### 所有 Team 代理共用 Clash 第一跳
 
@@ -217,7 +217,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 工作流 B -> 本地中继 B -> Clash 127.0.0.1:7897 -> CliProxy/代理 B -> 目标
 ```
 
-在“同步 Alias”“导入新母号”或已接管母号的“子号默认链路”对话框中，直接粘贴完整 HTTP/SOCKS 代理链接。页面固定使用 `Clash 两跳`，只读的“Clash 第一跳”默认是 `http://127.0.0.1:7897`，不能给不同 Team 各选一个第一跳。
+在“同步 Alias”“导入新母号”或已接管母号的“子号默认链路”对话框中，可粘贴完整 HTTP/SOCKS 代理 URL，或带 `-U` 认证的 `curl -x` / `curl --socks5` 命令。页面会把命令规范化为代理 URL 后加密保存，并固定使用 `Clash 两跳`；只读的“Clash 第一跳”默认是 `http://127.0.0.1:7897`，不能给不同 Team 各选一个第一跳。
 
 固定代理端点连接和历史生成 API 请求都会经过这个统一前置，因此要求受支持来源 IP 或白名单的代理渠道可以使用 Clash 出口。需要切换 Clash 出口时直接在 Clash 中操作；控制台不创建第二个 Clash，不写入 listener/provider/dialer-proxy，不调用 reload，也不覆盖选择器。
 
@@ -301,7 +301,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与阶段日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 309 项测试，其中 303 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、现场新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与阶段日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 311 项测试，其中 305 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 

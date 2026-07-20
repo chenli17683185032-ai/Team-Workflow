@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import json
 import select
+import shlex
 import socket
 import ssl
 import threading
@@ -136,6 +137,97 @@ def validate_bootstrap_proxy(value: str) -> str:
     return validate_proxy_url(value)
 
 
+def _proxy_source_from_curl(value: str) -> str | None:
+    """Parse only curl's proxy arguments; the command is never executed."""
+
+    try:
+        tokens = shlex.split(str(value or ""), posix=True)
+    except ValueError:
+        raise ValueError("curl proxy command has invalid quoting") from None
+    command = (
+        tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+        if tokens
+        else ""
+    )
+    if command not in {"curl", "curl.exe"}:
+        return None
+
+    proxy_value = ""
+    default_scheme = ""
+    proxy_user: str | None = None
+    targets: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        option_scheme = {
+            "-x": "http",
+            "--proxy": "http",
+            "--socks5": "socks5",
+        }.get(token)
+        if option_scheme is not None:
+            if proxy_value:
+                raise ValueError("curl proxy command contains multiple proxy options")
+            if index + 1 >= len(tokens):
+                raise ValueError(f"curl proxy command {token} value is required")
+            index += 1
+            proxy_value = tokens[index]
+            default_scheme = option_scheme
+        elif token.startswith("--proxy=") or token.startswith("--socks5="):
+            if proxy_value:
+                raise ValueError("curl proxy command contains multiple proxy options")
+            option, proxy_value = token.split("=", 1)
+            default_scheme = "socks5" if option == "--socks5" else "http"
+            if not proxy_value:
+                raise ValueError(f"curl proxy command {option} value is required")
+        elif token in {"-U", "--proxy-user"}:
+            if proxy_user is not None:
+                raise ValueError("curl proxy command contains multiple proxy users")
+            if index + 1 >= len(tokens):
+                raise ValueError(f"curl proxy command {token} value is required")
+            index += 1
+            proxy_user = tokens[index]
+        elif token.startswith("--proxy-user="):
+            if proxy_user is not None:
+                raise ValueError("curl proxy command contains multiple proxy users")
+            proxy_user = token.split("=", 1)[1]
+            if not proxy_user:
+                raise ValueError("curl proxy command --proxy-user value is required")
+        elif token.startswith("-"):
+            raise ValueError("curl proxy command contains an unsupported option")
+        else:
+            targets.append(token)
+        index += 1
+
+    if not proxy_value:
+        raise ValueError("curl proxy command must include -x, --proxy, or --socks5")
+    if len(targets) != 1:
+        raise ValueError("curl proxy command must include exactly one probe target")
+
+    candidate = str(proxy_value).strip()
+    if "://" not in candidate:
+        candidate = f"{default_scheme}://{candidate}"
+    normalized = validate_proxy_url(candidate)
+    parsed = urllib.parse.urlsplit(normalized)
+    if proxy_user is None:
+        return normalized
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("curl proxy credentials must use either the URL or -U, not both")
+    if ":" not in proxy_user:
+        raise ValueError("curl proxy user must use USER:PASS format")
+    username, password = proxy_user.split(":", 1)
+    if not username:
+        raise ValueError("curl proxy username is required")
+    host = str(parsed.hostname or "")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    userinfo = (
+        f"{urllib.parse.quote(username, safe='')}:"
+        f"{urllib.parse.quote(password, safe='')}"
+    )
+    netloc = f"{userinfo}@{host}:{parsed.port}"
+    return validate_proxy_url(urllib.parse.urlunsplit(parsed._replace(netloc=netloc)))
+
+
 def _safe_proxy_label(value: str) -> str:
     """Return a proxy label without userinfo or secret query material."""
 
@@ -188,9 +280,12 @@ def is_chain_proxy_mode(value: Any) -> bool:
 
 
 def validate_proxy_source(value: str) -> str:
-    """Accept a fixed HTTP/SOCKS endpoint or a legacy Loki generator URL."""
+    """Accept a proxy URL, a limited curl proxy command, or a legacy generator."""
 
     text = str(value or "").strip()
+    curl_source = _proxy_source_from_curl(text)
+    if curl_source is not None:
+        text = curl_source
     try:
         parsed = urllib.parse.urlsplit(text)
         scheme = parsed.scheme.casefold()
