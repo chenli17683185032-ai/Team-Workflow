@@ -117,6 +117,8 @@ _TEXT_SETTING_KEYS = frozenset(
         "sub2api_push",
         "sub2api_concurrency",
         "sub2api_priority",
+        "sub2api_load_factor",
+        "sub2api_all_groups",
         "sub2api_group_id",
     }
 )
@@ -2622,7 +2624,9 @@ class WebConsoleController:
 
     def list_sub2api_groups(self) -> dict[str, Any]:
         with self._sub2api_client() as client:
-            remote_groups = client.list_groups(include_inactive=True)
+            remote_groups = client.list_groups(
+                platform="openai", include_inactive=True
+            )
         groups = []
         for item in remote_groups:
             try:

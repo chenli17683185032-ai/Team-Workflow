@@ -13,6 +13,7 @@ from .registrar import (
     bind_proxy_sid,
     generate_proxy_sid,
 )
+from .sub2api import SUB2API_PUSH_CONCURRENCY, SUB2API_PUSH_LOAD_FACTOR
 from .workflow import (
     AccountNetworkSpec,
     AccountSpec,
@@ -966,10 +967,16 @@ class TaskQueue:
             remote_name="",
             invite_settle_seconds=0.0,
             sub2api_concurrency=self._int_setting(
-                "sub2api_concurrency", 10, minimum=0
+                "sub2api_concurrency", SUB2API_PUSH_CONCURRENCY, minimum=0
             ),
             sub2api_priority=self._int_setting(
                 "sub2api_priority", 1, minimum=0
+            ),
+            sub2api_load_factor=self._int_setting(
+                "sub2api_load_factor", SUB2API_PUSH_LOAD_FACTOR, minimum=1
+            ),
+            sub2api_all_groups=self._bool_setting(
+                "sub2api_all_groups", True
             ),
             sub2api_group_id=self._optional_int_setting(
                 "sub2api_group_id", minimum=1
@@ -1287,9 +1294,15 @@ class TaskQueue:
             sub2api_totp_secret=sub2api_totp_secret,
             sub2api_push=self._bool_setting("sub2api_push", False),
             sub2api_concurrency=self._int_setting(
-                "sub2api_concurrency", 10, minimum=0
+                "sub2api_concurrency", SUB2API_PUSH_CONCURRENCY, minimum=0
             ),
             sub2api_priority=self._int_setting("sub2api_priority", 1, minimum=0),
+            sub2api_load_factor=self._int_setting(
+                "sub2api_load_factor", SUB2API_PUSH_LOAD_FACTOR, minimum=1
+            ),
+            sub2api_all_groups=self._bool_setting(
+                "sub2api_all_groups", True
+            ),
             sub2api_group_id=self._optional_int_setting(
                 "sub2api_group_id", minimum=1
             ),

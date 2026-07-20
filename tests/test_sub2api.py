@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 from team_protocol.cpa import OPENAI_AUTH_CLAIM, OPENAI_PROFILE_CLAIM
 from team_protocol.sub2api import (
+    SUB2API_PUSH_CONCURRENCY,
+    SUB2API_PUSH_LOAD_FACTOR,
     Sub2APIClient,
     Sub2APIError,
     _totp_code,
@@ -127,6 +129,29 @@ class Sub2APIAccountTests(unittest.TestCase):
         self.assertEqual(credentials["auth_mode"], "personalAccessToken")
         self.assertEqual(credentials["chatgpt_account_id"], "workspace-1")
         self.assertNotIn("must-not-leak", json.dumps(document))
+
+    def test_builds_load_factor_and_multiple_deduplicated_groups(self):
+        account = build_sub2api_account(
+            {
+                "accessToken": access_token(),
+                "user": {"id": "user-1", "email": "user@example.com"},
+                "account": {"id": "workspace-1", "planType": "team"},
+            },
+            personal_access_token="at-test",
+            load_factor=9999,
+            group_id=3,
+            group_ids=[9, 2, 3],
+        )
+
+        self.assertEqual(account["load_factor"], 9999)
+        self.assertEqual(account["group_ids"], [2, 3, 9])
+
+        with self.assertRaisesRegex(ValueError, "load factor"):
+            build_sub2api_account(
+                {"accessToken": access_token()},
+                personal_access_token="at-test",
+                load_factor=10001,
+            )
 
     def test_sub2api_filename_matches_converter_download_shape(self):
         local_time = datetime(2026, 7, 12, 9, 0, tzinfo=timezone.utc)
@@ -379,6 +404,162 @@ class Sub2APIAccountTests(unittest.TestCase):
             client.push_account(account)
 
         self.assertEqual(len(session.calls), 2)
+
+    def test_production_push_updates_existing_account_and_verifies_settings(self):
+        account = account_payload()
+        remote_export = account_payload()
+        remote_detail = {
+            **account,
+            "id": 42,
+            "concurrency": 10,
+            "load_factor": None,
+            "group_ids": [2],
+        }
+        verified_detail = {
+            **remote_detail,
+            "concurrency": SUB2API_PUSH_CONCURRENCY,
+            "load_factor": SUB2API_PUSH_LOAD_FACTOR,
+            "group_ids": [2, 3, 9],
+        }
+        session = QueueSession(
+            [
+                wrapped(
+                    [
+                        {"id": 9, "platform": "openai", "status": "active"},
+                        {"id": 2, "platform": "openai", "status": "active"},
+                        {"id": 3, "platform": "openai", "status": "active"},
+                        {"id": 8, "platform": "openai", "status": "inactive"},
+                        {"id": 7, "platform": "claude", "status": "active"},
+                    ]
+                ),
+                wrapped({"exported_at": "now", "accounts": [remote_export]}),
+                wrapped({"items": [remote_detail], "total": 1}),
+                wrapped(verified_detail),
+                wrapped(verified_detail),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example", api_key="admin-key", session=session
+        )
+
+        result = client.push_production_account(account)
+
+        self.assertEqual(result.action, "updated")
+        self.assertTrue(result.verified)
+        self.assertEqual(result.account_id, 42)
+        self.assertEqual(result.group_count, 3)
+        update_call = session.calls[3]
+        self.assertEqual(update_call[0], "PUT")
+        self.assertTrue(update_call[1].endswith("/admin/accounts/42"))
+        self.assertEqual(
+            update_call[2]["json"],
+            {
+                "concurrency": 9999,
+                "load_factor": 9999,
+                "group_ids": [2, 3, 9],
+                "confirm_mixed_channel_risk": True,
+            },
+        )
+
+    def test_production_push_dry_run_reports_update_without_writing(self):
+        account = account_payload()
+        remote_detail = {
+            **account,
+            "id": 42,
+            "load_factor": None,
+            "group_ids": [2],
+        }
+        session = QueueSession(
+            [
+                wrapped([{"id": 2, "platform": "openai", "status": "active"}]),
+                wrapped({"exported_at": "now", "accounts": [account]}),
+                wrapped({"items": [remote_detail], "total": 1}),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example", api_key="admin-key", session=session
+        )
+
+        result = client.push_production_account(account, dry_run=True)
+
+        self.assertEqual(result.action, "would-update")
+        self.assertFalse(result.verified)
+        self.assertEqual(len(session.calls), 3)
+
+    def test_production_push_creates_with_fixed_settings_and_all_groups(self):
+        account = account_payload()
+        verified_detail = {
+            **account,
+            "id": 51,
+            "concurrency": SUB2API_PUSH_CONCURRENCY,
+            "load_factor": SUB2API_PUSH_LOAD_FACTOR,
+            "group_ids": [2, 3],
+        }
+        session = QueueSession(
+            [
+                wrapped(
+                    [
+                        {"id": 3, "platform": "openai", "status": "active"},
+                        {"id": 2, "platform": "openai", "status": "active"},
+                    ]
+                ),
+                wrapped({"exported_at": "now", "accounts": []}),
+                wrapped({"id": 51, "name": account["name"]}),
+                wrapped(verified_detail),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example", api_key="admin-key", session=session
+        )
+
+        result = client.push_production_account(account)
+
+        self.assertEqual(result.action, "created")
+        create_payload = session.calls[2][2]["json"]
+        self.assertEqual(create_payload["concurrency"], 9999)
+        self.assertEqual(create_payload["load_factor"], 9999)
+        self.assertEqual(create_payload["group_ids"], [2, 3])
+        self.assertTrue(create_payload["confirm_mixed_channel_risk"])
+        self.assertTrue(create_payload["skip_default_group_bind"])
+
+    def test_production_push_rejects_empty_selectable_group_set(self):
+        session = QueueSession(
+            [
+                wrapped(
+                    [
+                        {"id": 2, "platform": "openai", "status": "inactive"},
+                        {"id": 3, "platform": "claude", "status": "active"},
+                    ]
+                )
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example", api_key="admin-key", session=session
+        )
+
+        with self.assertRaisesRegex(Sub2APIError, "no selectable"):
+            client.push_production_account(account_payload())
+
+        self.assertEqual(len(session.calls), 1)
+
+    def test_production_push_rejects_post_update_drift(self):
+        account = account_payload()
+        remote_detail = {**account, "id": 42, "group_ids": [2]}
+        session = QueueSession(
+            [
+                wrapped([{"id": 2, "platform": "openai", "status": "active"}]),
+                wrapped({"exported_at": "now", "accounts": [account]}),
+                wrapped({"items": [remote_detail], "total": 1}),
+                wrapped(remote_detail),
+                wrapped(remote_detail),
+            ]
+        )
+        client = Sub2APIClient(
+            "https://sub2api.example", api_key="admin-key", session=session
+        )
+
+        with self.assertRaisesRegex(Sub2APIError, "post-update verification"):
+            client.push_production_account(account)
 
 
 if __name__ == "__main__":

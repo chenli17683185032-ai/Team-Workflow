@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from team_protocol.cli import build_parser, main
 
@@ -29,6 +33,7 @@ class CliCutoverTests(unittest.TestCase):
                 "analyze",
                 "convert",
                 "push",
+                "push-sub2api",
                 "invite",
                 "leave",
                 "create-token",
@@ -58,6 +63,77 @@ class CliCutoverTests(unittest.TestCase):
 
         self.assertEqual(result, 23)
         serve.assert_called_once_with(port=8765, open_browser=True)
+
+    def test_push_sub2api_uses_encrypted_settings_and_production_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "account.sub2api.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "exported_at": "2026-07-21T00:00:00.000Z",
+                        "proxies": [],
+                        "accounts": [
+                            {
+                                "name": "user@example.com",
+                                "platform": "openai",
+                                "type": "oauth",
+                                "concurrency": 10,
+                                "priority": 1,
+                                "credentials": {
+                                    "access_token": "at-test",
+                                    "email": "user@example.com",
+                                    "chatgpt_account_id": "workspace-1",
+                                },
+                                "extra": {"email": "user@example.com"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            database = MagicMock()
+            database.get_text_setting.side_effect = lambda key, default="": {
+                "sub2api_base_url": "https://sub2api.example",
+                "sub2api_email": "",
+            }.get(key, default)
+            database.get_secret_setting.side_effect = lambda key: {
+                "sub2api_api_key": b"admin-key",
+            }.get(key)
+            client = MagicMock()
+            client.__enter__.return_value = client
+            client.push_production_account.return_value = SimpleNamespace(
+                action="would-update",
+                account_name="user@example.com",
+                verified=False,
+                concurrency=9999,
+                load_factor=9999,
+                group_count=4,
+            )
+
+            with (
+                patch("team_protocol.cli.SecretStore"),
+                patch("team_protocol.cli.Database", return_value=database),
+                patch("team_protocol.cli.Sub2APIClient", return_value=client) as client_class,
+            ):
+                result = main(
+                    [
+                        "push-sub2api",
+                        "--file",
+                        str(path),
+                        "--dry-run",
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with(
+            "https://sub2api.example",
+            "",
+            "",
+            timeout=30.0,
+            api_key="admin-key",
+        )
+        client.push_production_account.assert_called_once()
+        self.assertTrue(client.push_production_account.call_args.kwargs["dry_run"])
 
 
 if __name__ == "__main__":

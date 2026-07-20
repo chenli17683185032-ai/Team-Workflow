@@ -100,6 +100,8 @@ class WorkflowConfig:
     sub2api_push: bool = False
     sub2api_concurrency: int = 10
     sub2api_priority: int = 1
+    sub2api_load_factor: int | None = None
+    sub2api_all_groups: bool = False
     sub2api_group_id: int | None = None
     new_account_registered: bool = False
     old_session_token: str = ""
@@ -1112,6 +1114,7 @@ class WorkflowRunner:
             "type",
             "concurrency",
             "priority",
+            "load_factor",
             "group_ids",
         ):
             if cached.get(key) != expected.get(key):
@@ -1167,7 +1170,12 @@ class WorkflowRunner:
             personal_access_token=token,
             concurrency=self.config.sub2api_concurrency,
             priority=self.config.sub2api_priority,
-            group_id=self.config.sub2api_group_id,
+            load_factor=self.config.sub2api_load_factor,
+            group_id=(
+                None
+                if self.config.sub2api_all_groups
+                else self.config.sub2api_group_id
+            ),
             personal_access_token_expires_at=pat.get("expires_at"),
         )
         expected_account = expected["accounts"][0]
@@ -1243,14 +1251,13 @@ class WorkflowRunner:
         if isinstance(cached, dict) and cached.get("verified"):
             self._log("[resume] push_sub2api")
             return cached
-        verified_session_auth = bool(
-            self.config.sub2api_email
-            and self.config.sub2api_password
-            and self.config.sub2api_totp_secret
+        has_admin_auth = bool(
+            self.config.sub2api_api_key
+            or (self.config.sub2api_email and self.config.sub2api_password)
         )
-        if not verified_session_auth:
+        if not has_admin_auth:
             raise RuntimeError(
-                "Sub2API push requires administrator email, password, and TOTP secret"
+                "Sub2API push requires an administrator API key or email and password"
             )
         account = self._sub2api_account_from_file(export_path)
         owns_client = self.sub2api is None
@@ -1266,7 +1273,11 @@ class WorkflowRunner:
             **client_options,
         )
         try:
-            result = client.push_account(account)
+            result = (
+                client.push_production_account(account)
+                if self.config.sub2api_all_groups
+                else client.push_account(account)
+            )
         finally:
             if owns_client:
                 client.close()
@@ -1276,6 +1287,15 @@ class WorkflowRunner:
             "verified": result.verified,
             "message": result.message,
         }
+        for key in (
+            "account_id",
+            "group_count",
+            "concurrency",
+            "load_factor",
+        ):
+            value = getattr(result, key, None)
+            if value is not None:
+                payload[key] = value
         self.state.set("push_sub2api", payload)
         self._log(f"[sub2api] {result.action} verified={result.verified}")
         return payload

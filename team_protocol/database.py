@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
+from .sub2api import SUB2API_PUSH_LOAD_FACTOR
+
 
 SCHEMA_VERSION = 7
 ACCOUNT_STATUSES = frozenset(
@@ -5478,12 +5480,15 @@ class Database:
                 "sub2api_email": config.sub2api.email,
                 "sub2api_push": int(
                     config.sub2api.push
-                    and bool(config.sub2api.email)
-                    and bool(sub2api_secret)
-                    and bool(sub2api_totp_secret)
+                    and (
+                        bool(sub2api_api_key)
+                        or (bool(config.sub2api.email) and bool(sub2api_secret))
+                    )
                 ),
                 "sub2api_concurrency": config.sub2api.concurrency,
                 "sub2api_priority": config.sub2api.priority,
+                "sub2api_load_factor": SUB2API_PUSH_LOAD_FACTOR,
+                "sub2api_all_groups": 1,
             }
             for key, value in text_settings.items():
                 self._upsert_text_setting_row(connection, key, value, timestamp)

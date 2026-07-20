@@ -2001,6 +2001,8 @@ class WebConsoleTests(unittest.TestCase):
                         "output_dir": str(self.root / "output"),
                         "sub2api_push": True,
                         "sub2api_group_id": 3,
+                        "sub2api_load_factor": 9999,
+                        "sub2api_all_groups": True,
                     },
                     "secrets": {
                         "sub2api_password": "",
@@ -2030,6 +2032,8 @@ class WebConsoleTests(unittest.TestCase):
         self.assertTrue(preserved.json()["secrets"]["sub2api_api_key"])
         self.assertTrue(preserved.json()["secrets"]["sub2api_totp_secret"])
         self.assertEqual(preserved.json()["values"]["sub2api_group_id"], "3")
+        self.assertEqual(preserved.json()["values"]["sub2api_load_factor"], "9999")
+        self.assertEqual(preserved.json()["values"]["sub2api_all_groups"], "1")
         self.assertFalse(cleared.json()["secrets"]["sub2api_password"])
         self.assertFalse(cleared.json()["secrets"]["sub2api_api_key"])
         self.assertFalse(cleared.json()["secrets"]["sub2api_totp_secret"])
@@ -2084,7 +2088,9 @@ class WebConsoleTests(unittest.TestCase):
             "secret-canary",
             totp_secret="totp-canary",
         )
-        client.list_groups.assert_called_once_with(include_inactive=True)
+        client.list_groups.assert_called_once_with(
+            platform="openai", include_inactive=True
+        )
 
     def test_sub2api_groups_route_uses_saved_api_key_without_password(self):
         self.database.set_text_setting("sub2api_base_url", "https://sub2api.example")
@@ -2266,6 +2272,8 @@ class WebConsoleTests(unittest.TestCase):
         self.assertIn('id="account-page-summary"', index.text)
         self.assertIn('data-action="account-page-next"', index.text)
         self.assertIn('name="sub2api_group_id"', index.text)
+        self.assertIn('name="sub2api_load_factor"', index.text)
+        self.assertIn('name="sub2api_all_groups"', index.text)
         self.assertIn('name="sub2api_api_key"', index.text)
         self.assertIn('name="sub2api_totp_secret"', index.text)
         self.assertIn('<select name="sub2api_group_id">', index.text)

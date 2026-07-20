@@ -9,7 +9,7 @@ import struct
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from .cpa import (
@@ -24,12 +24,20 @@ class Sub2APIError(RuntimeError):
     pass
 
 
+SUB2API_PUSH_CONCURRENCY = 9999
+SUB2API_PUSH_LOAD_FACTOR = 9999
+
+
 @dataclass(frozen=True)
 class Sub2APIPushResult:
     action: str
     account_name: str
     verified: bool
     message: str
+    account_id: int | None = None
+    group_count: int = 0
+    concurrency: int | None = None
+    load_factor: int | None = None
 
 
 def _clean_token(value: str) -> str:
@@ -134,13 +142,37 @@ def _email_key(email: str) -> str:
     return re.sub(r"^_+|_+$", "", re.sub(r"[^a-z0-9]+", "_", email.casefold()))
 
 
+def _normalized_group_ids(
+    group_ids: Sequence[int] | None,
+    *,
+    group_id: int | None = None,
+) -> tuple[int, ...]:
+    values: set[int] = set()
+    raw_values: list[Any] = list(group_ids or ())
+    if group_id is not None:
+        raw_values.append(group_id)
+    for raw_value in raw_values:
+        if isinstance(raw_value, bool):
+            raise ValueError("Sub2API group IDs must be positive integers")
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Sub2API group IDs must be positive integers") from exc
+        if value <= 0:
+            raise ValueError("Sub2API group IDs must be positive integers")
+        values.add(value)
+    return tuple(sorted(values))
+
+
 def build_sub2api_account(
     session: Mapping[str, Any],
     *,
     personal_access_token: str,
     concurrency: int = 10,
     priority: int = 1,
+    load_factor: int | None = None,
     group_id: int | None = None,
+    group_ids: Sequence[int] | None = None,
     personal_access_token_expires_at: Any = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -149,8 +181,9 @@ def build_sub2api_account(
         raise ValueError("personal access token is required for Sub2API")
     if concurrency < 0 or priority < 0:
         raise ValueError("Sub2API concurrency and priority must be non-negative")
-    if group_id is not None and int(group_id) <= 0:
-        raise ValueError("Sub2API group ID must be positive")
+    if load_factor is not None and not 1 <= int(load_factor) <= 10_000:
+        raise ValueError("Sub2API load factor must be between 1 and 10000")
+    normalized_group_ids = _normalized_group_ids(group_ids, group_id=group_id)
 
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     cpa = build_cpa(session, personal_access_token=token, now=now)
@@ -222,8 +255,10 @@ def build_sub2api_account(
         "credentials": credentials,
         "extra": extra,
     }
-    if group_id is not None:
-        account["group_ids"] = [int(group_id)]
+    if load_factor is not None:
+        account["load_factor"] = int(load_factor)
+    if normalized_group_ids:
+        account["group_ids"] = list(normalized_group_ids)
     return account
 
 
@@ -233,7 +268,9 @@ def build_sub2api_export(
     personal_access_token: str,
     concurrency: int = 10,
     priority: int = 1,
+    load_factor: int | None = None,
     group_id: int | None = None,
+    group_ids: Sequence[int] | None = None,
     personal_access_token_expires_at: Any = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -243,7 +280,9 @@ def build_sub2api_export(
         personal_access_token=personal_access_token,
         concurrency=concurrency,
         priority=priority,
+        load_factor=load_factor,
         group_id=group_id,
+        group_ids=group_ids,
         personal_access_token_expires_at=personal_access_token_expires_at,
         now=exported_at,
     )
@@ -405,10 +444,42 @@ class Sub2APIClient:
             raise Sub2APIError("Sub2API login did not return an access token")
         self._access_token = token
 
-    def export_accounts(self) -> list[dict[str, Any]]:
-        data = self._request("GET", "/admin/accounts/data?include_proxies=false")
+    def export_accounts(
+        self, *, account_ids: Sequence[int] | None = None
+    ) -> list[dict[str, Any]]:
+        query = {"include_proxies": "false"}
+        if account_ids:
+            query["ids"] = ",".join(str(int(value)) for value in account_ids)
+        data = self._request("GET", f"/admin/accounts/data?{urlencode(query)}")
         accounts = data.get("accounts") if isinstance(data, dict) else None
         return [dict(item) for item in (accounts or []) if isinstance(item, dict)]
+
+    def list_accounts(
+        self,
+        *,
+        search: str = "",
+        platform: str = "openai",
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        query = urlencode(
+            {
+                "page": 1,
+                "page_size": max(1, min(int(page_size), 1000)),
+                "platform": str(platform or "").strip(),
+                "search": str(search or "").strip(),
+            }
+        )
+        data = self._request("GET", f"/admin/accounts?{query}")
+        items = data.get("items") if isinstance(data, Mapping) else None
+        if not isinstance(items, list):
+            raise Sub2APIError("Sub2API accounts response is not a paginated list")
+        return [dict(item) for item in items if isinstance(item, Mapping)]
+
+    def get_account(self, account_id: int) -> dict[str, Any]:
+        data = self._request("GET", f"/admin/accounts/{int(account_id)}")
+        if not isinstance(data, Mapping):
+            raise Sub2APIError("Sub2API account response is not an object")
+        return dict(data)
 
     def verify_step_up(self) -> None:
         if not self._use_session_auth or not self.totp_secret:
@@ -446,6 +517,23 @@ class Sub2APIClient:
         if not isinstance(data, list):
             raise Sub2APIError("Sub2API groups response is not a list")
         return [dict(item) for item in data if isinstance(item, Mapping)]
+
+    def selectable_openai_group_ids(self) -> tuple[int, ...]:
+        values: set[int] = set()
+        for group in self.list_groups(platform="openai"):
+            platform = str(group.get("platform") or "openai").strip().casefold()
+            status = str(group.get("status") or "active").strip().casefold()
+            if platform != "openai" or status != "active":
+                continue
+            try:
+                group_id = int(group.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if group_id > 0:
+                values.add(group_id)
+        if not values:
+            raise Sub2APIError("Sub2API has no selectable active OpenAI groups")
+        return tuple(sorted(values))
 
     @staticmethod
     def _credentials(account: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -504,6 +592,72 @@ class Sub2APIClient:
         expected_group_ids = set(cls._group_ids(expected))
         return not expected_group_ids or expected_group_ids.issubset(cls._group_ids(remote))
 
+    @staticmethod
+    def _account_id(account: Mapping[str, Any]) -> int | None:
+        try:
+            value = int(account.get("id") or 0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @classmethod
+    def _settings_match(
+        cls, remote: Mapping[str, Any], expected: Mapping[str, Any]
+    ) -> bool:
+        try:
+            concurrency_matches = int(remote.get("concurrency") or 0) == int(
+                expected.get("concurrency") or 0
+            )
+            load_factor_matches = int(remote.get("load_factor") or 0) == int(
+                expected.get("load_factor") or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        return (
+            concurrency_matches
+            and load_factor_matches
+            and cls._group_ids(remote) == cls._group_ids(expected)
+        )
+
+    @classmethod
+    def _settings_payload(cls, account: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "concurrency": int(account.get("concurrency") or 0),
+            "load_factor": int(account.get("load_factor") or 0),
+            "group_ids": list(cls._group_ids(account)),
+            "confirm_mixed_channel_risk": True,
+        }
+
+    @classmethod
+    def _account_search(cls, account: Mapping[str, Any]) -> str:
+        credentials = cls._credentials(account)
+        extra = account.get("extra") if isinstance(account.get("extra"), Mapping) else {}
+        return str(
+            credentials.get("email")
+            or extra.get("email")
+            or account.get("name")
+            or ""
+        ).strip()
+
+    def _matching_account_detail(
+        self,
+        exported_account: Mapping[str, Any],
+        expected: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        search = self._account_search(exported_account) or self._account_search(expected)
+        candidates = self.list_accounts(search=search)
+        matches = [
+            item
+            for item in candidates
+            if self._same_identity(item, expected)
+            and str(item.get("name") or "") == str(exported_account.get("name") or "")
+        ]
+        if len(matches) != 1 or self._account_id(matches[0]) is None:
+            raise Sub2APIError(
+                "Sub2API existing account could not be mapped to one account ID"
+            )
+        return matches[0]
+
     @classmethod
     def _create_payload(cls, account: Mapping[str, Any]) -> dict[str, Any]:
         credentials = dict(cls._credentials(account))
@@ -523,10 +677,124 @@ class Sub2APIClient:
         }
         if group_ids:
             payload["group_ids"] = group_ids
+            payload["confirm_mixed_channel_risk"] = True
+        if account.get("load_factor") is not None:
+            payload["load_factor"] = int(account["load_factor"])
         for key in ("expires_at", "rate_multiplier"):
             if account.get(key) is not None:
                 payload[key] = account[key]
         return payload
+
+    def push_production_account(
+        self,
+        account: Mapping[str, Any],
+        *,
+        dry_run: bool = False,
+    ) -> Sub2APIPushResult:
+        desired = dict(account)
+        desired["concurrency"] = SUB2API_PUSH_CONCURRENCY
+        desired["load_factor"] = SUB2API_PUSH_LOAD_FACTOR
+        desired["group_ids"] = list(self.selectable_openai_group_ids())
+        account_name = str(desired.get("name") or "ChatGPT Account")
+
+        if self.totp_secret:
+            self.verify_step_up()
+        remote_accounts = self.export_accounts()
+        token_matches = [
+            remote for remote in remote_accounts if self._same_token(remote, desired)
+        ]
+        if len(token_matches) > 1:
+            raise Sub2APIError(
+                f"Sub2API token matches multiple accounts: {account_name}"
+            )
+        if token_matches:
+            detail = self._matching_account_detail(token_matches[0], desired)
+            account_id = self._account_id(detail)
+            if account_id is None:
+                raise Sub2APIError("Sub2API existing account has no valid account ID")
+            if self._settings_match(detail, desired):
+                return Sub2APIPushResult(
+                    action="skipped",
+                    account_name=account_name,
+                    verified=True,
+                    message="Sub2API account and scheduling settings already match",
+                    account_id=account_id,
+                    group_count=len(self._group_ids(desired)),
+                    concurrency=SUB2API_PUSH_CONCURRENCY,
+                    load_factor=SUB2API_PUSH_LOAD_FACTOR,
+                )
+            if dry_run:
+                return Sub2APIPushResult(
+                    action="would-update",
+                    account_name=account_name,
+                    verified=False,
+                    message="dry run: Sub2API scheduling settings would be updated",
+                    account_id=account_id,
+                    group_count=len(self._group_ids(desired)),
+                    concurrency=SUB2API_PUSH_CONCURRENCY,
+                    load_factor=SUB2API_PUSH_LOAD_FACTOR,
+                )
+            self._request(
+                "PUT",
+                f"/admin/accounts/{account_id}",
+                json_data=self._settings_payload(desired),
+            )
+            verified = self.get_account(account_id)
+            if not self._same_identity(verified, desired) or not self._settings_match(
+                verified, desired
+            ):
+                raise Sub2APIError(
+                    f"Sub2API post-update verification failed: {account_name}"
+                )
+            return Sub2APIPushResult(
+                action="updated",
+                account_name=account_name,
+                verified=True,
+                message="Sub2API account scheduling settings updated and verified",
+                account_id=account_id,
+                group_count=len(self._group_ids(desired)),
+                concurrency=SUB2API_PUSH_CONCURRENCY,
+                load_factor=SUB2API_PUSH_LOAD_FACTOR,
+            )
+
+        if any(self._same_identity(remote, desired) for remote in remote_accounts):
+            raise Sub2APIError(
+                f"Sub2API account identity already exists with a different token: {account_name}"
+            )
+        if dry_run:
+            return Sub2APIPushResult(
+                action="would-create",
+                account_name=account_name,
+                verified=False,
+                message="dry run: Sub2API account would be created",
+                group_count=len(self._group_ids(desired)),
+                concurrency=SUB2API_PUSH_CONCURRENCY,
+                load_factor=SUB2API_PUSH_LOAD_FACTOR,
+            )
+
+        created = self._request(
+            "POST",
+            "/admin/openai/create-from-codex-pat",
+            json_data=self._create_payload(desired),
+        )
+        account_id = self._account_id(created if isinstance(created, Mapping) else {})
+        if account_id is None:
+            raise Sub2APIError(f"Sub2API create did not return an account ID: {account_name}")
+        verified = self.get_account(account_id)
+        if not self._same_identity(verified, desired) or not self._settings_match(
+            verified, desired
+        ):
+            raise Sub2APIError(f"Sub2API post-create verification failed: {account_name}")
+        return Sub2APIPushResult(
+            action="created",
+            account_name=account_name,
+            verified=True,
+            message="Sub2API account created and verified",
+            account_id=account_id,
+            group_count=len(self._group_ids(desired)),
+            concurrency=SUB2API_PUSH_CONCURRENCY,
+            load_factor=SUB2API_PUSH_LOAD_FACTOR,
+        )
 
     def push_account(
         self,

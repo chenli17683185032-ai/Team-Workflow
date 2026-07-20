@@ -1,5 +1,26 @@
 # 更新日志
 
+## 2026-07-21
+
+### 新增
+
+- Sub2API 自动推送改为实时选择全部有效 OpenAI 分组，并固定写入 `concurrency=9999` 与 `load_factor=9999`。
+- 新增 `python -m team_protocol push-sub2api --latest` 和 macOS 双击入口 `push_latest_sub2api.command`，可重试最近一次成功换班的 JSON；`--dry-run` 只读预演。
+- Sub2API JSON account/export 模型支持 `load_factor` 和多个去重、排序后的 `group_ids`，旧单分组参数继续兼容。
+
+### 稳定性与安全
+
+- 同一 Token 已存在时不重复创建账号：系统把导出账号映射到唯一远端 ID，只校正并发数、负载因子和分组，然后回读验证完整集合。
+- 同身份但不同 Token、空有效分组、远端 ID 歧义或回读漂移都会在明确终态停止；推送失败不删除本地 `0600` JSON，也不倒退已经完成的 Team 换班。
+- 自动推送支持管理员 API Key 或管理员 Session；API Key 只保存在系统加密设置中，不进入脚本、日志、计划或 Git。
+
+### 验证
+
+- 真实生产预演识别既有账号后返回 `would-update`；canary 只把目标账号的 `load_factor` 从空值校正为 `9999`，并发数 `9999` 与四个有效分组保持不变；重复预演返回 `skipped verified=true`。
+- Sub2API、Caddy、PostgreSQL、Redis 容器 ID 和启动时间未变化，均保持 healthy、restart=0；本地 LaunchAgent 5 秒恢复 HTTP 200。
+- `1440x900` 与 `390x844` 设置页无横向溢出，新增字段、全分组和自动推送状态可见，浏览器控制台错误为 0。
+- macOS 全量 320 项测试中 314 项通过、6 项 Windows DPAPI 按平台跳过；Python/JavaScript 语法和 `git diff --check` 通过。
+
 ## 2026-07-20
 
 ### 新增

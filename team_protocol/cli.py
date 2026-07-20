@@ -10,8 +10,12 @@ from typing import Any
 
 from .chatgpt import AuthContext, ChatGPTClient
 from .cpa import build_cpa, build_cpa_filename, load_json_object
+from .database import Database
 from .har import analyze_har, load_har, select_pat_credential, select_session_snapshot
 from .management import ManagementClient
+from .secret_store import SecretStore
+from .sub2api import Sub2APIClient
+from .workflow import WorkflowRunner
 
 
 def _default_har() -> Path:
@@ -231,6 +235,68 @@ def command_web(args: argparse.Namespace) -> int:
     )
 
 
+def _latest_successful_sub2api_path(database: Database) -> Path:
+    candidates: list[tuple[str, Path]] = []
+    for run in database.list_runs(state="succeeded", limit=1000):
+        result = run.get("result")
+        if not isinstance(result, dict):
+            continue
+        raw_path = str(result.get("sub2api_path") or "").strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path).expanduser().resolve()
+        if path.is_file():
+            candidates.append((str(run.get("finished_at") or ""), path))
+    if not candidates:
+        raise ValueError("no successful run has an available Sub2API JSON")
+    candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        raise ValueError("latest successful Sub2API JSON is ambiguous; pass --file")
+    return candidates[0][1]
+
+
+def _secret_text(database: Database, key: str) -> str:
+    value = database.get_secret_setting(key)
+    return "" if value is None else value.decode("utf-8")
+
+
+def command_push_sub2api(args: argparse.Namespace) -> int:
+    database = Database(secret_store=SecretStore())
+    path = (
+        _latest_successful_sub2api_path(database)
+        if args.latest
+        else Path(args.file).expanduser().resolve()
+    )
+    if not path.is_file() or path.suffix.casefold() != ".json":
+        raise ValueError("Sub2API input must be an existing JSON file")
+    account = WorkflowRunner._sub2api_account_from_file(path)
+
+    base_url = str(database.get_text_setting("sub2api_base_url", "") or "").strip()
+    email = str(database.get_text_setting("sub2api_email", "") or "").strip()
+    password = _secret_text(database, "sub2api_password")
+    api_key = _secret_text(database, "sub2api_api_key")
+    totp_secret = _secret_text(database, "sub2api_totp_secret")
+    options: dict[str, Any] = {"timeout": float(args.timeout)}
+    if api_key:
+        options["api_key"] = api_key
+    if totp_secret:
+        options["totp_secret"] = totp_secret
+
+    with Sub2APIClient(base_url, email, password, **options) as client:
+        result = client.push_production_account(account, dry_run=bool(args.dry_run))
+
+    print(f"Sub2API JSON: {path}")
+    print(f"Account: {result.account_name}")
+    print(
+        "Target: "
+        f"concurrency={result.concurrency} "
+        f"load_factor={result.load_factor} "
+        f"groups={result.group_count}"
+    )
+    print(f"Result: {result.action} verified={str(result.verified).lower()}")
+    return 0
+
+
 def _add_live_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--impersonate", default="chrome145")
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -278,6 +344,17 @@ def build_parser() -> argparse.ArgumentParser:
     push.add_argument("--timeout", type=float, default=20.0)
     push.add_argument("--impersonate", default="chrome145")
     push.set_defaults(func=command_push)
+
+    push_sub2api = subparsers.add_parser(
+        "push-sub2api",
+        help="push one generated Sub2API JSON with production scheduling settings",
+    )
+    source = push_sub2api.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file")
+    source.add_argument("--latest", action="store_true")
+    push_sub2api.add_argument("--dry-run", action="store_true")
+    push_sub2api.add_argument("--timeout", type=float, default=30.0)
+    push_sub2api.set_defaults(func=command_push_sub2api)
 
     invite = subparsers.add_parser("invite", help="send a Team invite")
     invite.add_argument("--auth-json", required=True)

@@ -2148,8 +2148,10 @@ function safeSettings(payload, previous = {}) {
     sub2api_url: safeString(firstValue(settings, ["sub2api_base_url", "sub2api_url"])),
     sub2api_email: safeString(firstValue(settings, ["sub2api_email"])),
     sub2api_push: booleanValue(firstValue(settings, ["sub2api_push", "push_sub2api"], false)),
-    sub2api_concurrency: firstValue(settings, ["sub2api_concurrency"], ""),
+    sub2api_concurrency: firstValue(settings, ["sub2api_concurrency"], 9999),
     sub2api_priority: firstValue(settings, ["sub2api_priority"], ""),
+    sub2api_load_factor: firstValue(settings, ["sub2api_load_factor"], 9999),
+    sub2api_all_groups: booleanValue(firstValue(settings, ["sub2api_all_groups"], true)),
     sub2api_group_id: firstValue(settings, ["sub2api_group_id"], ""),
     proxy_configured: configuredSecret(secrets, ["proxy", "proxy_configured", "proxy_present"], previous.proxy_configured),
     management_api_key_configured: configuredSecret(secrets, ["management_api_key", "management_api_key_configured", "management_key_present"], previous.management_api_key_configured),
@@ -2212,6 +2214,14 @@ function renderSub2APIGroupOptions(form, selectedValue) {
   control.value = selectedExists ? selected : "";
 }
 
+function syncSub2APIGroupMode(form = byId("settings-form")) {
+  const allGroups = form.elements.namedItem("sub2api_all_groups");
+  const group = form.elements.namedItem("sub2api_group_id");
+  if (allGroups instanceof HTMLInputElement && group instanceof HTMLSelectElement) {
+    group.disabled = allGroups.checked;
+  }
+}
+
 function renderSecretControls(form = byId("settings-form")) {
   const values = state.settings;
   const secretDefinitions = [
@@ -2249,17 +2259,19 @@ function renderSettings({force = false} = {}) {
     "sub2api_url",
     "sub2api_email",
     "sub2api_concurrency",
+    "sub2api_load_factor",
     "sub2api_priority",
   ];
   for (const name of textFields) {
     const control = form.elements.namedItem(name);
     if (control) control.value = values[name] ?? "";
   }
-  for (const name of ["management_push", "management_overwrite", "sub2api_push"]) {
+  for (const name of ["management_push", "management_overwrite", "sub2api_all_groups", "sub2api_push"]) {
     const control = form.elements.namedItem(name);
     if (control) control.checked = Boolean(values[name]);
   }
   renderSub2APIGroupOptions(form, values.sub2api_group_id);
+  syncSub2APIGroupMode(form);
   for (const name of ["proxy", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"]) {
     const control = form.elements.namedItem(name);
     if (control) control.value = "";
@@ -3857,9 +3869,10 @@ function settingsPayload(form) {
     management_replace: data.get("management_overwrite") === "on",
     sub2api_base_url: safeString(data.get("sub2api_url")).trim(),
     sub2api_email: safeString(data.get("sub2api_email")).trim(),
+    sub2api_all_groups: data.get("sub2api_all_groups") === "on",
     sub2api_push: data.get("sub2api_push") === "on",
   };
-  for (const name of ["pat_ttl", "invite_settle_seconds", "sub2api_concurrency", "sub2api_priority"]) {
+  for (const name of ["pat_ttl", "invite_settle_seconds", "sub2api_concurrency", "sub2api_load_factor", "sub2api_priority"]) {
     const raw = safeString(data.get(name)).trim();
     if (raw) values[name] = Number(raw);
   }
@@ -4160,6 +4173,7 @@ document.addEventListener("change", (event) => {
     state.filters.runDateFrom = target.value;
     renderRunTable();
   } else if (target.closest("#settings-form")) {
+    if (target.name === "sub2api_all_groups") syncSub2APIGroupMode();
     state.settingsDirty = true;
   }
 });

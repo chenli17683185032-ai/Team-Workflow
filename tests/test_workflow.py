@@ -318,6 +318,8 @@ def make_workflow_config(
     sub2api_password="secret",
     sub2api_api_key="",
     sub2api_totp_secret="totp-secret",
+    sub2api_load_factor=None,
+    sub2api_all_groups=False,
     invite_settle_seconds=0,
     new_account_registered=False,
     old_session_token="",
@@ -345,6 +347,8 @@ def make_workflow_config(
         sub2api_api_key=sub2api_api_key,
         sub2api_totp_secret=sub2api_totp_secret,
         sub2api_push=sub2api_push,
+        sub2api_load_factor=sub2api_load_factor,
+        sub2api_all_groups=sub2api_all_groups,
         new_account_registered=new_account_registered,
         old_session_token=old_session_token,
         persist_old_session=persist_old_session,
@@ -1540,6 +1544,64 @@ class WorkflowTests(unittest.TestCase):
             "secret",
             api_key="admin-key",
             totp_secret="totp-secret",
+        )
+
+    def test_sub2api_all_groups_push_accepts_admin_api_key_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_email="",
+                sub2api_password="",
+                sub2api_api_key="admin-key",
+                sub2api_totp_secret="",
+                sub2api_load_factor=9999,
+                sub2api_all_groups=True,
+            )
+            client = SimpleNamespace(
+                push_production_account=lambda _account: SimpleNamespace(
+                    action="updated",
+                    account_name="main+3@example.com",
+                    verified=True,
+                    message="updated",
+                    account_id=42,
+                    group_count=4,
+                    concurrency=9999,
+                    load_factor=9999,
+                ),
+                close=lambda: None,
+            )
+            with patch(
+                "team_protocol.workflow.Sub2APIClient", return_value=client
+            ) as client_class:
+                result = WorkflowRunner(
+                    config,
+                    **run_dependencies(config),
+                    registrar=FakeRegistrar(),
+                    chatgpt=FakeChatGPT(
+                        config.workspace_id,
+                        config.old_account.email,
+                        config.new_account.email,
+                    ),
+                    management=FakeManagement(),
+                    verbose=False,
+                ).run()
+
+        self.assertEqual(
+            result["sub2api"],
+            {
+                "action": "updated",
+                "account_name": "main+3@example.com",
+                "verified": True,
+                "message": "updated",
+                "account_id": 42,
+                "group_count": 4,
+                "concurrency": 9999,
+                "load_factor": 9999,
+            },
+        )
+        client_class.assert_called_once_with(
+            "https://sub2api.example", "", "", api_key="admin-key"
         )
 
     def test_in_memory_checkpoint_prevents_duplicate_mutations_on_resume(self):

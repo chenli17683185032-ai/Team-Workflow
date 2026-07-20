@@ -1274,3 +1274,87 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-20：隔离日志流在向上阅读期间从 80 增至 82 条，`scrollTop` 保持 `1258.5`；回到最新后从 108 增至 110 条，尾部距离保持在 1 像素内。桌面与 `390x844` 均无页面、底栏或日志横向溢出，移动端抽样行无列碰撞或裁切，浏览器控制台错误为 0。
 - 2026-07-20：TaskQueue 与 Web 聚焦 68 项通过；macOS 全量 312 项中 306 项通过、6 项 Windows DPAPI 按平台跳过。Python compileall、JavaScript 语法、diff 检查与新增行高置信凭据扫描通过。
 - 2026-07-20：部署前真实队列、活动 run 和活动 refresh 均为空；LaunchAgent 重启后 4 秒恢复 HTTP 200，线上静态资源包含新日志框，队列仍为空，错误日志没有新增内容。隔离日志进程、临时视口和浏览器标签页均已清理。
+
+### 节点 X：Sub2API JSON 全分组一键推送（进行中）
+
+#### X.1 目标与性能指标
+
+把每次换班注册后已经生成的单账号 Sub2API JSON 作为唯一凭据输入，直接推送到云贝生产 Sub2API，并把账号的并发数 `concurrency` 与调度负载因子 `load_factor` 都固定为 `9999`，同时绑定生产接口当前返回的全部可选 OpenAI 分组。
+
+- “负载”按生产 `v0.1.151` 的账号模型解释为并发数 `concurrency`；实时负载率是测量值，不能写入。账号可写的另一字段是 `load_factor`，生产上限为 `10000`，因此 `9999` 合法。
+- “所有能选的分组”定义为推送当时 `GET /api/v1/admin/groups/all?platform=openai` 返回的有效分组；不缓存分组 ID，不绑定停用、已删除或平台不兼容分组。
+- 输入 JSON 原文件保持不变且继续为 `0600`；PAT、管理员密码、TOTP、API Key 不进入命令行、日志、计划、Git、API 响应或运维手册。
+- 一键动作必须有界：连接、登录、分组读取、创建/更新和回读校验各自使用超时；失败必须返回终态，不能在无人操作时永久卡住。
+- 重复执行必须幂等：同一 Token 已存在时不创建重复账号，但仍校正并回读验证 `concurrency=9999`、`load_factor=9999` 和全分组绑定。
+- 正常换班继续先完成 PAT 与 JSON 原子导出，再执行可选推送；推送失败不得倒退 Team 成员、iCloud Alias、账号晋升或已完成文件。
+- 生产 Sub2API、PostgreSQL、Redis、Caddy 不因本功能重启；本地 LaunchAgent 如需重启，中断必须低于 1 分钟。
+
+#### X.2 GitHub、生产版本与既有实现经验
+
+- `Wei-Shaw/sub2api` 生产标签 `v0.1.151`、提交 `deff3123` 与当前镜像完全一致。该版本原生支持 `group_ids[]`、`concurrency`、`load_factor`、Codex PAT 创建接口和创建后的账号回读；`load_factor` 明确限制为不大于 `10000`。
+- 同版本通用 `/admin/accounts/data` 导入结构不包含 `load_factor` 或 `group_ids`，并提示分组需要另行绑定，因此不能把原 JSON 原样交给通用导入端点后假定配置已经完整生效。
+- `gtxx3600/CPA2sub2API` 与本仓库节点 K 已验证当前 `exported_at / proxies / accounts` 单账号 JSON 结构；本节点复用该结构，不引入另一种凭据文件。
+- 本仓库已有 PAT 专用创建、TOTP step-up、Token/身份幂等匹配、创建后回读以及换班断点；本节点扩展这些现有反馈点，不复制一套未经验证的 HTTP 客户端。
+
+#### X.3 动态控制结构与最小充分模型
+
+```text
+换班注册完成
+    -> PAT + Session 原子导出单账号 JSON（测量输入）
+    -> 严格解析且不改原文件
+    -> 生产实时读取全部可选 OpenAI 分组（环境反馈）
+    -> 覆盖 concurrency=9999 / load_factor=9999 / group_ids=全部
+    -> Sub2API PAT 创建或既有账号校正（执行器）
+    -> 重新读取账号详情与分组（结果反馈）
+    -> 三项完全一致才记录 verified
+    -> 工作流 checkpoint / 一键脚本终态
+```
+
+控制对象是“新注册账号在生产 Sub2API 中的可调度状态”；JSON 是身份与令牌测量，实时分组列表是环境测量，推送客户端是控制器，管理 API 是执行器，账号详情回读是闭环反馈。稳定性优先于速度：任何身份歧义、空分组、认证失败、混合渠道确认失败或回读不一致都必须停止并保留 JSON，不通过数据库直写绕过控制面。
+
+#### X.4 实施节点
+
+- [x] 只读确认本地换班已经生成单账号 Sub2API JSON，现有推送只支持单个静态 `group_id`，账号默认 `concurrency=10` 且未表达 `load_factor`。
+- [x] 通过桌面唯一连接手册登录服务器，确认 `yunbay-sub2api` 为官方 `v0.1.151`、提交 `deff3123`、容器健康且生产依赖未改动。
+- [x] 对照 GitHub 同版本源码确认通用 JSON 导入、PAT 创建、全分组、并发数、负载因子和上限语义。
+- [x] 在本文件固定目标、最小模型、验收、回滚和秘密边界后再开始代码修改。
+- [x] 扩展 Sub2API account/export 模型，安全表达 `load_factor` 与多个 `group_ids`，同时保留旧单分组调用兼容性。
+- [x] 扩展客户端：实时列出可选 OpenAI 分组；创建或校正账号；回读验证 Token 身份、并发数、负载因子和完整分组集合。
+- [x] 增加有界的一键脚本，接收显式 JSON 路径或选择最新成功产物，默认先展示无秘密摘要，再执行生产推送；任何歧义都拒绝猜测。
+- [x] 把同一逻辑接回换班 `push_sub2api` 阶段，使后续一键换班在开关启用时自动推送，不再要求人工选择单个静态分组。
+- [x] 增加聚焦测试，覆盖原 JSON 直读、9999 两字段、动态全分组、空分组、停用分组排除、混合渠道确认、同 Token 幂等校正、异 Token 身份冲突、超时与回读漂移。
+- [x] 运行 Sub2API/Workflow/TaskQueue/Web 聚焦测试、全量测试、Python/JavaScript 语法、compileall、`git diff --check` 和高置信秘密扫描。
+- [x] 先对真实生产 JSON 执行只读/预演，再备份受影响账号配置并执行一次 canary 推送；确认只新增或校正目标账号，不改变其他账号和分组。
+- [x] 配置本地加密管理员凭据与自动推送开关；重启 LaunchAgent 后在 1 分钟内恢复 HTTP 200，并验证无活动任务、错误日志干净。
+- [ ] 更新 README、CHANGELOG、本节点记录和桌面唯一云贝运维手册；提交并推送 GitHub `main`，清理临时文件并确认工作树与远端一致。
+
+#### X.5 验收场景
+
+1. 给定换班生成的单账号 JSON，预演只显示账号名、目标分组数量和三个目标参数，不输出 PAT、Workspace ID、管理员凭据或代理。
+2. 生产存在至少一个有效 OpenAI 分组时，首次推送只创建一个目标账号；回读为 `concurrency=9999`、`load_factor=9999`，分组集合与实时可选集合完全相同。
+3. 同一 JSON 再执行一次：账号总数不增加；若三个配置项已有漂移则原位校正，最终仍返回 `verified=true`。
+4. 同身份但不同 Token 的账号存在时，不静默覆盖；只有已验证的安全刷新路径才允许更新，否则明确失败并保留现场。
+5. 分组接口返回空、非列表、停用分组或请求超时：不创建无分组账号，不修改已有账号，脚本有界失败。
+6. 工作流自动推送失败：JSON 与 PAT 阶段仍成功保留，Team 换班状态不倒退；失败原因脱敏并可用同一 JSON 重试。
+7. 生产容器 ID、启动时间、restart count 与部署前一致；Sub2API、PostgreSQL、Redis、Caddy 均保持 healthy。
+8. 本地 LaunchAgent 重启低于 60 秒，控制台 HTTP 200；后续换班不再需要人工逐项设置 9999 或逐个勾选分组。
+
+#### X.6 回滚与安全边界
+
+- 生产写入前导出目标账号的加密/`0600` 配置备份；回滚只恢复目标账号原配置或删除本次确认新建的单个账号，不回滚数据库 Volume 或其他账号。
+- 不修改、构建或重启生产 Sub2API 镜像；不直写 PostgreSQL，不把管理 API 失败绕过为成功。
+- 不把管理员密码、TOTP、API Key 或账号 PAT 固化到脚本；脚本只从本机加密设置读取管理员凭据，从 `0600` JSON 读取账号 Token。
+- 不自动选择目录中“看起来最新”但身份不明确的多个 JSON；若最新候选并列或结构不合法，要求显式路径并有界退出。
+- 不扩大到批量导入历史 Downloads 文件，不修改已有无关账号的并发、负载因子或分组。
+
+#### X.7 实施记录
+
+- 2026-07-20：SSH 只读核验生产 `yunbay-sub2api` 为 `v0.1.151` / `deff3123`，容器 healthy；未重启或修改生产服务。
+- 2026-07-20：确认通用 `/admin/accounts/data` 虽能读取当前导出 JSON 顶层结构，但不会表达 `load_factor` 与分组绑定；决定沿用 PAT 专用管理接口并增加完整回读闭环。
+- 2026-07-20：生产账号字段中没有可直接写入的实时“负载”；按生产模型把用户要求映射为 `concurrency=9999` 与 `load_factor=9999`，全分组使用实时 OpenAI 可选集合。
+- 2026-07-21：新增生产推送闭环和 `push-sub2api --latest` / 双击脚本；同 Token 账号只校正三项调度配置，异 Token 身份冲突停止，API Key 或管理员 Session 均可认证。
+- 2026-07-21：Sub2API/Workflow/TaskQueue/Web/CLI 聚焦 133 项通过；macOS 全量 320 项中 314 项通过、6 项 Windows DPAPI 按平台跳过，Python/JavaScript 语法与 diff 检查通过。
+- 2026-07-21：生产写前备份保存于 `/opt/new-api/backups/sub2api-json-push-20260720T165412Z`；真实最新 JSON 预演命中账号 ID 500，只报告 `would-update`，未创建账号。
+- 2026-07-21：canary 将账号 500 校正为 `concurrency=9999`、`load_factor=9999`、分组 `2/3/6/9`，回读验证成功；再次预演返回 `skipped verified=true`。
+- 2026-07-21：生成生产管理员 API Key 并只写入本机 Keychain 加密设置；本地数据库写前备份通过 `quick_check`，未保存管理员密码或 TOTP。
+- 2026-07-21：Sub2API/Caddy/PostgreSQL/Redis 均保持原容器 healthy、restart=0；本地 LaunchAgent 5 秒恢复 HTTP 200，桌面与移动设置页无横向溢出，浏览器控制台错误为 0。

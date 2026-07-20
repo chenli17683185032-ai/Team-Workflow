@@ -10,7 +10,7 @@
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows11&logoColor=white)](#运行环境)
 [![macOS](https://img.shields.io/badge/Platform-macOS-111111?logo=apple&logoColor=white)](#运行环境)
 [![FastAPI](https://img.shields.io/badge/FastAPI-localhost-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Tests](https://img.shields.io/badge/tests-276%20passed-2E7D32)](#测试)
+[![Tests](https://img.shields.io/badge/tests-314%20passed-2E7D32)](#测试)
 [![License: MIT](https://img.shields.io/badge/License-MIT-111111.svg)](LICENSE)
 
 </div>
@@ -164,6 +164,17 @@ $ErrorActionPreference = 'Stop'
 队列在每个阶段保存 checkpoint。进程异常退出后可以恢复同一次运行，避免重复邀请、重复退出或重复创建远端资源。邀请前必须满足活跃成员不超过 2 且不存在其他待接受邀请；旧子号退出后会等待远端成员反馈，只有旧号已消失且剩余成员少于 2，或本次新号已在两名成员之中，才允许继续新号登录/恢复。新子号入组后再次要求总人数不超过 2、旧号缺席且新号存在，验证完成前不能创建 PAT 或提交轮换。
 
 PAT 创建成功后，本地始终生成 CPA 与 Sub2API 两个 `0600` 文件；Management 和 Sub2API 管理员配置只控制后续可选推送，不会阻断本地导出。Sub2API 文件采用 `exported_at / proxies / accounts` 结构，`credentials.access_token` 使用本次 Team 新建的 PAT，Session 只用于补充账号身份，不写入 `sessionToken`。
+
+启用 Sub2API 自动推送后，系统在每次推送时实时读取全部有效 OpenAI 分组，并把账号并发数与负载因子固定为 `9999`。同一 Token 已存在时不创建重复账号，只校正这三项调度配置并回读验证；同身份但不同 Token 时停止，不静默覆盖。管理员 API Key 保存在系统加密设置中，不写入脚本或命令行。
+
+需要对最近一次成功换班生成的 JSON 手工重试时，可以先预演，再执行同一个有界脚本；macOS 也可双击仓库根目录的 `push_latest_sub2api.command`：
+
+```bash
+python3 -m team_protocol push-sub2api --latest --dry-run
+python3 -m team_protocol push-sub2api --latest
+```
+
+指定历史文件时使用 `--file /absolute/path/account.sub2api.json`。脚本只输出文件路径、账号名、目标参数和结果，不输出 PAT 或管理员凭据。
 
 账号首次参与任务时会先分配稳定 SID，通过该账号代理解析出口国家和 IANA 时区，再生成并加密保存 SessionProfile、BrowserForge 完整 payload 和工具链版本。旧号、新号分别使用独立代理、指纹和 curl 会话；账号由下一账号晋升为当前账号后仍复用原身份。任务开始时会确认代理地域解析、IANA 时区和 UTC 时钟有效；当前出口与已保存地域或语言发生漂移时继续使用账号已锁定的身份。出口 IP 不保存、不写入日志，代理 userinfo 在日志中整体掩码。
 
