@@ -1764,3 +1764,76 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-22：上线后 BitBrowser 只读复核确认组 1 仍为两人、待邀请为空，并已恢复到成员页；组 2 未打开浏览器窗口，改为对在线库与部署前备份做只读行级对比，1 条 workspace、2 条关联 account、8 条 run 与 8 条 queue 的双向差集全为 0。
 - 2026-07-23：最终复核将 ChatGPT callback 主机限制为 `chatgpt.com`/`www.chatgpt.com`，现有浏览器协议测试 10/10 和全量 351 项回归再次通过。最终 LaunchAgent PID 为 `72777`，首次 watchdog 即返回 HTTP 200，45 秒观察窗内持续 ready；组 2 四类本地行差集再次全为 0，协调器的既有映射歧义保持不变。
 - 2026-07-23：功能提交 `8c19926` 已推送 GitHub `main`；Git 仅包含必要源码、测试、脱敏协议夹具与公开文档，部署备份继续被 Git 忽略。
+
+### 节点 AD：独立 Free 新号自动注册 canary（完成）
+
+#### AD.1 目标与性能指标
+
+使用现有健康 iCloud HME 资源池创建且只创建一个全新测试 Alias，并通过当前自动注册器完成一个不绑定母号、不加入 Team 的 ChatGPT Free 账号，实证 AC 修复后的新账号状态机是否可重复闭环。
+
+- 外部写入预算固定为 1 个 HME Alias、1 次账号注册；不邀请 Team、不选择 Workspace、不创建 PAT、不导出或推送 Sub2API。
+- 全程自动化，不允许用户或操作者手工接管。若出现 CAPTCHA、服务条款确认、安全挑战、电话验证或其他必须人工操作的页面，立即停止并把该阶段记为自动化失败，不尝试绕过。
+- 注册链必须在同一浏览器上下文内显式经过 signup 启动、`authorize/continue`、`email-otp/send`、OTP validate 与 `create_account`；首个非预期状态必须脱敏记录。
+- 成功判据是新身份可读取 ChatGPT session 且账号不属于任何 Team/Workspace；不得用 PAT 或 Team API 成功替代 Free 身份验证。
+- Cookie、OTP、token、iCloud Session、IMAP 授权码和代理凭据不得进入终端、计划、日志摘要或 Git；本次只验证邮件 OTP 注册链，不把密码持久化改造设为前置条件。
+- 失败必须有界终止，不重复创建第二个 Alias，不切换稳定账号，不进行手工补救。
+
+#### AD.2 GitHub 与已有实现经验
+
+- 沿用 AC 已完成的 GitHub 对照：OpenAI 官方 Codex 以 PKCE、随机 state、callback 完整性和秘密脱敏作为认证基线；非官方注册项目不构成协议契约，也不用于规避平台控制。
+- 本仓库 AC 已将主注册入口收敛为同一 Playwright context 的 `screen_hint=signup -> authorize/continue -> user/register -> email-otp/send -> validate -> create_account`，本节点只验证真实闭环，不另造第二套注册器。
+- HME Alias 继续通过现有 `HmeClient.create_alias()` 与数据库事务持久化；注册邮件继续由现有 iCloud IMAP provider 读取，避免引入临时邮箱或旁路凭据。
+
+#### AD.3 动态控制结构与最小充分模型
+
+```text
+健康 HME 资源池 -> 创建 1 个 Alias -> 本地加密持久化
+                                      |
+                                      v
+同一自动浏览器上下文
+  -> signup 初始化 -> authorize/continue -> email-otp/send
+  -> IMAP 测量新 OTP -> validate -> create_account
+  -> ChatGPT session 回读 -> Free/无 Team 事实确认
+
+任一挑战页、人工门、明确拒绝或超时
+  -> 脱敏失败终态 -> 不接管、不重试创建 Alias、不触碰 Team/PAT
+```
+
+控制对象是 Alias 与新账号认证状态随时间的演化；HME 返回、注册阶段事件、HTTP 状态和最终 session/Workspace 事实是测量；当前 registrar 是控制器；Playwright、iCloud HME、IMAP 与既有代理链是执行器；网络时延、OTP 延迟、Sentinel 和上游风控是不确定环境。单 Alias 预算与无人工接管是稳定性约束。
+
+#### AD.4 实施节点
+
+- [x] 确认仓库 `main` 与 `origin/main` 一致、工作树干净、本地控制台 ready 且队列为空。
+- [x] 复核当前注册主路径、iCloud HME/IMAP 组件、加密数据库边界和 `workspace_id=None` 行为。
+- [x] 在本文件固定单次预算、无人工接管、停止条件、验收和回滚边界后再触发外部写入。
+- [x] 只读选择一个状态为 ready 的既有 iCloud mailbox 与现有自动注册代理，确认不读取或输出秘密值。
+- [x] 创建且只创建一个带 canary 标签的 HME Alias，并作为无母号 `rotating_child` 在现有加密数据库中持久化。
+- [x] 直接调用当前 `RegistrarAdapter.register(..., workspace_id=None)`；由现有运行时处理注册表单，事件只保存脱敏阶段与状态。
+- [x] 自动验证 signup、OTP send/validate、create_account 与 session 读取结果；遇到任何人工门立即以失败终态停止。
+- [x] 成功时只读确认账号为 Free 且无 Team/Workspace 归属；失败时固定首个拒绝点和可复现证据，不创建第二个 Alias。
+- [x] 运行相关聚焦回归、`git diff --check` 和秘密扫描；更新本节点实施记录。
+- [x] 提交并推送 GitHub `main`，确认工作树干净；若没有业务代码修复，不重启服务。
+
+#### AD.5 验收场景
+
+1. HME 远端和本地各只新增一条 canary Alias，且没有母号归属、Workspace 绑定、Team 邀请、PAT 或 Sub2API 写入。
+2. 自动事件序列明确出现独立 `email-otp/send`，首次 OTP validate 不再返回旧协议导致的账号停用 `403`，并最终到达 `create_account` 与 session 回读。
+3. 若出现 CAPTCHA、条款、安全挑战、电话验证或其他人工门，任务以自动化失败结束，不请求用户操作、不借助手工浏览器继续。
+4. 注册失败不触发第二次 Alias 创建；Alias 与失败阶段保留为可审计状态，不以密码持久化或后续 Team/PAT 环节扩大本次范围。
+5. 注册成功后账号保持 Free 且不属于 Team；现有组 1、组 2、稳定子号、队列和 Sub2API 均无变化。
+
+#### AD.6 回滚与安全边界
+
+- 本次不自动停用或删除远端 HME Alias；失败 Alias 留在受管库存中，避免未经确认的破坏性清理。
+- 不绕过 CAPTCHA、Sentinel、安全警告或平台风控，不伪造挑战结果；人工门即是当前自动化闭环未完成的测量结果。
+- 不打印数据库秘密字段，不把完整账号标识或凭据写入计划和提交；日志摘要仅保留阶段、状态码和规范化错误类别。
+- 不修改 Team 成员、母号、Workspace、生产 Sub2API 或云贝服务；若需要代码修复，先在本节点记录证据，再做最小改动与测试。
+
+#### AD.7 实施记录
+
+- 2026-07-23：用户要求创建一个新的测试 iCloud 子账号，并用当前流程注册为没有母账号的 Free 账号；随后明确禁止任何手动接管。本 canary 因此采用单 Alias、全自动、人工门即失败的严格边界。
+- 2026-07-23：用户进一步确认本次只验证邮件 OTP 注册前半链路，不需要先改造密码持久化。已撤销尚未部署的相关代码与测试改动；真实 Alias 仍未创建。
+- 2026-07-23：在线 SQLite 快照与源库 `quick_check` 均为 `ok` 后，通过 ready 的既有 iCloud 资源池创建唯一 canary Alias；远端和本地创建均成功，Alias 总数从 20 增至 21，记录为无母号 `rotating_child`，没有第二次创建。
+- 2026-07-23：当前 `RegistrarAdapter.register(..., workspace_id=None)` 真实自动运行成功，阶段为代理检查、邮箱准备、同上下文浏览器注册和 session 获取；身份回传与目标 Alias 一致，session 存在，计划类型为 `free`。全程未出现 CAPTCHA、条款、安全挑战或电话门，人工接管为 0。
+- 2026-07-23：使用加密保存的浏览器 session 独立回读 ChatGPT 成功，身份与 Alias 再次一致、access token 存在、计划类型仍为 `free`；本地 `registered_account=true`，母号归属为空，Workspace 关联数为 0。
+- 2026-07-23：canary 前后数据库差异仅为 `accounts +1`、`icloud_aliases +1`；`workspaces=2`、`runs=16`、`queue_items=16` 均无增量。队列无 active/pending/run/refresh，未创建 Team 邀请、PAT 或 Sub2API 写入，服务无需重启。
