@@ -326,6 +326,7 @@ class WorkflowRunner:
         self.logger = logger
         self.event_callback = event_callback
         self._owns_chatgpt = bool(self._owned_chatgpt_clients)
+        self._old_login_used_saved_session = False
 
     def close(self) -> None:
         seen: set[int] = set()
@@ -627,6 +628,7 @@ class WorkflowRunner:
         step: str,
         *,
         select_workspace: bool = True,
+        allow_saved_session: bool = True,
     ) -> dict[str, Any]:
         self._check_cancel()
         cached = self.state.get(step)
@@ -637,7 +639,13 @@ class WorkflowRunner:
         role = "old" if step in {"old_login", "owner_login"} else "new"
         mailbox = self._mailboxes.get(f"{role}_login")
         network = self._networks[role]
-        if step == "old_login" and self.config.old_session_token:
+        if step == "old_login":
+            self._old_login_used_saved_session = False
+        if (
+            step == "old_login"
+            and allow_saved_session
+            and self.config.old_session_token
+        ):
             self._log("[session] reuse saved child browser cookie")
             try:
                 session = self._chatgpt_clients[role].refresh_session(
@@ -655,6 +663,7 @@ class WorkflowRunner:
                 if self.config.persist_old_session is not None:
                     self.config.persist_old_session(context.session_token)
                 self.state.set(step, session)
+                self._old_login_used_saved_session = True
                 return dict(session)
         action = "register" if step == "new_login" else "login"
         self._log(f"[{action}] {spec.email}")
@@ -1405,6 +1414,43 @@ class WorkflowRunner:
 class CurrentAccountRefreshRunner(WorkflowRunner):
     """Refresh one active child session, PAT, and Sub2API export only."""
 
+    def _create_pat_with_fresh_login_fallback(
+        self, current_session: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            pat = self._run_stage(
+                "pat", lambda: self._create_pat(current_session, role="old")
+            )
+            return dict(current_session), pat
+        except ChatGPTApiError as exc:
+            if not (
+                self._old_login_used_saved_session
+                and exc.status_code == 401
+                and exc.error_code == "token_invalidated"
+            ):
+                raise
+
+        self._check_cancel()
+        self._log(
+            "[session] saved child access token invalidated; "
+            "start a fresh login environment"
+        )
+        if self.config.clear_old_session is not None:
+            self.config.clear_old_session()
+        self.state.set("old_login", None)
+        current_session = self._run_stage(
+            "old_login",
+            lambda: self._login(
+                self.config.old_account,
+                "old_login",
+                allow_saved_session=False,
+            ),
+        )
+        pat = self._run_stage(
+            "pat", lambda: self._create_pat(current_session, role="old")
+        )
+        return dict(current_session), pat
+
     def run(self) -> dict[str, Any]:
         try:
             self._log_network_context()
@@ -1412,8 +1458,8 @@ class CurrentAccountRefreshRunner(WorkflowRunner):
                 "old_login",
                 lambda: self._login(self.config.old_account, "old_login"),
             )
-            pat = self._run_stage(
-                "pat", lambda: self._create_pat(current_session, role="old")
+            current_session, pat = self._create_pat_with_fresh_login_fallback(
+                current_session
             )
             sub2api_path = self._run_stage(
                 "sub2api_export",

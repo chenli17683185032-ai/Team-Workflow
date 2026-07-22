@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "mother_har": [
+    {"method": "GET", "host": "chatgpt.com", "path": "/backend-api/admin/workspaces/{workspace_id}/users", "status": 200},
+    {"method": "POST", "host": "chatgpt.com", "path": "/api/auth/signin/openai", "status": 200},
+    {"method": "GET", "host": "auth.openai.com", "path": "/api/accounts/authorize", "status": 302},
+    {"method": "POST", "host": "auth.openai.com", "path": "/api/accounts/email-otp/validate", "status": 200, "request_json_keys": ["code"]},
+    {"method": "POST", "host": "auth.openai.com", "path": "/api/accounts/workspace/select", "status": 200, "request_json_keys": ["workspace_id"]},
+    {"method": "GET", "host": "chatgpt.com", "path": "/api/auth/callback/openai", "status": 302, "query_names": ["code", "scope", "state"]},
+    {"method": "DELETE", "host": "chatgpt.com", "path": "/backend-api/admin/workspaces/{workspace_id}/users/{user_id}", "status": 200},
+    {"method": "GET", "host": "chatgpt.com", "path": "/backend-api/admin/workspaces/{workspace_id}/users", "status": 200},
+    {"method": "POST", "host": "chatgpt.com", "path": "/backend-api/admin/workspaces/{workspace_id}/invites", "status": 200},
+    {"method": "GET", "host": "chatgpt.com", "path": "/backend-api/admin/workspaces/{workspace_id}/invites", "status": 200},
+    {"method": "GET", "host": "chatgpt.com", "path": "/backend-api/admin/workspaces/{workspace_id}/users", "status": 200},
+    {"method": "GET", "host": "chatgpt.com", "path": "/backend-api/admin/workspaces/{workspace_id}/invites", "status": 200}
+  ],
+  "existing_identity_incognito": [
+    {"method": "GET", "host": "chatgpt.com", "path": "/auth/login_with", "status": 200},
+    {"method": "POST", "host": "chatgpt.com", "path": "/api/auth/signin/openai", "status": 200},
+    {"method": "GET", "host": "auth.openai.com", "path": "/api/accounts/authorize", "status": 302},
+    {"method": "POST", "host": "auth.openai.com", "path": "/api/accounts/email-otp/resend", "status": 200},
+    {"method": "POST", "host": "auth.openai.com", "path": "/api/accounts/email-otp/validate", "network_error": "ERR_HTTP2_PING_FAILED"},
+    {"method": "POST", "host": "auth.openai.com", "path": "/api/accounts/email-otp/validate", "network_error": "ERR_SOCKS_CONNECTION_FAILED"},
+    {"method": "POST", "host": "auth.openai.com", "path": "/api/accounts/email-otp/validate", "status": 200},
+    {"method": "GET", "host": "chatgpt.com", "path": "/api/auth/callback/openai", "status": 302}
+  ]
+}

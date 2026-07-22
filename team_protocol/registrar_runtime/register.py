@@ -621,7 +621,7 @@ def _run_browser_full_registration_flow(
         codex_auth_url=codex_oauth.auth_url,
         random_profile=_generate_random_profile(),
         stop_event=stop_event,
-        signup_flow_candidates=AUTHORIZE_CONTINUE_SENTINEL_FLOWS,
+        signup_flow_candidates=SIGNUP_START_SENTINEL_FLOWS,
         register_flow_candidates=REGISTER_SENTINEL_FLOWS,
         email_verification_flow_candidates=EMAIL_VERIFICATION_SENTINEL_FLOWS,
         create_account_flow_candidates=CREATE_ACCOUNT_SENTINEL_FLOWS,
@@ -639,6 +639,19 @@ def _run_browser_full_registration_flow(
         else None
     )
     mailbox_context = _build_mailbox_context(email=email, auth_credential=mail_auth_credential)
+
+    if isinstance(session_token_data, dict) and session_token_data:
+        session_only_data = _mark_token_payload_session_only(
+            dict(session_token_data),
+            reason="browser_full_flow_session_only",
+            token_source=str(session_token_data.get("token_source") or "chatgpt_session"),
+        )
+        session_only_data["account_password"] = account_password
+        session_only_data["password"] = account_password
+        session_only_data["mail_provider"] = mail_provider_name
+        if mailbox_context:
+            session_only_data["mailbox"] = mailbox_context
+        return json.dumps(session_only_data, ensure_ascii=False, separators=(",", ":"))
 
     if callback_url:
         try:
@@ -680,18 +693,6 @@ def _run_browser_full_registration_flow(
         except Exception:
             pass
 
-    if isinstance(session_token_data, dict) and session_token_data:
-        fallback_data = _mark_token_payload_session_only(
-            dict(session_token_data),
-            reason="browser_full_flow_session_only",
-            token_source=str(session_token_data.get("token_source") or "chatgpt_session"),
-        )
-        fallback_data["account_password"] = account_password
-        fallback_data["password"] = account_password
-        fallback_data["mail_provider"] = mail_provider_name
-        if mailbox_context:
-            fallback_data["mailbox"] = mailbox_context
-        return json.dumps(fallback_data, ensure_ascii=False, separators=(",", ":"))
     return None
 
 
@@ -2894,6 +2895,7 @@ SIGNUP_PASSWORD_URL = "https://auth.openai.com/create-account/password"
 EMAIL_VERIFICATION_URL = "https://auth.openai.com/email-verification"
 SIGNUP_REGISTER_URL = "https://auth.openai.com/api/accounts/user/register"
 AUTHORIZE_CONTINUE_SENTINEL_FLOWS = ("authorize-continue", "authorize_continue")
+SIGNUP_START_SENTINEL_FLOWS = ("signup", *AUTHORIZE_CONTINUE_SENTINEL_FLOWS)
 REGISTER_SENTINEL_FLOWS = (
     "username-password-create",
     "username_password_create",
@@ -5131,7 +5133,6 @@ def run(
                 return None
             emitter.success("网络环境检查通过", step="check_proxy")
             _ensure_openai_relay_ready()
-            _start_create_account_sentinel_prefetch(step="check_proxy")
         except Exception as e:
             emitter.error(f"网络连接检查失败: {e}", step="check_proxy")
             return None
@@ -5166,7 +5167,6 @@ def run(
             emitter.error(f"{mailbox_action_label}准备失败", step="create_email")
             return None
         emitter.success(f"{mailbox_action_label}准备成功: {email}", step="create_email")
-        mailbox_context = _build_mailbox_context(email=email, auth_credential=dev_token)
 
         # 生成随机密码（密码注册流程需要）
         _pw_chars = string.ascii_letters + string.digits + "!@#$%&*"
@@ -5174,6 +5174,37 @@ def run(
 
         if _stopped():
             return None
+
+        emitter.info(
+            "使用同一浏览器上下文执行 signup、Sentinel、OTP 与账户创建...",
+            step="oauth_init",
+        )
+        browser_token_json = _run_browser_full_registration_flow(
+            email=email,
+            account_password=account_password,
+            mail_provider=mail_provider,
+            mail_auth_credential=dev_token,
+            emitter=emitter,
+            stop_event=stop_event,
+            proxy=static_proxy,
+            user_agent=_chrome_ua,
+            browser_entry_config=browser_entry_cfg,
+            browser_sentinel_config=browser_sentinel_cfg,
+            mail_provider_name=resolved_mail_provider_name,
+            session_profile=session_profile,
+        )
+        try:
+            s.close()
+        except Exception:
+            pass
+        if browser_token_json:
+            emitter.success("浏览器注册协议完成", step="get_token")
+            return browser_token_json
+        emitter.error(
+            "浏览器注册协议未返回有效会话；为避免重放失效协议，本次不回退旧 HTTP 注册链。",
+            step="oauth_init",
+        )
+        return None
 
         # ------- 步骤3：通过 chatgpt.com 建立注册会话 -------
         emitter.info("正在访问 ChatGPT 首页...", step="oauth_init")

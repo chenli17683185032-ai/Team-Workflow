@@ -32,16 +32,17 @@ class AuthContextTests(unittest.TestCase):
 
 
 class CapturingSession:
-    def __init__(self, *, status_code=200, text=""):
+    def __init__(self, *, status_code=200, text="", payload=None):
         self.calls = []
         self.status_code = status_code
         self.text = text
+        self.payload = {"ok": True} if payload is None else payload
 
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
         return SimpleNamespace(
             status_code=self.status_code,
-            json=lambda: {"ok": True},
+            json=lambda: self.payload,
             text=self.text,
         )
 
@@ -59,6 +60,21 @@ class ChatGPTClientFingerprintTests(unittest.TestCase):
             client._request("GET", "https://chatgpt.com/backend-api/test")
 
         self.assertEqual(caught.exception.status_code, 403)
+
+    def test_api_error_preserves_structured_error_code(self):
+        client = ChatGPTClient()
+        client._session.close()
+        client._session = CapturingSession(
+            status_code=401,
+            text='{"error":{"code":"token_invalidated"}}',
+            payload={"error": {"code": "token_invalidated"}},
+        )
+
+        with self.assertRaises(ChatGPTApiError) as caught:
+            client._request("POST", "https://chatgpt.com/backend-api/test")
+
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(caught.exception.error_code, "token_invalidated")
 
     def test_session_profile_controls_impersonation_and_headers(self):
         profile = SimpleNamespace(

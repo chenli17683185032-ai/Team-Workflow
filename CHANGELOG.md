@@ -1,5 +1,24 @@
 # 更新日志
 
+## 2026-07-22
+
+### 修复
+
+- 现场新子号注册改为同一浏览器上下文内的当前 `signup` 状态机：串联 `authorize/continue`、用户注册、OTP 发送/校验和资料创建，不再回落已失效的旧 HTTP 注册链。
+- 已有 OpenAI 身份的邮箱在 OTP 后可直接完成 callback，不再误调用用户注册和 `create_account`。
+- 当保存的 browser cookie 交换成功、但 PAT 明确返回 `401 token_invalidated` 时，当前子号刷新会清除失效会话，在全新登录环境中执行一次 OTP 重登并重试 PAT。
+
+### 稳定性与安全
+
+- OTP 校验只对明确的 HTTP/2、SOCKS 和 fetch 瞬时网络错误最多尝试 3 次；HTTP 拒绝或其他异常不重试。PAT 回退只匹配结构化的状态码与错误码，第二次失败立即结束。
+- 真实手工流程的浏览器抓包只留下方法、固定 host/path、状态、字段名与网络错误类别的脱敏测试夹具；原始 HAR/NetLog 在扫描后已删除，不进入 Git。
+
+### 验证
+
+- 认证、注册、工作流、队列与控制台聚焦回归 157 项通过，其中浏览器注册协议 10/10 通过；全量 351 项中 345 项通过，6 项 Windows DPAPI 按 macOS 平台跳过。Python compileall、JavaScript 语法、脱敏夹具 JSON、`git diff --check` 和高置信秘密扫描均通过。
+- 上线前 SQLite 在线备份与源库均 `quick_check=ok`，备份权限为 `0600`；LaunchAgent 初次部署核验在 48 秒内完成，最终认证边界重载后首次 watchdog 即返回 HTTP 200，45 秒观察窗内服务与迁移持续 ready，队列与活动 run/refresh 均为空。
+- 上线后只读核验确认组 1 仍为两人且无待邀请；组 2 的 workspace、关联账号、历史 run 与队列行相对部署前备份的双向差集均为 0。告警协调器线程已运行，但仍保留重启前已存在的 `sub2api_current_child_mapping_ambiguous`，当前目标数为 0，不声称协调器健康。
+
 ## 2026-07-21
 
 ### 新增

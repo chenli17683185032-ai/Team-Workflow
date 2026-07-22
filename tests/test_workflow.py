@@ -661,6 +661,249 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("sessionToken", json.dumps(exported))
 
+    def test_current_refresh_relogs_in_fresh_environment_after_invalidated_saved_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cleared = []
+            persisted = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                old_session_token="old-browser-cookie",
+                persist_old_session=persisted.append,
+                clear_old_session=lambda: cleared.append(True),
+            )
+            config = replace(config, new_account=config.old_account)
+
+            class InvalidatedOnceChatGPT(FakeChatGPT):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.pat_attempts = 0
+
+                def create_personal_access_token(
+                    self, access_token_value, account_id, *, name, ttl
+                ):
+                    self.pat_attempts += 1
+                    if self.pat_attempts == 1:
+                        self.calls.append(("pat", account_id, name, ttl))
+                        raise ChatGPTApiError(
+                            "saved session token was invalidated",
+                            status_code=401,
+                            error_code="token_invalidated",
+                        )
+                    return super().create_personal_access_token(
+                        access_token_value,
+                        account_id,
+                        name=name,
+                        ttl=ttl,
+                    )
+
+            class FreshLoginRegistrar(FakeRegistrar):
+                def login(self, **kwargs):
+                    super().login(**kwargs)
+                    return {
+                        "user": {
+                            "id": "user-old",
+                            "email": config.old_account.email,
+                        },
+                        "account": {"id": config.workspace_id, "planType": "team"},
+                        "accessToken": access_token(
+                            config.old_account.email,
+                            config.workspace_id,
+                            "user-old",
+                        ),
+                        "sessionToken": "old-login-session",
+                    }
+
+            registrar = FreshLoginRegistrar()
+            chatgpt = InvalidatedOnceChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            old_mailbox, _new_mailbox = make_mailboxes(config)
+
+            result = CurrentAccountRefreshRunner(
+                config,
+                checkpoint_store=InMemoryCheckpoint(),
+                old_mailbox=old_mailbox,
+                new_mailbox=old_mailbox,
+                registrar=registrar,
+                chatgpt=chatgpt,
+                verbose=False,
+            ).run()
+
+            self.assertTrue(Path(result["sub2api_path"]).is_file())
+
+        self.assertEqual(cleared, [True])
+        self.assertEqual(
+            persisted,
+            ["old-workspace-session", "old-login-session"],
+        )
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+        self.assertEqual(
+            [call for call in chatgpt.calls if call[0] == "refresh"],
+            [("refresh", "old-browser-cookie", config.workspace_id)],
+        )
+        self.assertEqual(
+            len([call for call in chatgpt.calls if call[0] == "pat"]),
+            2,
+        )
+
+    def test_current_refresh_does_not_relogin_for_other_pat_401(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cleared = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                old_session_token="old-browser-cookie",
+                clear_old_session=lambda: cleared.append(True),
+            )
+            config = replace(config, new_account=config.old_account)
+
+            class OtherUnauthorizedChatGPT(FakeChatGPT):
+                def create_personal_access_token(
+                    self, access_token_value, account_id, *, name, ttl
+                ):
+                    del access_token_value, account_id, name, ttl
+                    raise ChatGPTApiError(
+                        "unauthorized",
+                        status_code=401,
+                        error_code="other_unauthorized",
+                    )
+
+            registrar = FakeRegistrar()
+            old_mailbox, _new_mailbox = make_mailboxes(config)
+
+            with self.assertRaises(ChatGPTApiError):
+                CurrentAccountRefreshRunner(
+                    config,
+                    checkpoint_store=InMemoryCheckpoint(),
+                    old_mailbox=old_mailbox,
+                    new_mailbox=old_mailbox,
+                    registrar=registrar,
+                    chatgpt=OtherUnauthorizedChatGPT(
+                        config.workspace_id,
+                        config.old_account.email,
+                        config.new_account.email,
+                    ),
+                    verbose=False,
+                ).run()
+
+        self.assertEqual(cleared, [])
+        self.assertEqual(registrar.calls, [])
+
+    def test_current_refresh_does_not_relogin_without_a_saved_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cleared = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                clear_old_session=lambda: cleared.append(True),
+            )
+            config = replace(config, new_account=config.old_account)
+
+            class InvalidatedFreshLoginChatGPT(FakeChatGPT):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.pat_attempts = 0
+
+                def create_personal_access_token(
+                    self, access_token_value, account_id, *, name, ttl
+                ):
+                    del access_token_value, account_id, name, ttl
+                    self.pat_attempts += 1
+                    raise ChatGPTApiError(
+                        "fresh token was invalidated",
+                        status_code=401,
+                        error_code="token_invalidated",
+                    )
+
+            registrar = FakeRegistrar()
+            chatgpt = InvalidatedFreshLoginChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            old_mailbox, _new_mailbox = make_mailboxes(config)
+
+            with self.assertRaises(ChatGPTApiError):
+                CurrentAccountRefreshRunner(
+                    config,
+                    checkpoint_store=InMemoryCheckpoint(),
+                    old_mailbox=old_mailbox,
+                    new_mailbox=old_mailbox,
+                    registrar=registrar,
+                    chatgpt=chatgpt,
+                    verbose=False,
+                ).run()
+
+        self.assertEqual(cleared, [])
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+        self.assertEqual(chatgpt.pat_attempts, 1)
+
+    def test_current_refresh_stops_after_one_fresh_login_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cleared = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                old_session_token="old-browser-cookie",
+                clear_old_session=lambda: cleared.append(True),
+            )
+            config = replace(config, new_account=config.old_account)
+
+            class AlwaysInvalidatedChatGPT(FakeChatGPT):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.pat_attempts = 0
+
+                def create_personal_access_token(
+                    self, access_token_value, account_id, *, name, ttl
+                ):
+                    del access_token_value, account_id, name, ttl
+                    self.pat_attempts += 1
+                    raise ChatGPTApiError(
+                        "token remained invalidated",
+                        status_code=401,
+                        error_code="token_invalidated",
+                    )
+
+            registrar = FakeRegistrar()
+            chatgpt = AlwaysInvalidatedChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            old_mailbox, _new_mailbox = make_mailboxes(config)
+
+            with self.assertRaises(ChatGPTApiError):
+                CurrentAccountRefreshRunner(
+                    config,
+                    checkpoint_store=InMemoryCheckpoint(),
+                    old_mailbox=old_mailbox,
+                    new_mailbox=old_mailbox,
+                    registrar=registrar,
+                    chatgpt=chatgpt,
+                    verbose=False,
+                ).run()
+
+        self.assertEqual(cleared, [True])
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+        self.assertEqual(chatgpt.pat_attempts, 2)
+
     def test_new_account_uses_registration_when_adapter_supports_it(self):
         with tempfile.TemporaryDirectory() as directory:
             config = make_workflow_config(

@@ -1454,3 +1454,311 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-21：服务器监控、安装器和独立 `0600` SMTP 环境完成原子部署，回滚点为 `/opt/new-api/backups/sub2api-alerts-20260720T191838Z`；真实 dry-run 为账号 500 约 75%、账号 501 约 9%、均无 401，无关账号 100% 未触发控制告警，所有业务容器 ID、启动时间和 restart count 不变。
 - 2026-07-21：真实 `[测试]` 邮件发送成功，QQ IMAP 从 UID 557 推进到 671 且严格过滤命中；LaunchAgent 9 秒内恢复 HTTP 200，协调器 `running=true / last_error=null`，两目标回读正常，queue/run/refresh/action latch 均为空，没有启动真实换班或刷新。
 - 2026-07-21：Team Workflow 提交 `0440717`（功能）与 `a0bffd8`（计划/部署记录）已推送 `main`；云贝功能分支 `e6f2626c` 经 `764d0f20` 合并远端 main、部署记录 `7f5ce6b8` 已推送 `main`。专用 worktree 与本轮生成缓存已清理，用户已有 `outputs/` 和设计稿保留。
+### 节点 Z：当前子号“刷新令牌失败”现场诊断（完成）
+
+#### Z.1 目标与性能指标
+
+在不再次触发登录、不覆盖现有失败现场、不修改账号或生产服务的前提下，定位 2026-07-22 控制台“刷新令牌失败”的首个失效环节，并给出能被日志、数据库状态或只读复现实验交叉验证的根因。
+
+- 把刷新链路分为请求接收、输入构建、账号登录、PAT 创建、JSON 导出、Sub2API 推送和结果回显；必须定位到具体阶段，不能停留在“刷新失败”的总括提示。
+- 优先读取当前内存快照、持久化数据库与 LaunchAgent 日志；不在证据不足时重放会消耗 OTP、创建新 PAT 或写生产账号的动作。
+- 所有检查必须有界完成，不停止本机控制台，不重启 Sub2API、PostgreSQL、Redis、Caddy 或云贝其他服务。
+- 诊断输出不得包含邮箱授权码、密码、Session、PAT、refresh token、API Key、代理凭据或用户提供的其他秘密。
+- 本节点只诊断原因；除计划与诊断记录外不修改业务代码、数据库、配置或部署状态。若需修复，先以已确认根因为输入另行更新本节点实施步骤。
+
+#### Z.2 GitHub 与现有实现经验
+
+- 本仓库 GitHub 提交 `6ddbda5` 显示当前按钮不是直接调用 Sub2API `RefreshAccountCredentials`，而是运行 `CurrentAccountRefreshRunner`：重新登录当前子号、创建 PAT、导出 Sub2API JSON，并按配置继续推送；任一子阶段异常最终都会收敛为 `credential refresh failed`。
+- `Wei-Shaw/sub2api` 官方实现把 `RefreshAccountCredentials` 作为管理 API 独立动作，说明“Sub2API 内部刷新”和本项目“重新登录后重建 PAT”是两个不同控制对象，不能混用错误语义。
+- 官方 issue `#1499` 记录了批量刷新失败时未明确标出失败账号的问题，`#2231` 记录了刷新周期日志不足的问题；共同经验是必须保存账号、阶段、终态和脱敏错误，不能仅凭前端 toast 诊断。
+
+#### Z.3 动态控制结构与最小充分模型
+
+```text
+用户点击当前子号刷新
+    -> Web API 校验当前账号与空闲 workspace
+    -> TaskQueue 建立 credential_refresh 操作快照
+    -> CurrentAccountRefreshRunner
+       -> old_login（邮箱 OTP / ChatGPT session）
+       -> pat（创建新 PAT）
+       -> sub2api_export（本地 JSON + 可选生产推送）
+    -> 阶段事件与脱敏异常反馈到队列快照
+    -> 前端轮询并显示终态
+```
+
+控制对象是“当前子号可被 Sub2API 使用的最新凭据”；控制器是刷新状态机，邮箱、OpenAI 与代理是带时延和扰动的环境，日志/队列快照/产物时间是测量反馈。最小充分诊断模型只需要首个失败阶段、该阶段最后一条脱敏事件、运行前置状态和是否产生新产物；在这四项没有闭合前不扩大为网络、账号或代码的泛化猜测。
+
+#### Z.4 实施节点
+
+- [x] 读取仓库规则、`karpathy-guidelines`、现有唯一计划文件和 Git 状态。
+- [x] 对照本仓库 GitHub 历史提交、Sub2API 官方刷新实现及相关 issue，区分两种刷新语义并确定可观测性边界。
+- [x] 固定本次目标、性能指标、最小模型、只读边界和验收标准。
+- [x] 只读读取当前 Web API 健康与队列快照，确认失败账号、失败阶段和前端拿到的脱敏错误。
+- [x] 只读检查 LaunchAgent 进程、最近服务日志、SQLite 业务状态及最新导出产物时间，交叉验证首个失败点。
+- [x] 检查失败阶段对应代码、持久化会话状态和测试覆盖；仅运行不会登录账号或写远端的聚焦诊断。
+- [x] 形成单一主因、排除项和证据链；若证据只能支持多个候选，明确缺失观测而不猜测。
+- [x] 将诊断结论与验证结果写回本节点，运行 `git diff --check` 并确认除本计划外无新增修改。
+
+#### Z.5 验收场景
+
+1. 能回答失败发生在输入校验、登录、PAT、导出还是推送阶段，并引用至少两类互相独立的本地证据。
+2. 能解释为什么界面只显示“刷新失败”，以及实际脱敏错误从何处产生、是否仍保留。
+3. 不产生新 OTP 请求、新 PAT、新 JSON、Sub2API 账号写入、队列任务或服务重启。
+4. 诊断过程和计划中不出现任何完整秘密，现有控制台保持可用。
+
+#### Z.6 回滚与安全边界
+
+- 本节点没有业务状态写入；计划文档可由单一 Git diff 审核，不需要数据库或服务回滚。
+- 不直接读取或打印 Keychain 明文，不 dump 数据库加密字段，不输出完整环境变量、Cookie、邮件正文或请求头。
+- 不将 GitHub 上其他项目的同名错误直接套用为本机根因；GitHub 只用于确认控制边界与成熟诊断经验，本机证据决定结论。
+- 若内存快照已因服务重启丢失，只从现有持久化日志、数据库和产物时间恢复证据；不自动重跑刷新。
+
+#### Z.7 实施记录
+
+- 2026-07-22：确认工作树初始干净，当前 `main` 与 `origin/main` 同步；现有刷新功能来自提交 `6ddbda5`。
+- 2026-07-22：GitHub 对照确认本项目“当前子号刷新”与 Sub2API 官方内部令牌刷新不是同一动作；本次采用阶段、终态、脱敏错误和产物反馈构成最小诊断闭环。
+- 2026-07-22：失败快照完整保留：`old_login=done`、`pat=failed`、`sub2api_export=pending`；PAT 请求收到 OpenAI 明确的 HTTP 401 `token_invalidated`。登录日志显示本次复用了已保存的子号浏览器 Cookie，没有进入邮箱 OTP 登录。
+- 2026-07-22：控制台仍健康且队列空闲，Sub2API 对该当前账号的只读测量为 `unauthorized=false`；最新 CPA/Sub2API 产物停留在刷新前，证明失败没有生成新 JSON，也没有进入推送阶段。网络已收到结构化 401，因此排除请求未发出、普通连接超时和本地导出失败作为本次首因。
+- 2026-07-22：根因确认。OpenAI 的 Session 交换接口返回成功对象，当前实现只校验 `session_token` 与邮箱就把 `old_login` 标为完成并持久化新 Cookie；该对象中的 access token 随后被 PAT 接口判定为 `token_invalidated`。刷新器仅在 Session 交换自身抛异常时清 Cookie并回退 OTP，没有处理“交换成功、PAT 401”的失效窗口，因此操作直接失败且失效会话仍被保留。
+- 2026-07-22：运行 3 项无外部写入的聚焦测试均通过，确认现有覆盖只有“Session 交换 401 后 OTP 回退”和“Session/PAT 全成功”，缺少“Session 交换成功但 PAT 返回 401 `token_invalidated`”。建议修复边界是仅在复用保存会话且 PAT 明确返回该 401 时，清除保存会话并最多执行一次邮箱 OTP 全量重登，再重试 PAT；其他 4xx、5xx、超时和身份不匹配不得泛化重试。
+- 2026-07-22：按用户要求在未改代码前通过 Team 工具界面原样重试一次；18:22:25 启动，仍为 `old_login=done / pat=failed / sub2api_export=pending`，18:22:31 再次收到相同 `401 token_invalidated`。第二次独立复现排除偶发交换窗口。
+
+### 节点 AA：失效浏览器会话的单次 OTP 回退修复（实现与部署完成，待提交）
+
+#### AA.1 目标与性能指标
+
+修复当前子号刷新在“保存 Cookie 可交换 Session、但交换出的 access token 已被 OpenAI 作废”时直接失败的问题，使系统清除失效会话、启动不导入旧 Cookie 的全新登录环境、通过邮箱 OTP 建立全新会话并完成 PAT/JSON/Sub2API 闭环，同时保持重试严格有界。
+
+- 只有同时满足“本轮实际复用了保存会话”“PAT 返回 HTTP 401”“结构化错误码为 `token_invalidated`”才允许回退；普通 401、403、429、5xx、超时、身份不匹配和导出/推送失败不得被误判。
+- 每次用户刷新最多清理一次保存会话、新建一次登录环境、执行一次 OTP 重登和重试一次 PAT；第二次失败必须立即进入脱敏终态，不能无人值守永久循环。
+- “全新登录环境”定义为调用现有 registrar 全量登录入口：新建独立 HTTP/浏览器会话容器与 device ID，且不导入旧 Cookie；账号绑定的代理出口与稳定指纹继续保持，避免身份和地域漂移。
+- 首次 PAT 失败前不创建文件；回退成功后仍只生成一组新 JSON，并沿用现有 Sub2API 幂等推送与回读校验。
+- 不改变 Team 成员、Alias、workspace 绑定、换班次数、队列顺序或其他账号；现有可用 PAT 在新 PAT 完成前不被删除。
+- 部署前备份 SQLite 并通过 `quick_check`；LaunchAgent 中断低于 60 秒，生产 Sub2API 及云贝其他容器不重启。
+
+#### AA.2 GitHub 与现有实现经验
+
+- 本仓库 GitHub 提交 `3afeb3f` 已建立“保存 Cookie 的 Session 交换自身失败时清理并 OTP 回退”的单次闭环；本次扩展同一边界到下游 PAT 明确拒绝交换 token 的情况，不引入第二套登录器。
+- GitHub 代码搜索未发现可直接复用的同名 `token_invalidated` 处理；`Wei-Shaw/sub2api` issue `#1499`、`#2231` 仍证明阶段、账号和终态必须保留。修复以本机两次相同现场反馈为主，不复制未经验证的通用重试。
+- 现有 `ChatGPTApiError` 只保留 HTTP 状态和截断文本；结构化响应已经由 `curl_cffi` 提供 JSON，应该在客户端边界提取 `error.code`，避免工作流层用脆弱字符串匹配。
+
+#### AA.3 动态控制结构与最小充分模型
+
+```text
+保存 Cookie -> Session 交换 2xx -> PAT 401 token_invalidated
+                                  -> 精确反馈控制器
+                                  -> 清保存会话（一次）
+                                  -> 新登录环境 + 邮箱 OTP（一次）
+                                  -> PAT 重试（一次）
+                                  -> JSON / Sub2API 推送 / 回读
+                                  -> 成功终态
+
+任何门禁不匹配或第二次失败 -> 脱敏失败终态，不继续重试
+```
+
+控制对象仍是当前子号凭据，结构化 `status_code + error_code` 是测量，新登录环境中的单次 OTP 回退是校正动作，重试次数上限是稳定性约束，PAT/JSON/Sub2API 回读是闭环反馈。最小充分改动只涉及 API 错误模型、当前子号刷新 runner 和对应测试，不修改注册主流程、队列协议或前端契约。
+
+#### AA.4 实施节点
+
+- [x] 在未改代码前通过真实 Team 工具原样重试并得到第二次相同失败，保留阶段与终态证据。
+- [x] 对照 GitHub 历史实现与 issue，确认复用既有 Cookie 失效回退模式，并固定精确门禁和单次重试上限。
+- [x] 在本文件固定目标、性能指标、控制模型、验收、回滚和秘密边界后再修改业务代码。
+- [x] 扩展 `ChatGPTApiError`，从非 2xx JSON 响应安全提取规范化 `error.code`，保留现有消息与状态兼容性。
+- [x] 让当前刷新 runner 记录是否实际复用保存会话；PAT 精确命中门禁时清会话、清内存登录 checkpoint、禁用旧 Cookie，并通过现有 registrar 新建不含旧 Cookie 的登录环境完成 OTP 重登一次，然后重试 PAT。
+- [x] 增加聚焦测试：结构化错误码、回退后成功、非目标错误不重试、无保存会话不重试、第二次 PAT 失败有界退出、阶段日志/秘密脱敏。
+- [x] 运行 ChatGPT/Workflow/TaskQueue/Web 聚焦测试、全量测试、compileall、JavaScript 语法、`git diff --check` 和新增行秘密扫描。
+- [x] 备份在线 SQLite 并校验；在队列空闲时最小中断重启 LaunchAgent，60 秒 watchdog 确认 HTTP 200 和协调器线程恢复，并如实保留其映射歧义状态。
+- [x] 根据 AB/AC 的稳定号保护边界取消真实 PAT canary；用有界单元回归验证 OTP 回退、PAT 最多两次与非目标错误零重试，不再对稳定账号发起真实刷新。
+- [ ] 更新 README/CHANGELOG、本节点与适用运维记录，提交并推送 GitHub `main`，清理临时文件并确认工作树和远端一致。
+
+#### AA.5 验收场景
+
+1. 保存 Cookie 的 Session 交换返回 2xx，但 PAT 返回 `401 token_invalidated`：旧会话被清除，只新建一次不导入旧 Cookie 的登录环境并完成 OTP 登录，第二次 PAT 成功并继续导出/推送。
+2. Session 交换直接 401：保持既有行为，在登录阶段清会话并 OTP 回退，不额外产生第二层重试。
+3. PAT 返回没有 `token_invalidated` 的 401，或返回 403/429/5xx/超时：原错误立即上报，不清会话、不发 OTP。
+4. 没有保存 Cookie、已经通过 OTP 登录后 PAT 返回 `token_invalidated`：不再重复登录，防止无界循环。
+5. 回退后的第二次 PAT 仍失败：刷新终态为 failed，PAT 总调用不超过 2 次，OTP 登录不超过 1 次，错误继续脱敏。
+6. 真实 canary 成功后只新增一组带 `0600` 权限的 JSON；Sub2API 同身份账号原位更新并回读 verified，账号数量不重复增加。
+7. 新登录环境保持该账号既有代理与稳定指纹，但生成独立会话容器和 device ID；部署中本机控制台 60 秒内恢复，生产容器不重启，两个 workspace 绑定、Team 成员和无关账号均不变化。
+
+#### AA.6 回滚与安全边界
+
+- 代码回滚只恢复本次提交并重启本机 LaunchAgent；数据库回滚只在启动迁移或配置异常时使用部署前在线备份，成功生成的远端 PAT/JSON 不自动撤销。
+- 不把所有 PAT 401 都转为 OTP，不捕获宽泛异常后重试，不对第二次失败继续循环。
+- 不在日志、测试夹具、计划、Git 或 API 响应中加入真实 Cookie、OTP、PAT、邮箱授权码、代理凭据或管理密钥。
+- 不重启或修改生产 Sub2API、PostgreSQL、Redis、Caddy；真实 canary 沿用现有管理 API 幂等推送，不直写数据库。
+
+#### AA.7 实施记录
+
+- 2026-07-22：真实原样重试再次命中同一 `401 token_invalidated`；修复范围从诊断扩展为结构化错误码与单次 OTP 回退，尚未修改业务代码。
+- 2026-07-22：用户明确要求复用会话失败后直接使用新的浏览器环境重新登录；确认现有 registrar 登录入口每次创建独立会话容器/device ID且不导入旧 Cookie，因此沿用该入口，保留账号绑定的代理与稳定指纹。
+- 2026-07-22：已在 ChatGPT 客户端边界提取结构化错误码；当前刷新只对实际复用保存会话后出现的 `401 token_invalidated` 清会话并新建登录环境，重试次数固定为一次。5 项新增回归先失败后通过，ChatGPT/Workflow 51 项、TaskQueue 22 项、Web 46 项聚焦测试全部通过。
+- 2026-07-22：AA 与 AC 合并验证完成：认证/注册/工作流/队列/控制台聚焦回归 157 项通过，全量 351 项中 345 项通过、6 项 Windows DPAPI 按 macOS 平台跳过；compileall、JavaScript 语法、JSON、diff 与高置信秘密扫描通过。
+
+### 节点 AB：组 2 手工稳定会话与自动登录协议差异诊断（诊断完成，待修复授权）
+
+#### AB.1 目标与性能指标
+
+以组 2 已由用户手工完成且持续可用的新子号作为只读正对照，捕获浏览器实际登录后会话与 Team 访问的脱敏网络形状，并与本项目自动注册、登录、Session 交换和 PAT 请求逐段比较，判断账号异常究竟来自协议契约偏差、会话生命周期错误、环境不一致，还是目前证据不足以归因。
+
+- 正对照账号只允许刷新已登录页面、读取当前登录状态和 Team 页面；不退出、不重新注册、不重复 OTP、不创建 PAT、不邀请/移除成员，也不注入本项目 Cookie。
+- 抓包只保留时间顺序、HTTP 方法、host/path、状态码、重定向关系、Content-Type，以及 Cookie/请求头/JSON 的字段名；Cookie 值、authorization、code、state、OTP、token、邮箱、账号 ID、workspace ID 和请求正文值一律不写入文件、终端、计划或 Git。
+- 自动侧优先使用已有失败运行的脱敏日志与代码路径重建请求序列；没有独立测试号前不重放注册或登录，绝不拿稳定号做自动协议 canary。
+- 结论至少由两类证据支撑：浏览器抓包、现有运行日志/队列快照、代码请求形状、官方 GitHub 实现中的任意两类；单个端点或第三方项目说法不能直接定性。
+- 所有观测必须有界完成；不得修改 Team 成员、Alias、workspace 绑定、Sub2API、生产服务、代理或浏览器安全设置。
+
+#### AB.2 GitHub 与现有实现经验
+
+- OpenAI 官方 `openai/codex` 当前登录实现使用浏览器打开 `auth.openai.com/oauth/authorize`，生成随机 `state` 与 S256 PKCE，本地 `localhost:1455/1457/auth/callback` 校验 state 后再以 `authorization_code + code_verifier` 请求 `/oauth/token`；官方日志还明确对 code、state、token 和 URL 凭据做脱敏。
+- 本项目现有流程同时涉及 `chatgpt.com/api/auth/signin/openai`、Auth Web API、ChatGPT `/api/auth/session`、Codex OAuth 和 PAT，控制对象多于官方 Codex 登录。诊断必须先区分“ChatGPT Web 会话”“Codex OAuth token”“Team/PAT”三种身份材料，不能把某一层成功等同于全部协议有效。
+- GitHub 上大量非官方自动注册项目复用了同名 Web 端点，但其实现不构成当前协议契约，也不能用于规避平台风控；本节点只把官方 Codex 的授权码/PKCE/回调和秘密脱敏边界作为可信基线。
+
+#### AB.3 动态控制结构与最小充分模型
+
+```text
+手工稳定浏览器（正对照）
+    -> 已登录 ChatGPT / Team 只读刷新
+    -> DevTools Network 脱敏请求序列
+
+已有自动失败运行（待测对象）
+    -> registrar / login / session / PAT 代码序列
+    -> 既有脱敏日志与终态
+
+两侧按阶段对齐
+    -> 入口与授权方式
+    -> Cookie/Origin/Redirect 生命周期
+    -> Session 与 token 的生成边界
+    -> Team/PAT 首次拒绝点
+    -> 一致 / 明确偏差 / 证据不足
+```
+
+控制对象是账号认证状态随登录、跳转和 Team API 调用的演化过程；浏览器网络记录和远端状态码是测量，当前项目请求编排是控制器，浏览器/HTTP session 是执行器，代理、时延、Cookie 作用域、上游协议变化与平台策略是不确定环境。稳定性优先：先证明一个只读、可重复、无账号副作用的观测闭环，再决定是否调整自动流程。
+
+#### AB.4 实施节点
+
+- [x] 读取 `computer-use` 与 `karpathy-guidelines`，检查工作树并识别 AA 未提交实现，禁止覆盖或混入无关改动。
+- [x] 对照 OpenAI 官方 Codex GitHub 登录实现，固定 PKCE、state、本地回调、token exchange 与秘密脱敏基线。
+- [x] 在本文件固定目标、指标、最小模型、验收与安全边界后再开始界面抓包。
+- [x] 使用 Computer Use 识别当前浏览器、Team 控制台和可用抓包界面；先做屏幕只读基线并确认稳定号当前登录状态。
+- [x] 在不退出和不触发写操作的情况下捕获一次 ChatGPT/Team 页面刷新，只记录脱敏请求形状；关闭或清理临时 DevTools 视图但保留用户原标签。
+- [x] 从现有失败日志与代码提取自动侧请求阶段和首个拒绝点，建立手工/自动逐段对照表；必要时只增加本地脱敏观测测试，不发起真实注册。
+- [x] 根据证据选择：暂停 AA canary 和所有自动新号注册，不部署现有未提交实现；下一步先把注册启动改为当前浏览器 `create_account_start` 状态机，再使用独立测试 Alias 做 canary。
+- [x] 运行相关聚焦测试与 `git diff --check`，更新实施记录；确认抓包产物不含秘密且不进入 Git。
+
+#### AB.5 验收场景
+
+1. 已登录稳定号页面刷新后仍可正常访问，Team 成员、workspace、PAT 和本地绑定均无变化。
+2. 能以脱敏阶段序列说明手工浏览器经过哪些 host/path、跳转和会话读取，且记录中没有任何凭据值或完整身份标识。
+3. 自动侧能定位到与正对照一致、不同或缺失的具体阶段；无法观测完整手工登录时明确标为证据不足，不以登录后刷新冒充完整登录抓包。
+4. 未创建账号、OTP、PAT、Alias、邀请、退出、换班、刷新任务或生产写入；未修改 Chrome 网络/安全设置。
+5. 结论能直接决定下一步：继续 AA 的单次 OTP canary、先修协议，或申请独立测试号；稳定账号始终不承担破坏性验证。
+
+#### AB.6 回滚与安全边界
+
+- 本节点默认只有计划文档和只读观测；若临时抓包文件包含原始敏感数据，不打开内容、不提交 Git，立即在确认精确路径后移入受限临时目录或删除，并只保留人工脱敏摘要。
+- 不安装根证书、不启用 HTTPS 中间人、不修改系统代理/VPN/防火墙，也不绕过浏览器或平台安全警告；优先使用浏览器 DevTools 自身 Network 观测。
+- 不把“自动账号异常”转化为规避检测、伪造指纹或绕开平台封禁的实现；只修复协议正确性、会话一致性和有界错误处理。
+- AA 的真实 canary 在本节点完成前暂停；未提交代码与用户现有改动保持原样，除非抓包证据明确支持继续。
+
+#### AB.7 实施记录
+
+- 2026-07-22：用户报告组 2 新子号经手工流程成功且持续稳定，提出自动 Team 登录协议可能失效；该账号被设为只读正对照，不进入自动协议回放。
+- 2026-07-22：GitHub 对照确认官方 Codex 使用标准授权码 + PKCE + 本地回调，而本项目还叠加 ChatGPT Web Session 与 PAT 流程；本轮先抓取实际阶段边界，不预设单一根因。
+- 2026-07-22：Computer Use 只读刷新组 2 母号的 ChatGPT Team 成员页，实时页面显示母号与手工新子号共 2 名成员；Network 中 ChatGPT Team/账户读取请求返回 `200`，实时通道返回 `101`，未出现 Team 认证 `401/403`。Sub2API 同一新子号保持正常并有持续调用，因此 Team 会话不是本次首个失效环节。
+- 2026-07-22：现有失败运行在母号登录、清退旧成员和邀请新 Alias 后进入注册；连续两次都从 `signin/openai` 直接落到普通 `/email-verification`，随后第一次 `POST /api/accounts/email-otp/validate` 即返回 `403`，明确表示账号已删除或停用。PAT、Session 导出、Sub2API 推送均尚未执行。
+- 2026-07-22：全新无 Cookie Chrome 抓包确认当前用户入口为 `chatgpt.com/auth/login_with` -> `auth.openai.com/log-in`，新用户从独立 `/create-account` 页面启动；页面在同一浏览器上下文初始化 Sentinel。公开前端构建进一步确认新号状态机为 `create_account_start` 生成 `authorize_continue` Sentinel -> `POST /api/accounts/authorize/continue` -> `GET /api/accounts/email-otp/send` -> `/email-verification/register` -> `POST /api/accounts/email-otp/validate` -> `/create_account`。
+- 2026-07-22：本项目主注册路径仍获取 ChatGPT CSRF 并 `POST /api/auth/signin/openai?screen_hint=login_or_signup`，直接接受 `/email-verification` 作为注册续页，且代码明确跳过独立 `email-otp/send`；OTP validate 由 HTTP 会话直接提交，create_account Sentinel 则由另一浏览器会话预取。浏览器全流程 fallback 同样沿用旧 `signin/openai` 入口，现有测试没有覆盖上述真实注册状态机。
+- 2026-07-22：根因收敛为“自动新号注册启动协议已偏离当前 Auth 前端”，不是 Team 成员 API 失效。为防止继续消耗 Alias 或产生被停用账号，自动新号注册和 AA 真实 canary 暂停；未修改业务代码、账号、Team 成员、Alias、Sub2API、代理或生产服务，未导出 HAR。
+- 2026-07-22：收尾核验通过：AB 未修改业务代码，因此沿用本轮已通过的 ChatGPT/Workflow 51 项、TaskQueue 22 项、Web 46 项聚焦测试；再次执行 `git diff --check` 返回成功。工作区未发现本轮 HAR/PCAP/Network 导出物，唯一名称命中是 `.venv` 内 Playwright 自带的 `crDevTools.js`，不属于抓包产物；Git 状态仅保留 AA 原有 4 个代码/测试文件与本计划文件的未提交修改。
+
+### 节点 AC：组 1 Computer Use 手工提拉全链抓包与注册协议修复（实现与部署完成，待提交）
+
+#### AC.1 目标与性能指标
+
+不用现有自动提拉任务，由 Computer Use 在真实界面中完成且只完成一次组 1 手工提拉：登录组 1 Team 母号、读取成员事实、移除旧子号、确认只剩母号、使用现有 iCloud 资源准备一个新 Alias、邀请新 Alias、在独立浏览器上下文按当前官方页面注册并接受邀请、最终确认 Team 恰好为母号与新子号两人。DevTools 从登录前开始保留全程网络记录，用真实序列修复当前工具的注册启动协议。
+
+- 远端写操作严格限定为组 1：最多创建或选用 1 个新 iCloud Alias、移除 1 个现有非母号成员、发送 1 个 Team 邀请、创建 1 个新 ChatGPT 子号；不得触碰组 2、其他 Alias、其他 Team、生产 Sub2API 或云贝服务。
+- 稳定性先于速度：先确认母号可登录、新 Alias 邮箱可收信和回滚对象明确，再移除旧成员；每次写操作后读取远端事实，成员数必须按 `2 -> 1 -> 1+pending -> 2` 演化，任何不确定状态立即停止。
+- 抓包覆盖母号登录、成员读取、成员移除、邀请、新号注册启动、Sentinel 初始化、OTP 发送/校验、资料创建、邀请接受、Team/账户读取；保留方法、host/path、状态、重定向、字段名、Cookie 作用域和同一上下文关系。
+- 原始 HAR 只允许保存在仓库外的权限受限临时目录，禁止进入终端输出、计划、Git 或应用日志；分析后只保留脱敏协议夹具，原始 Cookie、authorization、OTP、code、state、token、邮箱全文、账号/Workspace ID 和请求正文值全部清除。
+- 若出现 CAPTCHA、服务条款确认、Apple 双重验证或无法安全自动完成的凭据步骤，按 Computer Use 确认规则在动作发生时交给用户或请求确认；不得规避安全挑战。
+- 修复后注册流程必须在同一个浏览器上下文内保持 device ID、Cookie、Sentinel、`create_account_start`、OTP 和 `create_account` 的因果链，不再从旧 `signin/openai` 入口直接跳入普通 `/email-verification`。
+- 自动重试有界：入口初始化、OTP 发送和验证码校验均不得无限循环；明确的停用/删除、429、挑战页、状态不匹配立即进入脱敏失败终态，不做风控规避或指纹伪造。
+- 本地部署中断低于 60 秒；上线前备份 SQLite 并通过 `quick_check`，上线后控制台、队列和组 1/组 2只读状态均健康。
+
+#### AC.2 GitHub 与已有实现经验
+
+- OpenAI 官方 `openai/codex` 的 `codex-rs/login/src/server.rs` 使用授权码 + S256 PKCE + 随机 state + localhost callback，并对 code、state、token 与带凭据 URL 做脱敏；本次继续沿用其 OAuth 完整性与日志边界。
+- GitHub 代码搜索能找到非官方项目出现 `create_account_start`，但没有官方注册协议实现；非官方请求形状不作为契约，也不用于规避平台控制。本次真实浏览器 HAR 是注册状态机的首要测量来源。
+- 本仓库已具有 `authorize/continue`、`email-otp/send`、OTP validate、`create_account`、BrowserForge/Playwright 上下文和单次重试能力；最小修复应复用这些组件，只替换已经失效的注册入口和跨上下文编排，不另造完整注册器。
+- `karpathy-guidelines` 要求每一处代码变更直接对应抓包差异；先用脱敏失败夹具复现旧路径，再做最小实现并验证，不顺带重构 5000 行运行时。
+
+#### AC.3 动态控制结构与最小充分模型
+
+```text
+现有 iCloud 资源 -> 新 Alias 已就绪且可收 OTP
+                             |
+组 1 母号登录 -> 成员测量=2 -> 移除旧子号 -> 反馈测量=1
+                                         -> 邀请新 Alias -> pending=1
+新号独立浏览器上下文
+  -> auth/login_with -> create-account
+  -> create_account_start + Sentinel
+  -> authorize/continue -> email-otp/send
+  -> OTP validate -> create_account -> 接受邀请
+  -> Team 反馈测量=母号+新号=2
+
+真实脱敏网络序列 -> 与当前工具逐段对齐 -> 最小修复
+                  -> 单元/状态机测试 -> 本地部署 -> 只读健康反馈
+```
+
+控制对象是组 1 成员与新账号认证状态随时间的联合演化；浏览器 Network、Team 成员回读、iCloud 收信和本地运行阶段是测量；手工浏览器动作与修复后的注册编排是控制器；Chrome/DevTools、HTTP Session、代理和邮箱是执行器；时延、Sentinel、Cookie 作用域、重定向、OTP 延迟、限流和页面变更是不确定环境。每一步写后回读构成闭环，人数硬上限与单次操作上限保证稳定性。
+
+#### AC.4 实施节点
+
+- [x] 读取 Computer Use、`karpathy-guidelines`、仓库状态和唯一计划文件，识别并保留 AA 未提交代码。
+- [x] 对照 OpenAI 官方 Codex GitHub 登录实现与公开搜索结果，固定 OAuth 完整性、脱敏边界和“真实抓包优先”原则。
+- [x] 在本文件固定目标、性能指标、完整手工步骤、抓包范围、回滚与验收后再开始外部写操作。
+- [x] 用 Computer Use 读取 Team Workflow、浏览器和 iCloud 当前状态，确认组 1 母号、旧子号、现有新 Alias、母号可登录及没有运行中的自动任务；建立写前只读快照。
+- [x] 在仓库外建立 `0700` 临时抓包目录；打开 DevTools Network、开启 Preserve log，从母号登录前开始记录，原始数据全程不输出。
+- [x] 手工登录组 1 母号并回读 Team 成员；移除唯一旧子号后再次回读确认只剩母号。
+- [x] 使用用户指定的现有 iCloud Alias，母号邀请该 Alias，回读确认唯一 pending invite。
+- [x] 在同一 BitBrowser 网络环境的独立无痕上下文完成 OTP 登录与邀请接受；最终回读确认恰好母号与新子号两人。服务端把该邮箱识别为已有 OpenAI 身份，因此本次没有进入资料创建或 `create_account`，不得把这段记录当作全新注册分支。
+- [x] 对母号 HAR 与新号隐私剥离 NetLog 完成秘密扫描，生成仅含请求形状、字段名与网络错误类别的脱敏时间线/测试夹具；验证后逐文件删除原始抓包及本轮临时敏感目录。
+- [x] 将真实序列与 `register.py`、`browser_register_flow.py` 对齐，先增加能复现旧路径缺口的聚焦测试，再以最小改动实现当前注册入口、同上下文 Sentinel/OTP/create_account 链和有界失败。
+- [x] 运行新增测试、Registrar/Workflow/TaskQueue/Web 聚焦测试、全量测试、compileall、JavaScript 语法、`git diff --check` 和新增行秘密扫描。
+- [x] 更新 README、CHANGELOG、本节点与现有运维记录；备份 SQLite 并校验，在队列空闲时重启本地 LaunchAgent，60 秒 watchdog 验证控制台恢复，并记录协调器线程运行但映射仍歧义。
+- [x] 做上线后只读核验：组 1 仍为母号与手工新子号两人、待邀请为空；组 2 的 workspace/account/run/queue 与部署前备份双向差集为 0；队列空闲。未再执行第二次真实踢拉。
+- [ ] 提交并推送 GitHub `main`，清理本轮临时文件，确认本地工作树与 `origin/main` 一致。
+
+#### AC.5 验收场景
+
+1. 手工提拉每个阶段都有写后回读：写前 2 人、踢后仅母号 1 人、邀请后唯一目标 pending、新号接受后恰好 2 人；组 2 和其他远端对象无变化。
+2. 母号 HAR 与新号 NetLog 能重建本次已有身份的登录、OTP、callback、邀请接受和 Team 读取顺序；AB 的全新无 Cookie 前端证据补充 `authorize/continue`、OTP send 与 `create_account` 分支。两者必须明确分开，脱敏产物不含任何凭据值或完整身份标识。
+3. 新测试证明旧 `signin/openai -> /email-verification -> validate` 路径缺少当前注册启动状态；修复后的路径必须显式经过 `create_account_start`、`authorize/continue` 和 `email-otp/send`。
+4. Sentinel、Cookie、device ID、OTP 和 create_account 位于同一注册浏览器上下文；不得在另一个浏览器中预取 token 后注入 HTTP 会话。
+5. 既有账号登录、当前子号刷新、AA 精确的 `401 token_invalidated` 单次回退、Team 两人硬上限和提拉幂等恢复测试不回归。
+6. 部署后控制台 60 秒内恢复，数据库 `quick_check` 正常，队列无悬挂任务，组 1 手工新子号持续可用，组 2 保持原状。
+7. Git 只包含计划、必要代码、测试与文档；没有 HAR、Cookie、OTP、token、邮箱授权码、代理凭据、真实邮箱或远端 ID。
+
+#### AC.6 回滚与安全边界
+
+- 踢旧成员前必须确认新 Alias 可用和母号会话稳定。若踢后邀请或注册失败，停止所有自动动作，保留母号单人稳定态并向用户报告；只有明确知道旧账号仍可登录时才考虑重新邀请，不能盲目回滚到失效账号。
+- 邀请前发现其他 pending invite、成员不为预期 1 人、目标 Alias 不唯一或身份不完整时立即停止；不得为了完成任务清退额外成员或取消无关邀请。
+- 原始 HAR 视为高敏感临时数据：路径必须精确、权限受限、仓库外保存；解析程序不得打印值。删除只针对本轮创建且路径已验证的临时目录。
+- 不安装证书、不启用 HTTPS 中间人、不修改系统代理/VPN/防火墙、不绕过 CAPTCHA/安全警告、不伪造指纹或规避封禁；只使用浏览器 DevTools 原生 Network 记录。
+- 代码回滚恢复本次 AC 提交并重启本地服务；数据库仅在迁移/启动异常时使用部署前备份。已经完成的真实 Team 成员变化和新账号不自动撤销。
+- AA 未提交修改必须保留并重新验证；若 AC 证明 AA 与新协议冲突，先在计划中说明并做最小整合，不覆盖或丢弃既有工作。
+
+#### AC.7 实施记录
+
+- 2026-07-22：用户明确要求由 Computer Use 手工完成一次组 1 提拉并全程抓包，再用该真实证据修复工具；禁止把现有自动提拉当作本次操作方式，也不执行第二次真实踢拉。
+- 2026-07-22：完成技能、工作树和 GitHub 基线检查。官方 Codex 提供 PKCE/state/callback 与秘密脱敏基线，公开注册项目不作为协议契约；当前项目旧主路径仍从 `signin/openai` 进入并注明未见独立 OTP send，而仓库已有可复用的 `authorize/continue` 与 `email-otp/send` 组件。
+- 2026-07-22：Computer Use 只操作组 1，按 `2 人 -> 1 人 -> 1 个 pending -> 2 人` 完成一次手工提拉闭环；最终成员为原母号与用户指定的新子号，待处理邀请回读为空。上线前只读复核再次确认组 1 为 2 人，组 2 窗口未打开。
+- 2026-07-22：母号 DevTools HAR 覆盖登录、成员删除、邀请和最终成员/邀请回读；新号使用同一 BitBrowser 网络环境的无痕窗口，并由浏览器内置 NetLog 以 `Strip private information` 记录。原始文件位于仓库外 `0700` 临时目录，尚未完成最终秘密扫描和删除。
+- 2026-07-22：新号 OTP 前两次提交分别遇到 HTTP/2 ping 与 SOCKS 连接瞬时失败，第三次成功；服务端随后直接 OAuth callback 并进入 Business，没有出现 `create_account_start`、资料创建或 `create_account`。这证明已有身份分支必须跳过账号创建，也说明 SOCKS/HTTP2 扰动只能有界重试；真正全新用户分支仍以 AB 的全新无 Cookie 前端证据为准，不能由本次登录分支替代。
+- 2026-07-22：将两份原始抓包解析为 `tests/fixtures/group1_auth_protocol_shapes.json`，只保留方法、固定 host/path、状态码、请求字段名和网络错误类别；夹具通过 JSON、真实邮箱/ID、Bearer/JWT/API Key 已知模式扫描。原始 HAR 与 NetLog 含敏感字段值，分析完成后已逐文件删除，受限临时目录也已移除且确认不存在。
+- 2026-07-22：先增加 6 项失败测试固定新账号 signup 状态机、已有身份 callback、两类瞬时网络错误与主入口禁用旧协议，再完成最小修复；随后补充非瞬时错误不重试和 browser session 优先返回，共 8 项协议测试通过。主注册入口只调用同一 Playwright context，明确执行 `screen_hint=signup -> authorize/continue -> user/register -> GET email-otp/send -> validate -> create_account`；已有身份在 OTP 后进入 callback/consent/workspace 时跳过 `create_account`，瞬时 validate 最多尝试 3 次，已有 browser session 不再与另一套 Codex state 重复交换。
+- 2026-07-22：新增浏览器协议测试最终 10/10 通过，包括 `/api/auth/session` 未回传 session token 时从同一浏览器上下文的 NextAuth Cookie 恢复最小会话；聚焦回归共 157 项通过，全量 351 项中 345 项通过、6 项 Windows DPAPI 按 macOS 平台跳过。部署前在线备份 `backups/console-pre-auth-protocol-20260722-223347.sqlite` 与源库均 `quick_check=ok`，备份权限 `0600`。
+- 2026-07-22：LaunchAgent 初次部署后以 PID `36739` 运行，完整核验在 48 秒内完成；补入同一浏览器会话 Cookie 兜底后再次最小重载，新 PID 为 `67974`，首次 watchdog 即返回 HTTP 200。45 秒观察窗内服务和迁移持续 ready，队列无 active/pending/refresh，`run_operation=null`。协调器线程 `running=true`，但仍为重启前已存在的 `sub2api_current_child_mapping_ambiguous`，目标数为 0、`last_poll_at=null`，因此不声称协调器健康。
+- 2026-07-22：上线后 BitBrowser 只读复核确认组 1 仍为两人、待邀请为空，并已恢复到成员页；组 2 未打开浏览器窗口，改为对在线库与部署前备份做只读行级对比，1 条 workspace、2 条关联 account、8 条 run 与 8 条 queue 的双向差集全为 0。
+- 2026-07-23：最终复核将 ChatGPT callback 主机限制为 `chatgpt.com`/`www.chatgpt.com`，现有浏览器协议测试 10/10 和全量 351 项回归再次通过。最终 LaunchAgent PID 为 `72777`，首次 watchdog 即返回 HTTP 200，45 秒观察窗内持续 ready；组 2 四类本地行差集再次全为 0，协调器的既有映射歧义保持不变。

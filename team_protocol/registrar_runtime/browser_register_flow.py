@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
-import tempfile
 import threading
 import time
 import uuid
 from typing import Any, Dict, Optional, Sequence
-from urllib.parse import quote as urllib_parse_quote
+from urllib.parse import parse_qs, quote as urllib_parse_quote, urlparse
 
 from ..playwright_proxy import PlaywrightProxyLease, apply_playwright_proxy
 from .fingerprint_profiles import SessionProfile, create_session_profile
@@ -22,6 +20,8 @@ DEFAULT_CHATGPT_WARMUP_WAIT_MS = 2500
 DEFAULT_SENTINEL_PAGE_URL = "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
 DEFAULT_CHATGPT_READY_TIMEOUT_SECONDS = 30
 DEFAULT_CHATGPT_READY_POLL_INTERVAL_MS = 1000
+DEFAULT_TRANSIENT_FETCH_ATTEMPTS = 3
+DEFAULT_TRANSIENT_FETCH_RETRY_DELAY_MS = 250
 
 _CHALLENGE_MARKERS = (
     "just a moment",
@@ -29,6 +29,19 @@ _CHALLENGE_MARKERS = (
     "cf-turnstile",
     "challenge-platform",
     "cf_chl",
+)
+
+_TRANSIENT_FETCH_ERROR_MARKERS = (
+    "err_http2_ping_failed",
+    "err_socks_connection_failed",
+    "failed to fetch",
+    "networkerror",
+    "network error",
+)
+
+_SESSION_COOKIE_NAMES = (
+    "__Secure-next-auth.session-token",
+    "next-auth.session-token",
 )
 
 
@@ -239,7 +252,7 @@ class PlaywrightBrowserFlow:
     def _warm_chatgpt_page(self):
         page = self._ensure_page_origin("chatgpt")
         page.goto(
-            f"{CHATGPT_BASE}/auth/login?screen_hint=signup",
+            f"{CHATGPT_BASE}/auth/login_with?screen_hint=signup",
             wait_until="domcontentloaded",
             timeout=max(30000, int(self.config.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)) * 1000),
         )
@@ -293,6 +306,45 @@ class PlaywrightBrowserFlow:
             },
         )
 
+    def _fetch_json_with_transient_retries(
+        self,
+        *,
+        max_attempts: int = DEFAULT_TRANSIENT_FETCH_ATTEMPTS,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        attempts = max(1, int(max_attempts or 1))
+        retry_delay_ms = max(
+            0,
+            int(
+                self.config.get(
+                    "transient_fetch_retry_delay_ms",
+                    DEFAULT_TRANSIENT_FETCH_RETRY_DELAY_MS,
+                )
+            ),
+        )
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._fetch_json(**kwargs)
+            except Exception as exc:
+                last_error = exc
+                message = str(exc or "").casefold()
+                is_transient = any(
+                    marker in message for marker in _TRANSIENT_FETCH_ERROR_MARKERS
+                )
+                if not is_transient or attempt >= attempts:
+                    raise
+                self._log(
+                    "warn",
+                    f"浏览器请求发生瞬时网络错误，准备有界重试（{attempt}/{attempts}）",
+                    step="verify_otp",
+                )
+                if retry_delay_ms:
+                    time.sleep(retry_delay_ms / 1000.0)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("browser request did not run")
+
     def _cookies(self) -> list[dict]:
         self.open()
         if self._context is None:
@@ -309,7 +361,34 @@ class PlaywrightBrowserFlow:
                 return str(cookie.get("value") or "").strip()
         return str(uuid.uuid4())
 
-    def _generate_sentinel_token(self, flow_candidates: Sequence[str]) -> str:
+    def _session_cookie_token(self) -> str:
+        cookies = self._cookies()
+        values = {
+            str(cookie.get("name") or "").strip(): str(
+                cookie.get("value") or ""
+            ).strip()
+            for cookie in cookies
+            if isinstance(cookie, dict)
+        }
+        for base_name in _SESSION_COOKIE_NAMES:
+            direct = values.get(base_name, "")
+            if direct:
+                return direct
+            chunks = sorted(
+                (
+                    (int(name[len(base_name) + 1 :]), value)
+                    for name, value in values.items()
+                    if name.startswith(f"{base_name}.")
+                    and name[len(base_name) + 1 :].isdigit()
+                    and value
+                ),
+                key=lambda item: item[0],
+            )
+            if chunks:
+                return "".join(value for _index, value in chunks)
+        return ""
+
+    def _generate_sentinel_bundle(self, flow_candidates: Sequence[str]) -> Dict[str, str]:
         sentinel_page = self._ensure_sentinel_page()
         result = sentinel_page.evaluate(
             """async (flows) => {
@@ -318,22 +397,104 @@ class PlaywrightBrowserFlow:
                 for (const flow of flows) {
                     try {
                         await window.SentinelSDK.init(flow);
-                        const token = await window.SentinelSDK.token(flow);
-                        if (typeof token === 'string' && token.trim()) {
-                            return token.trim();
+                        const tokenResult = await window.SentinelSDK.token(flow);
+                        let soToken = '';
+                        try {
+                            soToken = await window.SentinelSDK.sessionObserverToken(flow) || '';
+                        } catch (error) {}
+                        const token =
+                            typeof tokenResult === 'string'
+                                ? tokenResult.trim()
+                                : (tokenResult && typeof tokenResult.token === 'string'
+                                    ? tokenResult.token.trim()
+                                    : '');
+                        if (token) {
+                            return {
+                                token,
+                                so_token: typeof soToken === 'string' ? soToken.trim() : '',
+                                flow,
+                            };
                         }
                     } catch (error) {
                         lastError = String(error || '');
                     }
                 }
                 if (lastError) throw new Error(lastError);
-                return '';
+                return { token: '', so_token: '', flow: '' };
             }""",
             list(flow_candidates or []),
         )
-        return str(result or "").strip()
+        payload = result if isinstance(result, dict) else {}
+        return {
+            "token": _first_text(payload.get("token")),
+            "so_token": _first_text(payload.get("so_token")),
+            "flow": _first_text(payload.get("flow")),
+        }
 
-    def _wait_for_otp(self, *, mail_provider: Any, mail_auth_credential: str, email: str, stop_event: Any = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> str:
+    def _generate_sentinel_token(self, flow_candidates: Sequence[str]) -> str:
+        return self._generate_sentinel_bundle(flow_candidates).get("token", "")
+
+    @staticmethod
+    def _response_state(response: Dict[str, Any]) -> tuple[str, str]:
+        payload = response.get("json") if isinstance(response.get("json"), dict) else {}
+        page = payload.get("page") if isinstance(payload.get("page"), dict) else {}
+        page_type = _first_text(page.get("type"), payload.get("page_type")).casefold()
+        next_url = _normalize_url(
+            payload.get("continue_url"),
+            payload.get("url"),
+            payload.get("redirect_url"),
+            response.get("url"),
+        )
+        return page_type, next_url
+
+    @staticmethod
+    def _is_callback_url(target_url: str) -> bool:
+        parsed = urlparse(str(target_url or ""))
+        if str(parsed.hostname or "").casefold() not in {
+            "chatgpt.com",
+            "www.chatgpt.com",
+        }:
+            return False
+        if parsed.path.rstrip("/") != "/api/auth/callback/openai":
+            return False
+        query = parse_qs(parsed.query)
+        return bool(query.get("code") and query.get("state"))
+
+    @classmethod
+    def _is_existing_identity_completion(
+        cls,
+        page_type: str,
+        next_url: str,
+    ) -> bool:
+        normalized_page = str(page_type or "").casefold()
+        normalized_url = str(next_url or "").casefold()
+        return (
+            cls._is_callback_url(next_url)
+            or "consent" in normalized_page
+            or "workspace" in normalized_page
+            or "organization" in normalized_page
+            or "/consent" in normalized_url
+            or "/workspace" in normalized_url
+        )
+
+    @staticmethod
+    def _needs_account_profile(page_type: str, next_url: str) -> bool:
+        normalized_page = str(page_type or "").casefold()
+        normalized_path = str(urlparse(str(next_url or "")).path or "").casefold()
+        return normalized_page in {"about_you", "create_account_start"} or normalized_path.startswith(
+            "/about-you"
+        )
+
+    def _wait_for_otp(
+        self,
+        *,
+        mail_provider: Any,
+        mail_auth_credential: str,
+        email: str,
+        stop_event: Any = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        sent_at_ts: Optional[float] = None,
+    ) -> str:
         if mail_provider is None:
             raise RuntimeError("browser flow otp wait requires mail provider")
         try:
@@ -344,6 +505,7 @@ class PlaywrightBrowserFlow:
                     proxy=self.proxy,
                     timeout=int(timeout_seconds or DEFAULT_TIMEOUT_SECONDS),
                     stop_event=stop_event,
+                    sent_at_ts=sent_at_ts,
                 )
                 or ""
             ).strip()
@@ -380,7 +542,12 @@ class PlaywrightBrowserFlow:
             access_token = _first_text(payload.get("accessToken"))
             if not access_token:
                 return None
-            session_token = _first_text(payload.get("sessionToken"))
+            session_token = _first_text(
+                payload.get("sessionToken"),
+                self._session_cookie_token(),
+            )
+            if not session_token:
+                return None
             email = _first_text((payload.get("user") or {}).get("email") if isinstance(payload.get("user"), dict) else "")
             return {
                 "access_token": access_token,
@@ -438,7 +605,7 @@ class PlaywrightBrowserFlow:
                 f"&ext-oai-did={urllib_parse_quote(device_id)}"
                 f"&auth_session_logging_id={uuid.uuid4()}"
                 "&ext-passkey-client-capabilities=0111"
-                "&screen_hint=login_or_signup"
+                "&screen_hint=signup"
                 f"&login_hint={urllib_parse_quote(email)}"
             )
             signin_response = self._fetch_json(
@@ -462,8 +629,109 @@ class PlaywrightBrowserFlow:
             device_id = self._device_id()
 
             signup_entry_url = _normalize_url(page.url)
-            if signup_entry_url:
+            if "create-account" not in str(urlparse(signup_entry_url).path or ""):
+                signup_entry_url = f"{AUTH_BASE}/create-account"
                 page.goto(signup_entry_url, wait_until="domcontentloaded")
+
+            signup_token = self._generate_sentinel_token(signup_flow_candidates)
+            if not signup_token:
+                raise RuntimeError("browser flow signup sentinel missing")
+            authorize_started_at = time.time()
+            authorize_response = self._fetch_json(
+                origin="auth",
+                url=f"{AUTH_BASE}/api/accounts/authorize/continue",
+                method="POST",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Origin": AUTH_BASE,
+                    "Referer": signup_entry_url,
+                    "oai-device-id": device_id,
+                    "openai-sentinel-token": signup_token,
+                },
+                json_body={
+                    "username": {"kind": "email", "value": email},
+                    "screen_hint": "signup",
+                },
+            )
+            if int(authorize_response.get("status") or 0) != 200:
+                raise RuntimeError(
+                    "browser flow authorize/continue failed: "
+                    f"{str(authorize_response.get('text') or '')[:180]}"
+                )
+            page_type, next_url = self._response_state(authorize_response)
+            existing_identity = page_type in {
+                "email_otp_verification",
+                "email_verification",
+            }
+            otp_requested_at = authorize_started_at if existing_identity else None
+            if not existing_identity:
+                next_path = str(urlparse(next_url).path or "")
+                if page_type not in {
+                    "create_account_password",
+                    "create_account_start",
+                } and "create-account" not in next_path:
+                    raise RuntimeError(
+                        "browser flow unexpected signup state after authorize: "
+                        f"{page_type or 'empty'}"
+                    )
+                register_token = self._generate_sentinel_token(
+                    register_flow_candidates
+                )
+                if not register_token:
+                    raise RuntimeError("browser flow register sentinel missing")
+                register_response = self._fetch_json(
+                    origin="auth",
+                    url=f"{AUTH_BASE}/api/accounts/user/register",
+                    method="POST",
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Origin": AUTH_BASE,
+                        "Referer": f"{AUTH_BASE}/create-account/password",
+                        "oai-device-id": device_id,
+                        "openai-sentinel-token": register_token,
+                    },
+                    json_body={"username": email, "password": account_password},
+                )
+                if int(register_response.get("status") or 0) != 200:
+                    raise RuntimeError(
+                        "browser flow user/register failed: "
+                        f"{str(register_response.get('text') or '')[:180]}"
+                    )
+                page_type, next_url = self._response_state(register_response)
+                if page_type == "email_otp_send":
+                    send_started_at = time.time()
+                    send_response = self._fetch_json(
+                        origin="auth",
+                        url=f"{AUTH_BASE}/api/accounts/email-otp/send",
+                        method="GET",
+                        headers={
+                            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+                            "Referer": f"{AUTH_BASE}/create-account/password",
+                            "oai-device-id": device_id,
+                        },
+                    )
+                    if int(send_response.get("status") or 0) not in {
+                        200,
+                        202,
+                        204,
+                        302,
+                    }:
+                        raise RuntimeError(
+                            "browser flow email-otp/send failed: "
+                            f"{str(send_response.get('text') or '')[:180]}"
+                        )
+                    page_type, next_url = self._response_state(send_response)
+                    otp_requested_at = send_started_at
+                elif page_type not in {
+                    "email_otp_verification",
+                    "email_verification",
+                }:
+                    raise RuntimeError(
+                        "browser flow unexpected state after user/register: "
+                        f"{page_type or 'empty'}"
+                    )
 
             self._log("info", "浏览器全流程：等待邮箱 OTP")
             otp_code = self._wait_for_otp(
@@ -472,64 +740,47 @@ class PlaywrightBrowserFlow:
                 email=email,
                 stop_event=stop_event,
                 timeout_seconds=int(self.config.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS),
+                sent_at_ts=otp_requested_at,
             )
             if not otp_code:
                 raise RuntimeError("browser flow otp missing")
 
-            otp_validate_response = self._fetch_json(
+            otp_token = self._generate_sentinel_token(
+                email_verification_flow_candidates
+            )
+            otp_headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Origin": AUTH_BASE,
+                "Referer": f"{AUTH_BASE}/email-verification",
+                "oai-device-id": device_id,
+            }
+            if otp_token:
+                otp_headers["openai-sentinel-token"] = otp_token
+            otp_validate_response = self._fetch_json_with_transient_retries(
                 origin="auth",
                 url=f"{AUTH_BASE}/api/accounts/email-otp/validate",
                 method="POST",
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "Origin": AUTH_BASE,
-                    "Referer": f"{AUTH_BASE}/email-verification",
-                },
+                headers=otp_headers,
                 json_body={"code": otp_code},
             )
             if int(otp_validate_response.get("status") or 0) != 200:
                 raise RuntimeError(f"browser flow otp validate failed: {str(otp_validate_response.get('text') or '')[:180]}")
             if _looks_phone_gate(otp_validate_response.get("text"), otp_validate_response.get("json")):
                 raise RuntimeError("browser flow hit add-phone gate after otp")
-            payload = otp_validate_response.get("json") if isinstance(otp_validate_response.get("json"), dict) else {}
-            page_type = _first_text((payload.get("page") or {}).get("type") if isinstance(payload.get("page"), dict) else "").lower()
-            next_url = _normalize_url(payload.get("continue_url"), payload.get("url"), payload.get("redirect_url"))
-
+            page_type, next_url = self._response_state(otp_validate_response)
             consent_url = next_url
-            if not consent_url or ("consent" not in page_type and "code=" not in consent_url and "state=" not in consent_url):
+            if self._is_existing_identity_completion(page_type, consent_url):
+                existing_identity = True
+            elif self._needs_account_profile(page_type, consent_url):
                 profile = dict(random_profile or {"name": "Alex Wilson", "birthdate": "1994-05-17"})
-                create_bundle = self._ensure_sentinel_page().evaluate(
-                    """async (flows) => {
-                        if (!window.SentinelSDK) throw new Error('SentinelSDK missing');
-                        let lastError = '';
-                        for (const flow of flows) {
-                            try {
-                                await window.SentinelSDK.init(flow);
-                                const tokenResult = await window.SentinelSDK.token(flow);
-                                let soToken = '';
-                                try {
-                                    soToken = await window.SentinelSDK.sessionObserverToken(flow) || '';
-                                } catch (error) {}
-                                const token =
-                                    typeof tokenResult === 'string'
-                                        ? tokenResult.trim()
-                                        : (tokenResult && typeof tokenResult.token === 'string' ? tokenResult.token.trim() : '');
-                                if (token) {
-                                    return { token, so_token: typeof soToken === 'string' ? soToken.trim() : '', flow };
-                                }
-                            } catch (error) {
-                                lastError = String(error || '');
-                            }
-                        }
-                        return { token: '', so_token: '', flow: '', error: lastError };
-                    }""",
-                    list(create_account_flow_candidates or []),
+                create_bundle = self._generate_sentinel_bundle(
+                    create_account_flow_candidates
                 )
                 create_token = _first_text((create_bundle or {}).get("token"))
                 create_so_token = _first_text((create_bundle or {}).get("so_token"))
                 if not create_token:
-                    raise RuntimeError(f"browser flow create_account sentinel missing: {_first_text((create_bundle or {}).get('error'))}")
+                    raise RuntimeError("browser flow create_account sentinel missing")
                 create_response = self._fetch_json(
                     origin="auth",
                     url=f"{AUTH_BASE}/api/accounts/create_account",
@@ -550,19 +801,29 @@ class PlaywrightBrowserFlow:
                 consent_url = _normalize_url(create_payload.get("continue_url"), create_payload.get("url"), create_payload.get("redirect_url"), consent_url)
                 if _looks_phone_gate(consent_url, create_response.get("text"), create_payload):
                     raise RuntimeError("browser flow hit add-phone gate during create_account")
+            else:
+                raise RuntimeError(
+                    "browser flow unexpected state after otp validate: "
+                    f"{page_type or 'empty'}"
+                )
 
             callback_url = ""
-            if "code=" in consent_url and "state=" in consent_url:
+            if self._is_callback_url(consent_url):
                 callback_url = consent_url
 
+            if consent_url:
+                page.goto(consent_url, wait_until="domcontentloaded")
+
             session_token_data = self._try_get_chatgpt_session()
-            self._log("success", "浏览器全流程：注册成功，等待外层 token exchange")
+            branch_label = "已有身份登录" if existing_identity else "新账号注册"
+            self._log("success", f"浏览器全流程：{branch_label}完成，等待会话导出")
             return {
                 "device_id": device_id,
                 "consent_url": consent_url,
                 "callback_url": callback_url,
                 "cookies": self._cookies(),
                 "session_token_data": session_token_data,
+                "identity_branch": "existing_identity" if existing_identity else "new_account",
             }
         finally:
             self.close()
