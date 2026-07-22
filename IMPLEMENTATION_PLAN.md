@@ -1523,7 +1523,7 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-22：运行 3 项无外部写入的聚焦测试均通过，确认现有覆盖只有“Session 交换 401 后 OTP 回退”和“Session/PAT 全成功”，缺少“Session 交换成功但 PAT 返回 401 `token_invalidated`”。建议修复边界是仅在复用保存会话且 PAT 明确返回该 401 时，清除保存会话并最多执行一次邮箱 OTP 全量重登，再重试 PAT；其他 4xx、5xx、超时和身份不匹配不得泛化重试。
 - 2026-07-22：按用户要求在未改代码前通过 Team 工具界面原样重试一次；18:22:25 启动，仍为 `old_login=done / pat=failed / sub2api_export=pending`，18:22:31 再次收到相同 `401 token_invalidated`。第二次独立复现排除偶发交换窗口。
 
-### 节点 AA：失效浏览器会话的单次 OTP 回退修复（实现与部署完成，待提交）
+### 节点 AA：失效浏览器会话的单次 OTP 回退修复（完成）
 
 #### AA.1 目标与性能指标
 
@@ -1569,7 +1569,7 @@ Workflow/Refresh runner 原始反馈
 - [x] 运行 ChatGPT/Workflow/TaskQueue/Web 聚焦测试、全量测试、compileall、JavaScript 语法、`git diff --check` 和新增行秘密扫描。
 - [x] 备份在线 SQLite 并校验；在队列空闲时最小中断重启 LaunchAgent，60 秒 watchdog 确认 HTTP 200 和协调器线程恢复，并如实保留其映射歧义状态。
 - [x] 根据 AB/AC 的稳定号保护边界取消真实 PAT canary；用有界单元回归验证 OTP 回退、PAT 最多两次与非目标错误零重试，不再对稳定账号发起真实刷新。
-- [ ] 更新 README/CHANGELOG、本节点与适用运维记录，提交并推送 GitHub `main`，清理临时文件并确认工作树和远端一致。
+- [x] 更新 README/CHANGELOG、本节点与适用运维记录，提交并推送 GitHub `main`，清理临时文件并确认工作树和远端一致。
 
 #### AA.5 验收场景
 
@@ -1594,8 +1594,9 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-22：用户明确要求复用会话失败后直接使用新的浏览器环境重新登录；确认现有 registrar 登录入口每次创建独立会话容器/device ID且不导入旧 Cookie，因此沿用该入口，保留账号绑定的代理与稳定指纹。
 - 2026-07-22：已在 ChatGPT 客户端边界提取结构化错误码；当前刷新只对实际复用保存会话后出现的 `401 token_invalidated` 清会话并新建登录环境，重试次数固定为一次。5 项新增回归先失败后通过，ChatGPT/Workflow 51 项、TaskQueue 22 项、Web 46 项聚焦测试全部通过。
 - 2026-07-22：AA 与 AC 合并验证完成：认证/注册/工作流/队列/控制台聚焦回归 157 项通过，全量 351 项中 345 项通过、6 项 Windows DPAPI 按 macOS 平台跳过；compileall、JavaScript 语法、JSON、diff 与高置信秘密扫描通过。
+- 2026-07-23：AA 与 AC 功能提交 `8c19926` 已推送 GitHub `main`；真实 PAT canary 按稳定号保护边界未执行，没有新增远端刷新或推送。
 
-### 节点 AB：组 2 手工稳定会话与自动登录协议差异诊断（诊断完成，待修复授权）
+### 节点 AB：组 2 手工稳定会话与自动登录协议差异诊断（诊断完成，修复已在 AC 落地）
 
 #### AB.1 目标与性能指标
 
@@ -1671,7 +1672,7 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-22：根因收敛为“自动新号注册启动协议已偏离当前 Auth 前端”，不是 Team 成员 API 失效。为防止继续消耗 Alias 或产生被停用账号，自动新号注册和 AA 真实 canary 暂停；未修改业务代码、账号、Team 成员、Alias、Sub2API、代理或生产服务，未导出 HAR。
 - 2026-07-22：收尾核验通过：AB 未修改业务代码，因此沿用本轮已通过的 ChatGPT/Workflow 51 项、TaskQueue 22 项、Web 46 项聚焦测试；再次执行 `git diff --check` 返回成功。工作区未发现本轮 HAR/PCAP/Network 导出物，唯一名称命中是 `.venv` 内 Playwright 自带的 `crDevTools.js`，不属于抓包产物；Git 状态仅保留 AA 原有 4 个代码/测试文件与本计划文件的未提交修改。
 
-### 节点 AC：组 1 Computer Use 手工提拉全链抓包与注册协议修复（实现与部署完成，待提交）
+### 节点 AC：组 1 Computer Use 手工提拉全链抓包与注册协议修复（完成）
 
 #### AC.1 目标与性能指标
 
@@ -1728,7 +1729,7 @@ Workflow/Refresh runner 原始反馈
 - [x] 运行新增测试、Registrar/Workflow/TaskQueue/Web 聚焦测试、全量测试、compileall、JavaScript 语法、`git diff --check` 和新增行秘密扫描。
 - [x] 更新 README、CHANGELOG、本节点与现有运维记录；备份 SQLite 并校验，在队列空闲时重启本地 LaunchAgent，60 秒 watchdog 验证控制台恢复，并记录协调器线程运行但映射仍歧义。
 - [x] 做上线后只读核验：组 1 仍为母号与手工新子号两人、待邀请为空；组 2 的 workspace/account/run/queue 与部署前备份双向差集为 0；队列空闲。未再执行第二次真实踢拉。
-- [ ] 提交并推送 GitHub `main`，清理本轮临时文件，确认本地工作树与 `origin/main` 一致。
+- [x] 提交并推送 GitHub `main`，清理本轮临时文件，确认本地工作树与 `origin/main` 一致。
 
 #### AC.5 验收场景
 
@@ -1762,3 +1763,4 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-22：LaunchAgent 初次部署后以 PID `36739` 运行，完整核验在 48 秒内完成；补入同一浏览器会话 Cookie 兜底后再次最小重载，新 PID 为 `67974`，首次 watchdog 即返回 HTTP 200。45 秒观察窗内服务和迁移持续 ready，队列无 active/pending/refresh，`run_operation=null`。协调器线程 `running=true`，但仍为重启前已存在的 `sub2api_current_child_mapping_ambiguous`，目标数为 0、`last_poll_at=null`，因此不声称协调器健康。
 - 2026-07-22：上线后 BitBrowser 只读复核确认组 1 仍为两人、待邀请为空，并已恢复到成员页；组 2 未打开浏览器窗口，改为对在线库与部署前备份做只读行级对比，1 条 workspace、2 条关联 account、8 条 run 与 8 条 queue 的双向差集全为 0。
 - 2026-07-23：最终复核将 ChatGPT callback 主机限制为 `chatgpt.com`/`www.chatgpt.com`，现有浏览器协议测试 10/10 和全量 351 项回归再次通过。最终 LaunchAgent PID 为 `72777`，首次 watchdog 即返回 HTTP 200，45 秒观察窗内持续 ready；组 2 四类本地行差集再次全为 0，协调器的既有映射歧义保持不变。
+- 2026-07-23：功能提交 `8c19926` 已推送 GitHub `main`；Git 仅包含必要源码、测试、脱敏协议夹具与公开文档，部署备份继续被 Git 忽略。
