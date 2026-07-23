@@ -537,30 +537,8 @@ def _warmup_auth_entry_with_browser(
 def _load_browser_register_flow_class():
     try:
         from .browser_register_flow import PlaywrightBrowserFlow  # type: ignore
-        return PlaywrightBrowserFlow
-    except Exception:
-        pass
 
-    try:
-        from importlib.machinery import SourcelessFileLoader
-        from importlib.util import module_from_spec, spec_from_loader
-        pyc_path = PACKAGE_DIR / "__pycache__" / f"browser_register_flow.cpython-{sys.version_info.major}{sys.version_info.minor}.pyc"
-        if not pyc_path.exists():
-            pyc_candidates = sorted((PACKAGE_DIR / "__pycache__").glob("browser_register_flow.cpython-*.pyc"))
-            pyc_path = pyc_candidates[-1] if pyc_candidates else pyc_path
-        if not pyc_path.exists():
-            raise FileNotFoundError("browser_register_flow pyc not found")
-        cached_module_name = f"{__package__}.browser_register_flow_cached"
-        loader = SourcelessFileLoader(cached_module_name, str(pyc_path))
-        spec = spec_from_loader(cached_module_name, loader)
-        if spec is None:
-            raise RuntimeError("failed to build browser register flow spec")
-        module = module_from_spec(spec)
-        loader.exec_module(module)
-        cls = getattr(module, "PlaywrightBrowserFlow", None)
-        if cls is None:
-            raise RuntimeError("PlaywrightBrowserFlow missing in cached module")
-        return cls
+        return PlaywrightBrowserFlow
     except Exception as exc:
         raise RuntimeError(f"failed to load browser register flow: {exc}") from exc
 
@@ -595,9 +573,6 @@ def _run_browser_full_registration_flow(
         "config": {
             "headless": bool(browser_entry_cfg["headless"]),
             "timeout_seconds": int(browser_entry_cfg["timeout_seconds"]),
-            "sentinel_page_url": str(
-                sentinel_cfg.get("page_url") or DEFAULT_BROWSER_SENTINEL_PAGE_URL
-            ),
         },
         "proxy": proxy,
         "user_agent": profile.user_agent,
@@ -610,29 +585,19 @@ def _run_browser_full_registration_flow(
             raise
         raise RuntimeError(
             "browser registration flow does not support SessionProfile; "
-            "remove stale __pycache__ artifacts and retry"
+            "install a compatible browser registration module"
         ) from exc
-    codex_oauth = generate_oauth_url()
     browser_result = flow.run_registration_and_oauth(
         email=email,
         account_password=account_password,
         mail_provider=mail_provider,
         mail_auth_credential=mail_auth_credential,
-        codex_auth_url=codex_oauth.auth_url,
         random_profile=_generate_random_profile(),
         stop_event=stop_event,
-        signup_flow_candidates=SIGNUP_START_SENTINEL_FLOWS,
-        register_flow_candidates=REGISTER_SENTINEL_FLOWS,
-        email_verification_flow_candidates=EMAIL_VERIFICATION_SENTINEL_FLOWS,
-        create_account_flow_candidates=CREATE_ACCOUNT_SENTINEL_FLOWS,
-        password_verify_flow_candidates=PASSWORD_VERIFY_SENTINEL_FLOWS,
     )
     if not isinstance(browser_result, dict) or not browser_result:
         return None
 
-    callback_url = str(browser_result.get("callback_url") or "").strip()
-    consent_url = str(browser_result.get("consent_url") or "").strip()
-    cookies = browser_result.get("cookies")
     session_token_data = (
         browser_result.get("session_token_data")
         if isinstance(browser_result.get("session_token_data"), dict)
@@ -640,60 +605,23 @@ def _run_browser_full_registration_flow(
     )
     mailbox_context = _build_mailbox_context(email=email, auth_credential=mail_auth_credential)
 
-    if isinstance(session_token_data, dict) and session_token_data:
-        session_only_data = _mark_token_payload_session_only(
-            dict(session_token_data),
-            reason="browser_full_flow_session_only",
-            token_source=str(session_token_data.get("token_source") or "chatgpt_session"),
-        )
-        session_only_data["account_password"] = account_password
-        session_only_data["password"] = account_password
-        session_only_data["mail_provider"] = mail_provider_name
-        if mailbox_context:
-            session_only_data["mailbox"] = mailbox_context
-        return json.dumps(session_only_data, ensure_ascii=False, separators=(",", ":"))
-
-    if callback_url:
-        try:
-            return submit_callback_url(
-                callback_url=callback_url,
-                expected_state=codex_oauth.state,
-                code_verifier=codex_oauth.code_verifier,
-                redirect_uri=codex_oauth.redirect_uri,
-                proxy=str(proxy or "").strip(),
-            )
-        except Exception as exc:
-            emitter.warn(f"浏览器全流程 callback exchange 失败，尝试 consent cookie exchange: {exc}", step="get_token")
-
-    browser_session = requests.Session(
-        impersonate=profile.impersonate,
-        proxy=(str(proxy or "").strip() or None),
+    if not isinstance(session_token_data, dict) or not session_token_data:
+        return None
+    expected_email = str(email or "").strip().casefold()
+    session_email = str(session_token_data.get("email") or "").strip().casefold()
+    if not session_email or session_email != expected_email:
+        return None
+    session_only_data = _mark_token_payload_session_only(
+        dict(session_token_data),
+        reason="browser_full_flow_session_only",
+        token_source=str(session_token_data.get("token_source") or "chatgpt_session"),
     )
-    browser_session.headers.update(dict(profile.http_headers))
-    try:
-        _merge_browser_cookies_into_session(browser_session, cookies)
-        if consent_url:
-            token_data = exchange_codex_tokens_from_session(
-                browser_session,
-                consent_url=consent_url,
-                oauth_issuer="https://auth.openai.com",
-                oauth_client_id=codex_oauth.client_id,
-                oauth_redirect_uri=codex_oauth.redirect_uri,
-                code_verifier=codex_oauth.code_verifier,
-                account_password=account_password,
-                mail_provider=mail_provider_name,
-                mailbox=mailbox_context,
-                device_id=str(browser_result.get("device_id") or "").strip(),
-            )
-            if isinstance(token_data, dict) and token_data:
-                return json.dumps(token_data, ensure_ascii=False, separators=(",", ":"))
-    finally:
-        try:
-            browser_session.close()
-        except Exception:
-            pass
-
-    return None
+    session_only_data["account_password"] = account_password
+    session_only_data["password"] = account_password
+    session_only_data["mail_provider"] = mail_provider_name
+    if mailbox_context:
+        session_only_data["mailbox"] = mailbox_context
+    return json.dumps(session_only_data, ensure_ascii=False, separators=(",", ":"))
 
 
 def _fallback_on_chatgpt_csrf_failure(
@@ -3899,7 +3827,7 @@ def login_existing_account_for_token(
             "ok": False,
             "error": message,
             "fatal_deactivated": is_deactivated,
-            "identity_error_code": "alias_disabled" if is_deactivated else "",
+            "identity_error_code": "account_deactivated" if is_deactivated else "",
         }
 
     def _retry_after_phone_gate(stage: str) -> Dict[str, Any]:
@@ -5176,7 +5104,7 @@ def run(
             return None
 
         emitter.info(
-            "使用同一浏览器上下文执行 signup、Sentinel、OTP 与账户创建...",
+            "使用同一浏览器上下文执行官方页面注册、OTP 与会话导出...",
             step="oauth_init",
         )
         browser_token_json = _run_browser_full_registration_flow(
@@ -5203,513 +5131,6 @@ def run(
         emitter.error(
             "浏览器注册协议未返回有效会话；为避免重放失效协议，本次不回退旧 HTTP 注册链。",
             step="oauth_init",
-        )
-        return None
-
-        # ------- 步骤3：通过 chatgpt.com 建立注册会话 -------
-        emitter.info("正在访问 ChatGPT 首页...", step="oauth_init")
-        _chatgpt_base = "https://chatgpt.com"
-
-        # 3a: 访问首页，获取 cookies
-        _session_get(f"{_chatgpt_base}/", timeout=20)
-
-        # 3b: 获取 CSRF Token
-        csrf_resp = _session_get(
-            f"{_chatgpt_base}/api/auth/csrf",
-            headers={"Accept": "application/json", "Referer": f"{_chatgpt_base}/"},
-            timeout=15,
-        )
-        try:
-            csrf_token = csrf_resp.json().get("csrfToken", "")
-        except Exception:
-            csrf_token = ""
-        if not csrf_token:
-            try:
-                browser_token_json = _fallback_on_chatgpt_csrf_failure(
-                    csrf_response=csrf_resp,
-                    email=email,
-                    account_password=account_password,
-                    mail_provider=mail_provider,
-                    mail_auth_credential=dev_token,
-                    emitter=emitter,
-                    stop_event=stop_event,
-                    proxy=static_proxy,
-                    user_agent=_chrome_ua,
-                    session_profile=session_profile,
-                    browser_entry_config=browser_entry_cfg,
-                    browser_sentinel_config=browser_sentinel_cfg,
-                    mail_provider_name=resolved_mail_provider_name,
-                )
-            except Exception as exc:
-                emitter.error(f"获取 CSRF Token 失败，浏览器全流程回退异常: {exc}", step="oauth_init")
-                return None
-            if browser_token_json:
-                emitter.success("ChatGPT CSRF 回退到浏览器全流程成功", step="get_token")
-                try:
-                    s.close()
-                except Exception:
-                    pass
-                return browser_token_json
-            emitter.error("获取 CSRF Token 失败", step="oauth_init")
-            return None
-
-        # 3c: 生成 Device ID
-        did = s.cookies.get("oai-did") or relay_cookie_jar.get("oai-did") or ""
-        if not did:
-            did = str(uuid.uuid4())
-        _sync_oai_device_cookie(did)
-
-        # 3d: Signin 请求，获取 authorize URL
-        auth_session_id = str(uuid.uuid4())
-        signin_params = urllib.parse.urlencode(
-            _build_chatgpt_signin_params(
-                email=email,
-                device_id=did,
-                auth_session_id=auth_session_id,
-            )
-        )
-        signin_resp = _session_post(
-            f"{_chatgpt_base}/api/auth/signin/openai?{signin_params}",
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-                "Referer": f"{_chatgpt_base}/",
-                "Origin": _chatgpt_base,
-            },
-            data=urllib.parse.urlencode({
-                "callbackUrl": f"{_chatgpt_base}/",
-                "csrfToken": csrf_token,
-                "json": "true",
-            }),
-            timeout=20,
-        )
-        try:
-            authorize_url = signin_resp.json().get("url", "")
-        except Exception:
-            authorize_url = ""
-        if not authorize_url:
-            emitter.error(
-                f"Signin 获取授权链接失败（{signin_resp.status_code}）: {str(signin_resp.text or '')[:220]}",
-                step="oauth_init",
-            )
-            return None
-        emitter.info(f"OAuth 初始化状态: {signin_resp.status_code}", step="oauth_init")
-
-        # 3e: 跟随 authorize 重定向，建立 auth.openai.com 会话
-        auth_resp = _session_get(
-            authorize_url,
-            headers=_navigate_headers(referer=f"{_chatgpt_base}/"),
-            timeout=20,
-        )
-        final_url = str(auth_resp.url) if hasattr(auth_resp, "url") else ""
-        emitter.info(f"Authorize 重定向完成: {final_url[:120]}", step="oauth_init")
-        emitter.info(f"Device ID: {did}", step="oauth_init")
-        signup_entry_url = final_url or authorize_url
-        if not _can_continue_signup_after_authorize(signup_entry_url):
-            emitter.error(
-                f"Authorize 未进入注册页，当前 URL: {(signup_entry_url or final_url or '-')[:220]}",
-                step="oauth_init",
-            )
-            return None
-        if not _is_signup_entry_url(signup_entry_url):
-            emitter.warn(
-                f"Authorize 直接进入注册续流程页，按抓包链路继续 OTP/资料提交: {(signup_entry_url or final_url or '-')[:140]}",
-                step="oauth_init",
-            )
-        else:
-            try:
-                bootstrap_resp = _session_get(
-                    signup_entry_url,
-                    headers=_navigate_headers(referer="https://auth.openai.com/log-in-or-create-account"),
-                    timeout=20,
-                )
-            except Exception as exc:
-                emitter.error(f"注册页预热失败: {exc}", step="oauth_init")
-                return None
-            if bootstrap_resp.status_code >= 400:
-                if _looks_like_cloudflare_challenge_response(bootstrap_resp):
-                    warmed_signup_url = _warmup_auth_entry_with_browser(
-                        target_url=signup_entry_url,
-                        session=s,
-                        emitter=emitter,
-                        step="oauth_init",
-                        browser_entry_config=browser_entry_cfg,
-                        proxy=static_proxy,
-                        user_agent=_chrome_ua,
-                        session_profile=session_profile,
-                    )
-                    if not warmed_signup_url:
-                        return None
-                    signup_entry_url = warmed_signup_url
-                    emitter.info(f"注册页预热完成: {signup_entry_url[:120]}", step="oauth_init")
-                    if _stopped():
-                        return None
-                    # 浏览器已成功完成入口验证，继续后续注册请求
-                    pass
-                else:
-                    emitter.error(
-                        f"注册页预热失败（状态码 {bootstrap_resp.status_code}）: {(str(bootstrap_resp.text or '')[:220])}",
-                        step="oauth_init",
-                    )
-                    return None
-            else:
-                signup_entry_url = str(getattr(bootstrap_resp, "url", "") or signup_entry_url)
-                emitter.info(f"注册页预热完成: {signup_entry_url[:120]}", step="oauth_init")
-
-        if _stopped():
-            return None
-
-        # ------- 步骤4：轮询邮箱拿验证码（抓包未见独立 send_otp 请求） -------
-        def _fetch_signup_otp(
-            timeout_seconds: int,
-            sent_at_ts: Optional[float],
-            exclude_codes: Optional[set[str]] = None,
-        ) -> str:
-            excluded_codes = {
-                str(candidate or "").strip()
-                for candidate in (exclude_codes or set())
-                if str(candidate or "").strip()
-            }
-            if mail_provider is not None:
-                try:
-                    return mail_provider.wait_for_otp(
-                        dev_token,
-                        email,
-                        proxy=static_proxy,
-                        proxy_selector=mail_proxy_selector,
-                        timeout=timeout_seconds,
-                        stop_event=stop_event,
-                        sent_at_ts=sent_at_ts,
-                        exclude_codes=excluded_codes,
-                    )
-                except TypeError:
-                    if excluded_codes:
-                        emitter.warn(
-                            "当前邮箱 provider 不支持排除旧验证码，可能重复命中同一 OTP",
-                            step="wait_otp",
-                        )
-                    return mail_provider.wait_for_otp(
-                        dev_token,
-                        email,
-                        proxy=static_proxy,
-                        timeout=timeout_seconds,
-                        stop_event=stop_event,
-                    )
-            return get_oai_code(
-                dev_token,
-                email,
-                static_proxies,
-                emitter,
-                stop_event,
-                proxy_selector=mail_proxies_selector,
-                timeout=timeout_seconds,
-                sent_at_ts=sent_at_ts,
-                exclude_codes=excluded_codes,
-            )
-
-        _start_create_account_sentinel_prefetch(step="wait_otp")
-        emitter.info("等待邮箱 OTP（按抓包链路跳过独立 send_otp 请求）...", step="wait_otp")
-        otp_wait_started_at = time.time()
-        tried_otp_codes: set[str] = set()
-        otp_latency_emitted = False
-        otp_resp_data: Dict[str, Any] = {}
-
-        # ------- 步骤5：提交验证码 -------
-        for otp_candidate_index in range(1, OTP_WRONG_CODE_MAX_RETRIES + 2):
-            fetch_timeout = (
-                OTP_PROVIDER_SWITCH_TIMEOUT_SECONDS
-                if otp_candidate_index == 1
-                else OTP_WRONG_CODE_RETRY_TIMEOUT_SECONDS
-            )
-            code = _fetch_signup_otp(
-                fetch_timeout,
-                otp_wait_started_at,
-                exclude_codes=tried_otp_codes,
-            )
-            if not code:
-                if tried_otp_codes:
-                    emitter.warn(
-                        f"已排除 {len(tried_otp_codes)} 个被拒绝验证码，"
-                        f"{fetch_timeout}s 内未等到新的验证码，放弃当前邮箱并切换下一个 provider",
-                        step="wait_otp",
-                    )
-                else:
-                    emitter.warn(
-                        f"{OTP_PROVIDER_SWITCH_TIMEOUT_SECONDS}s 内未收到验证码，放弃当前邮箱并切换下一个 provider",
-                        step="wait_otp",
-                    )
-                return None
-            if code in tried_otp_codes:
-                emitter.warn("邮箱 provider 重复返回已拒绝验证码，继续等待新 OTP", step="wait_otp")
-                _otp_poll_wait(stop_event)
-                continue
-            tried_otp_codes.add(code)
-            if not otp_latency_emitted:
-                _emit_otp_latency(
-                    emitter,
-                    otp_wait_started_at,
-                    step="wait_otp",
-                    direct_print=mail_provider is None,
-                )
-                otp_latency_emitted = True
-
-            if _stopped():
-                return None
-
-            time.sleep(random.uniform(0.15, 0.4))
-            emitter.info(
-                "正在验证 OTP..." if otp_candidate_index == 1 else f"正在验证新的 OTP（第 {otp_candidate_index} 个）...",
-                step="verify_otp",
-            )
-            _otp_headers = {
-                **_auth_api_headers("https://auth.openai.com/email-verification", include_device_id=False),
-            }
-            _otp_headers.update(_trace_headers())
-            code_resp = _session_post(
-                "https://auth.openai.com/api/accounts/email-otp/validate",
-                headers=_otp_headers,
-                json={"code": code},
-            )
-            emitter.info(f"验证码校验状态: {code_resp.status_code}", step="verify_otp")
-            if code_resp.status_code == 200:
-                try:
-                    otp_resp_data = code_resp.json() if code_resp.text else {}
-                except Exception:
-                    otp_resp_data = {}
-                break
-
-            verify_error_text = str(code_resp.text or "")
-            if _looks_deactivated_error(verify_error_text):
-                removed_aliases = _notify_mail_provider_skip_primary(
-                    mail_provider,
-                    auth_credential=dev_token,
-                    email=email,
-                    reason="account_deactivated",
-                )
-                emitter.warn(
-                    f"主邮箱不可用/已停用，跳过该主邮箱剩余 alias（移除 {removed_aliases} 个待注册邮箱）",
-                    step="verify_otp",
-                )
-                emitter.error(
-                    f"验证码校验失败（状态码 {code_resp.status_code}）: {verify_error_text[:220]}",
-                    step="verify_otp",
-                )
-                return None
-
-            can_retry_wrong_code = (
-                otp_candidate_index <= OTP_WRONG_CODE_MAX_RETRIES
-                and _looks_wrong_otp_error(code_resp.status_code, verify_error_text)
-                and not _stopped()
-            )
-            if can_retry_wrong_code:
-                emitter.warn(
-                    "OTP 被 OpenAI 拒绝，疑似旧验证码或错 alias 验证码；"
-                    f"已排除当前验证码，继续等待新的邮件（{OTP_WRONG_CODE_RETRY_TIMEOUT_SECONDS}s）",
-                    step="verify_otp",
-                )
-                continue
-
-            emitter.error(
-                f"验证码校验失败（状态码 {code_resp.status_code}）: {verify_error_text[:220]}",
-                step="verify_otp",
-            )
-            return None
-        else:
-            return None
-        otp_continue_url = _extract_next_auth_url(otp_resp_data)
-        if otp_continue_url:
-            signup_entry_url = otp_continue_url
-            emitter.info(f"OTP 校验返回 next={otp_continue_url[:140]}", step="verify_otp")
-
-        if _stopped():
-            return None
-
-        # ------- 步骤6：创建账户 -------
-        time.sleep(random.uniform(0.25, 0.75))
-        emitter.info("正在创建账户信息...", step="create_account")
-        profile = _generate_random_profile()
-        _ca_headers = _auth_api_headers("https://auth.openai.com/about-you", include_device_id=False)
-        _ca_headers.update(_trace_headers())
-        _browser_create_account_sentinel = ""
-        _browser_create_account_so_token = ""
-        create_account_sentinel_cfg = _create_account_browser_sentinel_config()
-        try:
-            emitter.info(
-                "读取浏览器 Sentinel token"
-                f"（无头={bool(create_account_sentinel_cfg.get('headless'))}，"
-                f"并发上限 {create_account_sentinel_cfg.get('max_concurrency', DEFAULT_BROWSER_SENTINEL_MAX_CONCURRENCY)}，"
-                f"指纹={create_account_sentinel_cfg.get('fingerprint_scope', DEFAULT_BROWSER_SENTINEL_FINGERPRINT_SCOPE)}/"
-                f"{create_account_sentinel_cfg.get('fingerprint_engine', DEFAULT_BROWSER_SENTINEL_FINGERPRINT_ENGINE)}，"
-                "协议=gmailreg-v2，优先使用后台预取）...",
-                step="create_account",
-            )
-            _browser_sentinel_bundle = _get_create_account_browser_sentinel_bundle(create_account_sentinel_cfg)
-            _browser_create_account_sentinel = str((_browser_sentinel_bundle or {}).get("token") or "").strip()
-            _browser_create_account_so_token = str((_browser_sentinel_bundle or {}).get("so_token") or "").strip()
-        except Exception as exc:
-            emitter.warn(f"浏览器 Sentinel 获取失败，已禁用 challenge Sentinel fallback: {exc}", step="create_account")
-        if _browser_create_account_sentinel:
-            _ca_headers["openai-sentinel-token"] = _browser_create_account_sentinel
-            if _browser_create_account_so_token:
-                _ca_headers["openai-sentinel-so-token"] = _browser_create_account_so_token
-            emitter.info("账户创建使用浏览器 Sentinel token", step="create_account")
-        else:
-            emitter.error("浏览器 Sentinel 未返回 token；create_account 不再回退 challenge Sentinel，跳过当前邮箱", step="create_account")
-            return None
-        create_account_resp = _session_post(
-            "https://auth.openai.com/api/accounts/create_account",
-            headers=_ca_headers,
-            json=profile,
-        )
-        create_account_status = create_account_resp.status_code
-        emitter.info(f"账户创建状态: {create_account_status}", step="create_account")
-
-        if create_account_status != 200 and _create_account_error_code(create_account_resp) == "invalid_auth_step":
-            emitter.warn(
-                "create_account 返回 invalid_auth_step；按 gmailreg-v2 协议重新获取无头浏览器 Sentinel 后重试一次...",
-                step="create_account",
-            )
-            try:
-                retry_sentinel_cfg = dict(create_account_sentinel_cfg)
-                retry_sentinel_cfg["enabled"] = True
-                retry_sentinel_cfg["headless"] = True
-                retry_bundle = _get_browser_sentinel_bundle_for_create_account(
-                    browser_sentinel_config=retry_sentinel_cfg,
-                    proxy=static_proxy,
-                    user_agent=_chrome_ua,
-                    session_profile=session_profile,
-                )
-                retry_sentinel = str((retry_bundle or {}).get("token") or "").strip()
-                retry_so_token = str((retry_bundle or {}).get("so_token") or "").strip()
-                if retry_sentinel:
-                    retry_headers = dict(_ca_headers)
-                    retry_headers["openai-sentinel-token"] = retry_sentinel
-                    retry_headers.pop("openai-sentinel-so-token", None)
-                    if retry_so_token:
-                        retry_headers["openai-sentinel-so-token"] = retry_so_token
-                    create_account_resp = _session_post(
-                        "https://auth.openai.com/api/accounts/create_account",
-                        headers=retry_headers,
-                        json=profile,
-                    )
-                    create_account_status = create_account_resp.status_code
-                    emitter.info(
-                        f"gmailreg-v2 Sentinel 重试账户创建状态: {create_account_status}",
-                        step="create_account",
-                    )
-                else:
-                    emitter.warn("gmailreg-v2 Sentinel 未返回 token，无法重试 create_account", step="create_account")
-            except Exception as exc:
-                emitter.warn(f"gmailreg-v2 Sentinel 重试失败: {exc}", step="create_account")
-
-        if (
-            create_account_status != 200
-            and browser_sentinel_cfg["enabled"]
-            and browser_sentinel_cfg["headless"]
-            and bool(browser_sentinel_cfg.get("fallback_headed"))
-        ):
-            create_account_error_text = str(create_account_resp.text or "")
-            lower_error_text = create_account_error_text.lower()
-            if create_account_status == 400 and (
-                "registration_disallowed" in lower_error_text
-                or "cannot create your account" in lower_error_text
-            ):
-                emitter.warn(
-                    "无头 Sentinel 返回 create_account 400，按配置切换可视浏览器 Sentinel 重试一次...",
-                    step="create_account",
-                )
-                try:
-                    headed_sentinel_cfg = dict(browser_sentinel_cfg)
-                    headed_sentinel_cfg["headless"] = False
-                    retry_bundle = _get_browser_sentinel_bundle_for_create_account(
-                        browser_sentinel_config=headed_sentinel_cfg,
-                        proxy=static_proxy,
-                        user_agent=_chrome_ua,
-                        session_profile=session_profile,
-                    )
-                    retry_sentinel = str((retry_bundle or {}).get("token") or "").strip()
-                    retry_so_token = str((retry_bundle or {}).get("so_token") or "").strip()
-                    if retry_sentinel:
-                        retry_headers = dict(_ca_headers)
-                        retry_headers["openai-sentinel-token"] = retry_sentinel
-                        if retry_so_token:
-                            retry_headers["openai-sentinel-so-token"] = retry_so_token
-                        create_account_resp = _session_post(
-                            "https://auth.openai.com/api/accounts/create_account",
-                            headers=retry_headers,
-                            json=profile,
-                        )
-                        create_account_status = create_account_resp.status_code
-                        emitter.info(
-                            f"可视 Sentinel 重试账户创建状态: {create_account_status}",
-                            step="create_account",
-                        )
-                    else:
-                        emitter.warn("可视 Sentinel 未返回 token，无法重试 create_account", step="create_account")
-                except Exception as exc:
-                    emitter.warn(f"可视 Sentinel 重试失败: {exc}", step="create_account")
-
-        if create_account_status != 200:
-            error_code = _create_account_error_code(create_account_resp)
-            if error_code == "user_already_exists":
-                removed_aliases = _notify_mail_provider_skip_primary(
-                    mail_provider,
-                    auth_credential=dev_token,
-                    email=email,
-                    reason=error_code,
-                )
-                emitter.warn(
-                    f"邮箱已存在，跳过该主邮箱剩余 alias（移除 {removed_aliases} 个待注册邮箱）",
-                    step="create_account",
-                )
-            elif error_code == "invalid_auth_step":
-                removed_aliases = _notify_mail_provider_skip_primary(
-                    mail_provider,
-                    auth_credential=dev_token,
-                    email=email,
-                    reason=error_code,
-                )
-                emitter.warn(
-                    f"invalid_auth_step：按 gmailreg-v2 处理为该主邮箱/alias额度异常，跳过该主邮箱剩余 alias（移除 {removed_aliases} 个待注册邮箱）",
-                    step="create_account",
-                )
-            emitter.error(create_account_resp.text, step="create_account")
-            return None
-
-        emitter.success("账户创建成功！", step="create_account")
-
-        # 账户已创建成功：只读取当前 ChatGPT session 并立即返回。
-        # 不再继续尝试 refresh_token / 当前会话 OAuth / fresh OAuth，避免触发额外限流。
-        try:
-            _ca_data = create_account_resp.json() if create_account_resp.text else {}
-        except Exception:
-            _ca_data = {}
-        post_create_url = _extract_post_create_url(_ca_data, _chatgpt_base)
-        mailbox_context = _build_mailbox_context(email=email, auth_credential=dev_token)
-
-        if _requires_phone_verification(_ca_data, create_account_resp.text, post_create_url):
-            emitter.warn(_phone_gate_error_message("create_account 后 "), step="create_account")
-
-        token_json = _try_extract_chatgpt_session_token(
-            continue_url=post_create_url,
-            chatgpt_base=_chatgpt_base,
-            session_get=_session_get,
-            emitter=emitter,
-            account_password=account_password,
-            mail_provider=resolved_mail_provider_name,
-            mailbox=mailbox_context,
-        )
-        try:
-            s.close()
-        except Exception:
-            pass
-        if token_json:
-            emitter.success("账户创建完成，已按配置导出当前注册会话 session。", step="create_account")
-            return token_json
-
-        emitter.error(
-            "账户已创建，但未能读取当前 ChatGPT session；已按要求停止，不再执行 refresh_token/OAuth。",
-            step="export_session",
         )
         return None
 

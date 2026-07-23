@@ -263,7 +263,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 8. 换班或提拉成功后，新子号晋升为当前子号，旧子号进入“已用完”池，空间重新回到无下一子号状态。下一次操作会再次现场创建一个新 Alias。
 9. 第二个母号重复同一导入流程。控制台会用它所选的当前子号独立识别对应 Team；零匹配、多匹配、成员超员或列表不完整都会停止，不会猜测或复用另一个 Team 的 ID。
 
-现场新 Alias 注册在同一个隔离浏览器上下文内完成 `login_with`、`signup`、Sentinel、OTP 和账户创建，不再把不同浏览器产生的 Sentinel 注入旧 HTTP 会话。若邮箱已有 OpenAI 身份，流程会在 OTP 后直接进入 callback，不重复执行用户注册或资料创建。验证码提交只对明确的 HTTP/2、SOCKS 或 fetch 瞬时网络错误最多尝试 3 次；HTTP 拒绝、账号状态错误和未知异常立即停止。
+现场新 Alias 注册从 ChatGPT 官方登录入口进入 `/create-account`，只填写当前页面上唯一可见的邮箱、密码、OTP 和资料控件；请求、Sentinel、Cookie 与重定向全部由同一个官方页面上下文生成，工具不再手工调用私有注册端点。若邮箱已有 OpenAI 身份，流程会在官方 OTP 页验证后直接进入 callback/session，不重复填写密码或资料。OTP 只在页面状态确认后读取；CAPTCHA/Cloudflare、手机验证、条款或年龄确认、控件歧义、未知页面和共享总时限耗尽都会立即停止，不切换身份、代理或重放请求。OpenAI 账号被停用时只替换本地账号，仍可用的 Apple HME Alias 与 iCloud mailbox 保持原状态。
 
 新子号登录成功后，控制台会把最小的 ChatGPT browser session cookie 加密绑定到该子号。它成为当前子号后，下一次接力优先复用这份会话；若 cookie 已失效则清除并回退邮箱 OTP。只有下一次接力完成、旧子号退出并提交轮换时，旧子号 cookie 才会与退役状态一起原子删除。完整 Cookie jar、浏览器 profile 和 token 不会进入账号列表、API 或日志。
 
@@ -329,7 +329,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、Sub2API 告警 UID 消费与动作幂等、现场新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与详细日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 351 项测试，其中 345 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、Sub2API 告警 UID 消费与动作幂等、官方页面驱动的新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与详细日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 365 项测试，其中 359 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 

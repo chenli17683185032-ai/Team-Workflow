@@ -413,7 +413,7 @@ import team_protocol.cli
                 "ok": False,
                 "error": "account unavailable",
                 "fatal_deactivated": True,
-                "identity_error_code": "alias_disabled",
+                "identity_error_code": "account_deactivated",
             }
         )
         with self.assertRaises(RegistrarIdentityError) as fatal:
@@ -423,7 +423,7 @@ import team_protocol.cli
                 mailbox=self._mailbox(),
                 verbose=False,
             )
-        self.assertEqual(fatal.exception.code, "alias_disabled")
+        self.assertEqual(fatal.exception.code, "account_deactivated")
 
         mailbox_adapter = self._adapter_for_login(
             MailboxCredentialsInvalidError("provider rejected refresh credentials")

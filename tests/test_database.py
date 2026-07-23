@@ -509,6 +509,50 @@ class DatabaseTests(unittest.TestCase):
                 current_account_id=spare["id"],
             )
 
+    def test_openai_account_deactivation_keeps_icloud_alias_active(self):
+        profile = self.database.create_icloud_mailbox(
+            name="OpenAI identity isolation",
+            forwarding_email="identity-forward@example.com",
+            secrets=self.icloud_secret("identity-isolation"),
+            status="ready",
+        )
+        created = [
+            self.database.create_icloud_alias(
+                profile["id"],
+                email=f"identity-{index}@icloud.com",
+                remote_metadata={"anonymousId": f"identity-remote-{index}"},
+                label=f"Identity {index}",
+            )
+            for index in range(3)
+        ]
+        workspace = self.database.create_workspace(
+            name="OpenAI identity isolation",
+            workspace_uid="openai-identity-isolation",
+            current_account_id=created[0]["account"]["id"],
+            next_account_id=created[1]["account"]["id"],
+        )
+
+        result = self.database.replace_workspace_account(
+            workspace["id"],
+            role="next",
+            failure_code="account_deactivated",
+            expected_version=workspace["version"],
+        )
+
+        self.assertEqual(result["replacement"]["id"], created[2]["account"]["id"])
+        self.assertEqual(
+            self.database.get_account(created[1]["account"]["id"])["status"],
+            "disabled",
+        )
+        self.assertEqual(
+            self.database.get_icloud_alias(created[1]["alias"]["id"])["state"],
+            "active",
+        )
+        self.assertEqual(
+            self.database.get_icloud_mailbox(profile["id"])["status"],
+            "ready",
+        )
+
     def test_icloud_team_owner_children_and_used_pool_form_a_closed_handoff(self):
         profile = self.database.create_icloud_mailbox(
             name="Shared Apple pool",

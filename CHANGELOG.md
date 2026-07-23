@@ -1,5 +1,29 @@
 # 更新日志
 
+## 2026-07-23
+
+### 修复
+
+- 自动注册从“Playwright 页面内手工 `fetch` 私有注册端点”改为官方页面驱动：从 ChatGPT 登录入口进入 `/create-account`，依次填写可见的邮箱、密码、OTP 和资料表单，由页面自身拥有请求、Sentinel、Cookie 与重定向。
+- 已有 OpenAI 身份继续在官方 OTP 页面验证后直接完成 callback/session；新身份才进入密码和资料页，现有 Team 顺序仍为旧子号邀请、旧子号退出、新子号注册/登录。
+- OpenAI 账号停用单独归类为 `account_deactivated`；替换本地账号时不再误把仍可收信的 Apple HME Alias 标为 inactive，也不改变 iCloud mailbox 状态。
+
+### 稳定性与安全
+
+- 邮箱 OTP 只会在 URL/DOM 已确认进入官方 OTP 页后读取和填写；单框与六位分段控件均按可见语义识别，缺失或歧义时停止。
+- 页面跳转共享总时限；CAPTCHA/Cloudflare、手机验证、条款/年龄确认、未知页面和控件漂移均关闭浏览器并返回脱敏错误，不重放私有请求、不切换身份或代理规避上游控制。
+- 注册实现源码不再包含五类私有 `/api/accounts/*` 注册 URL、独立 Sentinel SDK 调用或跨页面 token 注入；最终仅从同一浏览器上下文只读导出 ChatGPT session。
+- 物理删除主注册入口无条件返回后的旧 CSRF/signin、OTP validate、Sentinel/create_account 与 session 导出块；源码和递归字节码门禁同时防止旧注册协议回流。
+- 浏览器注册模块加载失败时直接停止，不再从 `__pycache__` 执行可能残留旧私有协议的 `.pyc`。
+- OTP 填写后先等待页面自动提交反馈；仅在页面仍停留于 OTP 且存在唯一提交按钮时点击一次。认证域的 consent/workspace/organization 选择页按人工门停止，不主动跳离认证页。
+- 只有页面自然回到精确的 `chatgpt.com` origin、session 邮箱与目标 Alias 一致时才输出 session-only；缺失或不符时不再尝试无关的 Codex callback/cookie token exchange。
+
+### 验证
+
+- 官方注册首屏完成只读真实冒烟：项目 Playwright 从 ChatGPT 入口点击官方注册链接后到达 `auth.openai.com/create-account` 并识别唯一 email 表单；未填写邮箱、未触发 OTP 或创建账号。
+- BrowserRegisterFlow 23 项及 Registrar、Database、Workflow、Web 聚焦回归共 193 项通过；全量 365 项中 359 项通过，6 项 Windows DPAPI 按 macOS 平台跳过。
+- Python compileall、JavaScript 语法、脱敏夹具 JSON、`git diff --check` 和新增差异高置信秘密扫描通过。部署前暂停队列并完成 SQLite 在线备份，源库、备份及重启后源库均 `quick_check=ok`；LaunchAgent 在 6 秒内恢复 HTTP `200`，活动 queue/run 为 0，未读取或测试真实组二。
+
 ## 2026-07-22
 
 ### 修复

@@ -291,7 +291,9 @@ def primary_email_for_alias(email: str) -> str:
 
 
 class RegistrarIdentityError(RuntimeError):
-    ALLOWED_CODES = frozenset({"alias_disabled", "mailbox_credentials_invalid"})
+    ALLOWED_CODES = frozenset(
+        {"alias_disabled", "account_deactivated", "mailbox_credentials_invalid"}
+    )
 
     def __init__(self, code: str) -> None:
         normalized = str(code or "").strip()
@@ -531,11 +533,15 @@ class RegistrarAdapter:
             finally:
                 self._register_module._try_extract_chatgpt_session_token = original_extractor
         if not isinstance(result, dict) or not result.get("ok"):
-            if isinstance(result, dict) and (
-                result.get("identity_error_code") == "alias_disabled"
-                or result.get("fatal_deactivated") is True
-            ):
-                raise RegistrarIdentityError("alias_disabled")
+            identity_error_code = (
+                str(result.get("identity_error_code") or "").strip()
+                if isinstance(result, dict)
+                else ""
+            )
+            if identity_error_code in RegistrarIdentityError.ALLOWED_CODES:
+                raise RegistrarIdentityError(identity_error_code)
+            if isinstance(result, dict) and result.get("fatal_deactivated") is True:
+                raise RegistrarIdentityError("account_deactivated")
             error = result.get("error") if isinstance(result, dict) else result
             raise RuntimeError(str(error or "registrar login failed"))
         token_data = result.get("token_data")

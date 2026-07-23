@@ -1120,7 +1120,11 @@ class WorkflowTests(unittest.TestCase):
         )
 
     def test_new_account_identity_failure_happens_after_invite_and_leave(self):
-        for code in ("alias_disabled", "mailbox_credentials_invalid"):
+        for code in (
+            "alias_disabled",
+            "account_deactivated",
+            "mailbox_credentials_invalid",
+        ):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 config = make_workflow_config(
                     Path(directory),

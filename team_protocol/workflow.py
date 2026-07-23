@@ -121,7 +121,9 @@ class WorkflowCancelled(RuntimeError):
 
 
 class WorkflowIdentityError(RuntimeError):
-    ALLOWED_CODES = frozenset({"alias_disabled", "mailbox_credentials_invalid"})
+    ALLOWED_CODES = frozenset(
+        {"alias_disabled", "account_deactivated", "mailbox_credentials_invalid"}
+    )
     ALLOWED_ROLES = frozenset({"current", "next", "owner"})
 
     def __init__(self, code: str, role: str) -> None:

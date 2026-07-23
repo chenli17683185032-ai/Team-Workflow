@@ -40,7 +40,9 @@ RUN_KINDS = frozenset({"handoff", "rescue"})
 QUEUE_STATES = frozenset({"pending", "running", "completed", "failed", "cancelled"})
 MAILBOX_INVENTORY_STATUSES = frozenset({"available", "disabled", "exhausted"})
 MAILBOX_ALLOCATION_STATES = frozenset({"allocated", "retired", "disabled"})
-IDENTITY_FAILURE_CODES = frozenset({"alias_disabled", "mailbox_credentials_invalid"})
+IDENTITY_FAILURE_CODES = frozenset(
+    {"alias_disabled", "account_deactivated", "mailbox_credentials_invalid"}
+)
 ICLOUD_MAILBOX_STATUSES = frozenset(
     {"unchecked", "ready", "disabled", "session_invalid", "imap_invalid"}
 )

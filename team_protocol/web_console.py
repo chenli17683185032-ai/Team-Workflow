@@ -339,7 +339,9 @@ class AccountAliasRequest(StrictModel):
 class WorkspaceReplaceAccountRequest(StrictModel):
     version: int = Field(ge=1)
     role: Literal["current", "next"]
-    failure_code: Literal["alias_disabled", "mailbox_credentials_invalid"]
+    failure_code: Literal[
+        "alias_disabled", "account_deactivated", "mailbox_credentials_invalid"
+    ]
 
 
 class WorkspaceAdvanceRequest(StrictModel):

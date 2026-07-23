@@ -1837,3 +1837,181 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-23：当前 `RegistrarAdapter.register(..., workspace_id=None)` 真实自动运行成功，阶段为代理检查、邮箱准备、同上下文浏览器注册和 session 获取；身份回传与目标 Alias 一致，session 存在，计划类型为 `free`。全程未出现 CAPTCHA、条款、安全挑战或电话门，人工接管为 0。
 - 2026-07-23：使用加密保存的浏览器 session 独立回读 ChatGPT 成功，身份与 Alias 再次一致、access token 存在、计划类型仍为 `free`；本地 `registered_account=true`，母号归属为空，Workspace 关联数为 0。
 - 2026-07-23：canary 前后数据库差异仅为 `accounts +1`、`icloud_aliases +1`；`workspaces=2`、`runs=16`、`queue_items=16` 均无增量。队列无 active/pending/run/refresh，未创建 Team 邀请、PAT 或 Sub2API 写入，服务无需重启。
+
+### 节点 AE：官方页面驱动的自动注册协议（进行中）
+
+#### AE.1 目标与性能指标
+
+真实对照表明换班顺序本身正确，故本节保留“旧子号邀请 -> 旧子号退出 -> 新子号注册/登录”的现有流程，只修复自动注册执行器。当前 `browser_register_flow.py` 虽运行在 Playwright 中，却用 `page.evaluate(fetch(...))` 手工拼装 `/api/accounts/*` 注册请求，并在独立页面生成 Sentinel；工具注册的新号随后出现 `token_invalidated`、`account deactivated` 和 PAT owner inactive，而官方页面手工注册号保持稳定。目标是让同一个官方页面上下文拥有邮箱、密码、OTP、资料、Sentinel、Cookie 和跳转的完整因果链。
+
+- 自动注册必须保留，`WorkflowRunner` 的现有分支选择和 Team 换班顺序不变；已注册账号仍走现有登录路径。
+- 新号注册从官方 `chatgpt.com/auth/login_with` 进入，沿页面上的 `/create-account` 表单操作；注册代码不得直接请求 `/api/accounts/authorize/continue`、`user/register`、`email-otp/send`、`email-otp/validate` 或 `create_account`。
+- 邮箱、密码、OTP 和资料只填写当前官方页面上唯一、可见、可编辑的语义控件；表单自身提交请求并驱动 URL/DOM 状态变化。
+- 每个页面状态都有共享总时限；挑战、CAPTCHA、手机验证、条款确认、未知页面、控件缺失/歧义或身份不匹配立即进入脱敏失败终态，不切换 IP/身份、不重放私有请求、不无限重试。
+- 成功判据仍是同一浏览器上下文能读取 ChatGPT session，且 session 邮箱与目标 Alias 一致；不以“资料提交返回”或局部页面跳转代替最终反馈。
+- OpenAI 账号停用单独归类为 `account_deactivated`，只禁用 OpenAI account，不把仍可收信的 Apple HME Alias 或 mailbox 标成失效。
+- 本地回归不再创建真实账号；先用模拟页面证明状态机闭环，再部署并只读核验。新的真实注册由用户后续正常换班触发并作为最终在线反馈。
+
+#### AE.2 GitHub、官方页面与采用结论
+
+- Microsoft 官方 [`microsoft/playwright-python`](https://github.com/microsoft/playwright-python) 的 locator 测试以 `get_by_label`、`get_by_role` 等可访问语义绑定表单控件，URL 测试以 `wait_for_url` 覆盖普通跳转和 SPA history 变化，并明确验证超时。采用其“语义控件 + 页面状态反馈 + 有界等待”，参考 HEAD `c3eff763a75f55d02e2539e8e224416a18c71114`。
+- OpenAI 官方 [`openai/codex`](https://github.com/openai/codex/tree/main/codex-rs/login) 让浏览器拥有授权链，回调端只校验 state/PKCE 并对 URL、code 和 token 脱敏；本项目继续沿用“浏览器链路拥有认证状态、日志只保留阶段”的边界，参考 HEAD `39a2438d16514d0d6f88105d17b0f747994af487`。
+- 2026-07-23 只读查看当前官方入口：`chatgpt.com/auth/login_with?screen_hint=signup` 跳到 `auth.openai.com/log-in`，页面提供指向 `/create-account` 的注册链接；`/create-account` 中存在唯一 `input[type=email][name=email]` 和唯一提交按钮。检查未填写邮箱、未提交表单、未触发 OTP 或账号创建。
+- GitHub 可检索到非官方自动注册项目，但其私有端点、指纹或挑战处理不作为契约，也不纳入实现；本节只依赖浏览器可见表单和最终 session 反馈。
+
+#### AE.3 动态控制结构与最小充分模型
+
+```text
+目标 Alias + 既有代理/稳定 SessionProfile
+  -> 官方 ChatGPT 登录入口
+  -> 官方“注册”链接 /create-account
+  -> 填写可见 email 表单 -> 页面提交
+  -> [新身份] 可见 password 表单 -> 页面提交并发送 OTP
+     [已有身份] 页面直接进入 OTP
+  -> 邮箱 provider 读取 OTP
+  -> 仅在官方 OTP 页填写并提交
+  -> [新身份] 可见资料表单 -> 页面提交
+     [已有身份] 跳过资料创建
+  -> 官方 callback/redirect -> 同上下文 ChatGPT session 回读
+
+任一挑战、人工确认门、手机门、未知状态或总时限耗尽
+  -> 关闭浏览器 -> 结构化失败 -> Workflow 不继续后续新号动作
+```
+
+控制对象是新账号认证状态随页面跳转演化的过程；当前 URL、可见控件、页面挑战标记、邮箱 OTP 和最终 session 是测量；Playwright 页面状态机是控制器；官方表单、浏览器 Context 和邮箱 provider 是执行器；页面改版、地域语言、网络时延、OTP 延迟、挑战与上游审核是不确定环境。最小充分模型不再理解私有响应 JSON，只识别 email/password/OTP/profile/completion 五类页面状态。
+
+#### AE.4 实施节点
+
+- [x] 核对现场证据与代码：失败集中在工具注册身份；Team 顺序正确；注册器四段私有 API 均由 `page.evaluate(fetch)` 发起。
+- [x] 复核 Playwright、OpenAI Codex GitHub 和当前官方注册入口，固定语义定位、页面反馈、共享时限和安全停止边界。
+- [x] 重写本节完整计划，撤销“人工预注册门控”方向，明确保留自动注册后再修改业务代码。
+- [x] 先重写 `tests/test_browser_register_flow.py` 的注册回归：模拟官方页面，证明邮箱/密码/OTP/资料均由可见表单提交，已有身份跳过资料，未知页/挑战/手机门有界失败，且源码不含私有注册端点。
+- [x] 将 `PlaywrightBrowserFlow` 注册状态机替换为官方页面交互；删除注册专用 `_fetch_json`、独立 Sentinel 生成和私有响应解析，保留最终 `/api/auth/session` 只读回读。
+- [x] 保持 `_run_browser_full_registration_flow`、`RegistrarAdapter.register()`、既有账号登录和 Workflow 顺序兼容；仅清理新实现不再使用的 Sentinel 参数/导入，不重构 5000 行旧运行时。
+- [x] 完成 `account_deactivated` 数据库允许集和行为，使 OpenAI account disabled、Apple Alias active、iCloud mailbox ready；验证原 `alias_disabled` 与 mailbox 凭据失效语义不变。
+- [x] 运行 BrowserRegisterFlow、Registrar、Database、Workflow 聚焦测试，再运行全量测试、`compileall`、JavaScript 语法、`git diff --check` 和秘密扫描；每个节点把结果回写本节。
+- [x] 更新 README、CHANGELOG 和本节实施记录，完成全部离线回归与静态检查。
+- [x] 用户明确要求重启后，在队列空闲时备份 SQLite 并校验源库/备份 `quick_check=ok`，以单次 LaunchAgent 重启在 60 秒内恢复 HTTP/health/队列。
+- [x] 上线只核对服务 HTTP/health、队列总状态和错误日志，不读取或测试组二 Workspace，不创建第二个 canary，不触发 Alias/邀请/退出/PAT/Sub2API 写入。
+- [ ] 提交并推送 GitHub `main`；保留用户原有 `.DS_Store` 不纳入提交，清理本次临时文件并确认本地与 `origin/main` 一致。
+
+#### AE.5 验收场景
+
+1. 全新身份：入口 -> 注册链接 -> email -> password -> OTP -> profile -> callback/session；每次提交均来自页面表单，调用序列中没有 `_fetch_json` 或私有注册 URL。
+2. 已有身份：email 后进入官方 OTP 页，OTP 成功后直接 callback/session；password/profile 不被误填，身份分支仍标为 existing。
+3. OTP 只会在 URL/DOM 已识别为官方 OTP 页面后从邮箱读取和填写；错误页、登录页或 profile 页不会消费 OTP。
+4. profile 同时支持官方单一 birthdate 控件和明确的月/日/年分段控件；控件缺失、重复或不可见时失败，不按位置盲填。
+5. CAPTCHA/Cloudflare、手机验证、条款/勾选确认、未知路径、重复控件或共享时限耗尽均关闭 Context 并返回脱敏错误，不进入下一阶段。
+6. 官方回调和 SPA 跳转完成后，同一 Context 的 ChatGPT session 被导出；session 邮箱不符时现有上层身份校验拒绝继续。
+7. `account_deactivated` 只禁用 OpenAI account 并分配替代账号；关联 Apple Alias 保持 active，mailbox 保持 ready。`alias_disabled` 仍会标记 Alias inactive。
+8. 已注册账号登录、当前子号刷新、换班顺序、Team 两人上限、断点恢复、PAT/导出和普通非 iCloud 流程的原有回归继续通过。
+
+#### AE.6 上线、回滚与安全边界
+
+- 本次无数据库 schema 迁移；上线前只备份现有 SQLite，代码失败时恢复上一 Git 提交并单次重启，不回放或删除任何账号/Alias。
+- 部署前暂停队列领取并确认无 active run/refresh；watchdog 必须在 60 秒内读到 HTTP 200 和 ready，失败立即恢复旧版本，不能等待人工操作而长期停机。
+- 不绕过 CAPTCHA、Cloudflare、手机、年龄或条款确认，不伪造 Sentinel、不注入私有请求头、不修改代理/指纹以规避平台控制；遇到这些状态直接停止。
+- 不记录页面全文、OTP、邮箱凭据、Cookie、token、回调查询参数或代理秘密；错误只输出阶段、规范化 URL path 和安全类别。
+- 不修改组 1/组 2 成员、不撤销 pending invite、不停用 Apple Alias、不触碰云贝或 Sub2API；真实写入留给用户随后正常发起的换班。
+- 用户正在手工踢拉组二期间不重启本地服务，不读取组二账号、Workspace、成员、邀请或运行详情；部署与服务级只读验证等待用户明确完成。
+
+#### AE.7 实施记录
+
+- 2026-07-23：用户纠正需求为“更新注册协议”，明确自动注册必须保留；本节撤销人工预注册门控方向，Team 换班顺序保持不变。
+- 2026-07-23：代码复核确认 `browser_register_flow.py` 当前直接发起 CSRF/signin 与五类 `/api/accounts/*` 请求，并在独立 Sentinel 页面生成 token；这与官方页面完整提交链不同，是本次唯一注册实现改造面。
+- 2026-07-23：GitHub 核对 Playwright Python HEAD `c3eff763a75f55d02e2539e8e224416a18c71114` 和 OpenAI Codex HEAD `39a2438d16514d0d6f88105d17b0f747994af487`；只采用语义定位、页面状态等待、回调完整性和秘密脱敏，不采用非官方注册协议。
+- 2026-07-23：使用内置浏览器只读核对官方登录/注册入口和首屏控件，未填写或提交任何数据；确认首屏可依赖标准 email 表单，而不是私有请求 JSON。
+- 2026-07-23：先以 8 个新页面状态机场景让旧实现失败，再完成官方页面驱动注册器；新身份、已有身份、单框/分段 OTP、单框/分段生日、挑战、手机门、确认门、未知页和最终 session 均有回归，源码扫描确认不再含五类私有注册 URL 或 `SentinelSDK`。
+- 2026-07-23：BrowserRegisterFlow 14 项、Registrar 22 项、Database 55 项、Workflow 47 项、Web 46 项聚焦测试通过；新增加载器保护确保模块导入失败时直接停止，不会从 `.pyc` 复活旧注册协议。`account_deactivated` 已贯通 registrar、workflow、数据库和 API schema，测试确认 Apple Alias 保持 active、iCloud mailbox 保持 ready。
+- 2026-07-23：用户开始手工踢拉组二并明确要求不测试组二；后续仅继续本地模拟/静态验证，暂停部署和任何组二读取或操作，直至用户确认手工流程结束。
+- 2026-07-23：只读真实首屏冒烟到达 `auth.openai.com/create-account` 并识别为 email 状态，未填写或提交表单；首轮全量 356 项中 350 项通过、6 项 Windows DPAPI 跳过，compileall、JavaScript、JSON、diff check 与新增差异秘密扫描通过。
+- 2026-07-23：README 和 CHANGELOG 已更新；部署、SQLite 备份、LaunchAgent 重启、服务级上线核验、Git 提交与推送等待组二手工流程结束后继续。
+- 2026-07-23：用户随后明确要求重启服务。部署前通过本地控制面暂停队列，确认活动 queue/run 均为 0；在线备份 `backups/console-pre-browser-register-20260723-200045.sqlite` 权限为 `0600`，源库与备份 `quick_check=ok`。
+- 2026-07-23：单次重启 `com.teamworkflow.console`，PID 从 `4589` 更新为 `37502`，HTTP 在 6 秒内恢复 `200` 且新增错误日志为 0；重启后迁移为 `ready`、源库 `quick_check=ok`、活动 queue/run 仍为 0，最后恢复重启前的队列未暂停状态。全程未读取或测试组二 Workspace、账号或成员。
+
+#### AE.8 继续修协议：单一页面闭环与最终身份反馈
+
+目标是把浏览器注册器进一步收敛为一条可重复的闭环：官方页面负责注册请求，页面自然回到 ChatGPT 后才读取 session，且 session 身份必须等于目标 Alias。当前审计发现四个尚未满足这一目标的缺口：认证页的 `consent/workspace/organization` 被宽松归为 `post_auth`；session 轮询会主动导航离开尚未完成的认证页；分段 OTP 的异步自动提交可能与脚本点击重叠；浏览器未返回 session 时运行时仍保留一条与本次页面 state/PKCE 无关的 Codex callback/cookie exchange 回退。
+
+控制结构：
+
+```text
+官方 email/password/OTP/profile 表单
+  -> 页面自然跳转反馈
+  -> 仅接受 chatgpt.com 完成态
+  -> 同 Context 读取 session
+  -> session.email == 目标 Alias
+  -> 输出 session-only
+
+OTP 填写后短暂等待页面反馈
+  -> 已离开 OTP：不再点击
+  -> 仍在 OTP 且唯一提交按钮存在：点击一次
+  -> 无按钮或进入人工门：有界失败
+
+缺 session / 身份缺失或不符 / consent/workspace 人工门
+  -> 关闭 Context -> 结构化失败
+  -> 不执行旧 callback、cookie exchange 或私有注册协议
+```
+
+实施节点：
+
+- [x] 复核官方页面状态机、上层身份校验和浏览器结果接线，定位四个最小缺口；继续采用 AE.2 已固定的 Playwright 与 OpenAI Codex GitHub 经验，不引入非官方协议。
+- [x] 先增加离线失败测试：异步 OTP 自动提交不得二次点击；认证 consent/workspace 不得被当作完成；session 邮箱缺失/不符必须失败；缺 session 不得调用 callback/cookie exchange。现有实现共出现 7 个预期失败，逐一对应上述边界。
+- [x] 收紧 `PlaywrightBrowserFlow`：精确校验页面 origin，只在自然到达 ChatGPT 后读取 session，为 OTP 自动提交保留有界反馈窗口，并强制最终邮箱一致。
+- [x] 删除 `_run_browser_full_registration_flow` 中与页面 state/PKCE 不关联的 Codex OAuth 生成及 callback/cookie exchange 回退；session-only 成为唯一成功输出。BrowserRegisterFlow 20 项聚焦测试通过。
+- [x] 运行 BrowserRegisterFlow、Registrar、Database、Workflow、Web 聚焦测试及全量离线回归，再执行 compileall、JavaScript、JSON、diff check 和差异秘密扫描；同步 README、CHANGELOG 与本节计数。聚焦 192 项通过，全量 364 项中 358 项通过、6 项按平台跳过。
+- [x] 组二手工踢拉期间未读取、登录、注册、邀请、退出或测试真实组二；用户明确要求重启后仅完成服务级部署与健康核验，未检查组二 Workspace。
+
+验收场景：
+
+1. 六位 OTP 最后一位触发异步自动提交时，脚本观察到页面状态变化后不点击提交按钮；未自动提交时最多点击一次。
+2. 页面停在 `auth.openai.com` 的 consent/workspace/organization 人工选择页时立即失败，不主动导航到 ChatGPT，也不尝试读取或交换 token。
+3. 页面自然回到 `chatgpt.com` 后才请求 `/api/auth/session`；精确 host 校验拒绝 lookalike origin。
+4. session 邮箱为空或与目标 Alias 不一致时注册失败，Context 关闭，Workflow 不继续 Team、PAT 或导出阶段。
+5. 浏览器结果没有有效 session 时直接返回失败，不生成无关 Codex OAuth state/PKCE，不调用 callback exchange 或 cookie exchange。
+6. 既有账号官方 OTP 分支、新账号 password/profile 分支、单框 OTP、显式提交按钮和最终 session-only 输出继续通过。
+
+安全与回滚：
+
+- 本节点只修改注册状态机、运行时接线、离线测试和文档，不访问正式数据库或远端账号，不创建 Alias，不触发 Team/Sub2API 写操作。
+- 所有失败均关闭浏览器并保留脱敏阶段；不输出 OTP、Cookie、token、邮箱凭据、代理秘密或回调查询参数。
+- 代码回滚只恢复本节点差异；当前 LaunchAgent 继续运行旧版本，组二手工流程完成前不部署也不重启。
+
+实施记录：
+
+- 2026-07-23：先增加异步 OTP、认证选择页、session 身份、相似 origin 和旧 token 回退测试，旧实现出现 7 个预期失败；完成首轮修复后 BrowserRegisterFlow 20 项通过。
+- 2026-07-23：源码复核继续发现 ChatGPT 应用控件误判与模块边界身份校验缺口；补入 2 个失败测试后完成修复，BrowserRegisterFlow 最终 22 项、五组聚焦回归 192 项全部通过。
+- 2026-07-23：全量离线回归 364 项中 358 项通过，6 项 Windows DPAPI 按 macOS 平台跳过；compileall、JavaScript、脱敏 JSON、diff check 和高置信秘密扫描通过。未读取或测试组二，未重启 LaunchAgent，未访问正式数据库或远端账号。
+- 2026-07-23：最终使用全新无账号、无数据库输入的 headless Context 做只读首屏反馈；页面自然到达 `auth.openai.com/create-account`，识别为 `email` 且唯一主邮箱控件计数为 1，未填写或提交表单。
+
+#### AE.9 旧注册源码物理清除与运行时门禁
+
+用户在部署后提出“可能仍被识别为老协议”的判断。只读核对显示：LaunchAgent 已以新 PID 使用 `python -B` 启动，浏览器模块 loader 不再读取 `.pyc`；递归检查 `register.run.__code__` 后，五类私有注册端点在运行字节码中的计数均为 0。原因是旧 HTTP 注册块位于无条件 `return None` 之后，CPython 没有把它编译进可执行字节码。服务端无法读取本地源码，因此这段不可达文本不是当前远端检测的直接输入；但它仍会造成维护歧义，并可能在未来重构时被误接回。
+
+实施节点：
+
+- [x] 核对 LaunchAgent 启动参数、新 PID、loader 行为、`run()` 源码与递归字节码常量；确认当前部署字节码中五类私有注册端点均为 0。
+- [x] 先增加源码与递归字节码回归：`PlaywrightBrowserFlow` 和注册 `run()` 均不得包含私有注册端点，运行时不得存在旧协议常量。当前测试只在 `run()` 源码发现旧 OTP validate/create_account 残留，递归字节码检查通过。
+- [x] 物理删除 `run()` 无条件返回后的旧 CSRF/signin、OTP validate、Sentinel/create_account 和旧 session 导出块，只保留官方页面注册闭环及统一异常处理。
+- [x] 重跑注册聚焦、五组联动、全量离线回归和静态/秘密检查；更新测试计数与记录。
+- [x] 仅当生产代码实际变化且验证通过时再做一次最小重启；仍只验证服务/队列/错误日志，不读取组二或创建真实账号。
+
+验收与停止条件：
+
+1. `inspect.getsource(register.run)` 与递归 `co_consts` 均不出现五类私有注册 URL 或 Sentinel 注册逻辑。
+2. 注册 `run()` 只可能在网络测量、邮箱准备和官方浏览器 session-only 三段内结束；浏览器失败直接返回，不存在第二执行器。
+3. 已有账号登录协议所需函数不在本次删除范围，Workflow 顺序、账号停用语义和数据库状态保持不变。
+4. 不以组二或任何真实新账号作为回归样本；若离线闭环不能证明则停止部署。
+
+根因判定：
+
+- 2026-07-22 的首个远端拒绝点是新号 OTP validate 的 `403`，当时 PAT、Session 导出、Team 接受与 Sub2API 都未执行；因此不能把根因归结为 Team 换班顺序、pending invite 或 Sub2API。
+- 同期官方页面已从独立 `/create-account` 进入并由页面维持 `create_account_start -> OTP -> profile -> callback` 状态；旧工具则从 `signin/openai` 进入，再以 `page.evaluate(fetch)` 自行拼接五类私有注册请求、Sentinel、device ID、Referer 与跳转。远端不能看到本地源码，但能看到这组已与当前前端不一致的请求形状和会话因果链。
+- 手工 BitBrowser 正对照使用同一官方页面上下文完成邮箱、OTP、资料和最终页面，并能稳定使用；这与自动侧在同一时窗的拒绝形成直接对照。结合时间点和首个拒绝阶段，“旧注册请求序列被当前服务端判为无效/高风险”是高置信主因。
+- Playwright/BrowserForge 与 BitBrowser 仍存在浏览器环境差异，但该差异在 2026-07-22 前已存在，不能单独解释故障的突然起始时间；它保留为次要未确定项，不通过修改指纹或规避风控来“验证”。
+- 当前源码已物理删除旧注册块；`inspect.getsource(register.run)`、`inspect.getsource(PlaywrightBrowserFlow)` 和 `register.run` 递归字节码对五类私有端点与 `SentinelSDK` 的计数均为 0。最终因果验证必须由用户后续的独立正常换班提供，本节不创建真实 canary，也不使用组二。
+
+实施记录：
+
+- 2026-07-23：物理删除旧不可达注册块后，BrowserRegisterFlow 23 项、五组联动 193 项全部通过；全量 365 项中 359 项通过、6 项 Windows DPAPI 按 macOS 平台跳过。Python compileall、JavaScript 语法、跟踪 JSON、`git diff --check` 和差异高置信秘密扫描通过；未读取或测试组二，未访问真实账号。
+- 2026-07-23：保留重启前队列未暂停状态，直接通过 SQLite 暂停领取并确认活动 queue/run 均为 0；单次重启 LaunchAgent 后 PID 从 `37502` 变为 `49513`，HTTP 在 5 秒内恢复 `200`，重启窗口新增错误日志为 0。随后数据库迁移元数据为 `ready`、schema v7、`quick_check=ok`，恢复队列未暂停状态后活动 queue/run 仍为 0。全程未读取组二 Workspace、账号、成员或邀请。
