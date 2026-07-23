@@ -2320,3 +2320,85 @@ API 不可用 / Key 错误 / 环境池为空 / Profile 已绑定或正在运行
 - 2026-07-24：修复后全量 390 项通过，6 项 Windows DPAPI 在 macOS 正常跳过；`compileall`、JavaScript 语法、`git diff --check` 和只返回文件名的高置信秘密扫描通过。控制台在 `1440x900` 与 `390x844` 验证 OpenBrowser 设置、容量状态和队列栏，无水平溢出，可见控件均在视口内，浏览器控制台错误为 0。
 - 2026-07-24：部署前队列和运行活动项均为 0；生成 `backups/console-pre-openbrowser-20260724-011633.sqlite`，源库与备份均 `quick_check=ok`。LaunchAgent PID `58827 -> 25161`，26 秒内恢复 HTTP 200，migration `ready`、队列不暂停且仍无活动任务，重启窗口错误日志新增 0 行。
 - 2026-07-24：最终差异审计将 `requests` 统一延迟到 Local API 客户端实例化，并让人工登录状态复用容错事件出口；聚焦 14 项与全量 390 项再次通过。队列仍空闲后第二次有界重启 PID `25161 -> 30024`，7 秒内恢复 HTTP 200，migration 与 SQLite 正常，活动队列/运行均为 0，错误日志新增 0 行。
+
+### 节点 AJ：OpenBrowser 自动登录、邮箱取码与资料补全（已完成）
+
+#### AJ.1 目标与性能指标
+
+将节点 AI 中的“用户手工登录”改为同一 OpenBrowser Profile 内的官方页面自动登录，其他资源预检、永久绑定、Team 反馈和 JSON 后续边界不变：
+
+- 新号阶段启动已绑定 Profile，从 ChatGPT 官方 `Log in` 入口进入认证，自动填写本次 HME Alias 并提交。
+- 到达邮箱验证页后，复用现有 iCloud IMAP provider 的发送时间、Alias 收件人、UID 和已用验证码过滤；验证码只输入官方页面，不进入日志、API、DOM 状态或 checkpoint。
+- 仅当唯一可见姓名控件出现时填入现有注册器生成的 profile 姓名；若同页存在现有状态机已支持的出生日期控件，沿用同一 profile 填写。多个候选控件或未知资料页不猜测提交。
+- 空白新 Alias 默认只走邮箱 OTP；若官方页强制密码但账号没有明确密码，则结构化失败，不提交占位密码。
+- 登录错账号、CAPTCHA/安全挑战、手机验证、条款/年龄确认、未知页面、窗口关闭、取消或超时均有界停止，不绕过、不换 Profile、不新建第二个 Alias。
+- 官方 session 邮箱必须等于目标 Alias，且目标 Workspace 可切换；之后才停止该 Profile，继续 member verify、PAT、CPA/Sub2API JSON 和可选推送。
+- 登录执行期间展示“正在自动登录 / 等待邮箱验证 / 等待目标 Team”等状态，保留现有停止按钮和有界时限，不再要求用户在新号页面输入任何内容。
+
+#### AJ.2 GitHub 参考与采用结论
+
+- 用户指定的 GitHub [`lyu0805/OpenBrowser`](https://github.com/lyu0805/OpenBrowser) HEAD 仍为 `19554a8652777373f638143655087373471af93a`（2026-07-24 复核）；上游明确提供独立 Chromium Profile、CDP 和本地 RPA，因此继续使用已鉴权 Local API 返回的回环 CDP 端口，不依赖 Profile 本地目录或上游未公开内部实现。
+- 本项目已有 `PlaywrightBrowserFlow` 官方页面状态机，覆盖唯一可见邮箱/验证码/姓名/出生日期控件、组合与分段 OTP、OTP 自动提交、session 邮箱反馈和挑战门禁。采用“把已存在的 OpenBrowser context/page 注入这个状态机”的最小改动，不复制选择器、不启动第二个 Chromium。
+- 邮箱取码复用 `ICloudImapProvider.wait_for_otp()` 的 Alias、发送时间、UID、已用 code、超时和 stop event 契约，并继续通过加密 registrar provider checkpoint 保持进程恢复一致性。
+
+#### AJ.3 动态控制结构与最小充分模型
+
+```text
+旧号邀请/退出已回读
+  -> 启动目标 OpenBrowser Profile -> CDP 连接唯一 context
+  -> 若同 Profile 已有 session：校验 Alias + Team
+  -> 否则进入官方 Log in -> 填 Alias -> 提交
+  -> 可选密码页：仅明确密码才提交
+  -> OTP 页 -> iCloud IMAP 读取新 code -> 唯一/分段控件填入
+  -> 可选姓名/已支持资料页 -> 生成 profile 填入
+  -> 同 context session 邮箱反馈 -> 目标 Workspace 反馈
+  -> 精确 stop 该 Profile -> member verify -> PAT/JSON
+
+多义控件 / 错号 / challenge / phone / terms-age / 窗口关闭 / 取消 / 超时
+  -> 不保存 new_login/new_workspace
+  -> 精确 stop 该 Profile
+  -> 保留 Alias、邀请、checkpoint 和永久 Profile 绑定供原任务恢复
+```
+
+控制对象是同一持久 Profile 中的官方认证页状态、邮箱消息和 Team 成员状态随时间的联合演化；Local API/CDP、页面控件分类、IMAP 新邮件和最终 session/Workspace 是测量，WorkflowRunner、官方页状态机和 OTP provider 是控制器，OpenBrowser Profile、页面控件与 IMAP 是执行器。网页漂移、邮件时延、OTP 自动提交、Profile 内旧 session、窗口关闭和 Team 入组延迟是扰动；稳定性约束是任何步骤无唯一反馈即停止，绝不以页面已跳转代替最终 session 和 Team 反馈。
+
+#### AJ.4 实施节点
+
+- [x] 先增加失败回归：OpenBrowser 空白 Profile 从 login 入口走 Alias -> OTP -> 可选姓名 -> session；旧实现应因只读等待而失败。
+- [x] 让 `PlaywrightBrowserFlow` 支持外部 context/page 的非所有权模式；关闭 flow 时只解绑引用，不关闭、清理或重建 OpenBrowser Profile。
+- [x] 增加官方 login 入口模式，支持 login 页内的邮箱、OTP、密码与姓名动态分类；空密码不提交占位值，姓名只在唯一可见控件出现时填写。
+- [x] 在 `RegistrarAdapter` 中增加“既有浏览器 context 官方页登录”边界，复用 iCloud IMAP provider、加密 provider state、现有生成 profile 和邮箱凭据失效分类。
+- [x] 将 `OpenBrowserManualLogin` 从“只读等待”改为“先恢复已有 session，否则只执行一次官方页自动登录，再等待 Team”；错号立即失败，不自动退出或清 Cookie。
+- [x] 从 WorkflowRunner 向自动登录边界传入本次 `new_mailbox`、stop event 和 provider checkpoint；仅最终 session 邮箱 + Workspace 双校验后写入 `new_login`/`new_workspace`。
+- [x] 更新队列与设置页文案，用“自动登录”、“等待邮箱验证”和“等待目标 Team”替代手工输入提示；保留不泄露 Profile ID、OTP、API Key 和 session 的统计状态。
+- [x] 覆盖组合/分段 OTP、OTP 自动提交、姓名可选、旧 session 恢复、错号、Team 延迟、强制密码无值、挑战/手机/条款、窗口关闭、取消、超时、单 Profile 停止和 PAT/JSON 顺序回归。
+- [x] 运行浏览器状态机、Registrar、OpenBrowser、Workflow、TaskQueue 和 Web 聚焦测试，再运行全量、compileall、JavaScript 语法、diff 和高置信秘密扫描。
+- [x] 队列空闲时备份生产 SQLite 并校验源库/备份；服务重启 60 秒内恢复 HTTP、migration ready 和队列原状态，浏览器验收不触发真实登录。
+- [x] 更新 README、CHANGELOG 与本节记录，提交并推送 GitHub `main`；真实换班仍只由用户点击“开始/一键换班”触发。
+
+#### AJ.5 验收场景
+
+1. 空白已绑定 Profile 仅启动一次，从官方 login 入口填入目标 Alias；到达 OTP 页后才启动 IMAP 读取，旧邮件、其他 Alias 和已用 UID/code 不能命中。
+2. 组合与分段 OTP 均只填一次；页面自动提交时不再点击下一个表单按钮，验证码不出现在日志、事件、API 或 Git 差异。
+3. 姓名控件未出现时不写入任何资料；唯一可见时才填现有生成 profile；控件多义、强制空密码或未知页面在有界时限内失败。
+4. Profile 已有同 Alias session 时不重发 OTP，直接进入 Workspace 校验；已有其他邮箱 session 时不自动退出、不清 Cookie，结构化失败并保留原 Profile。
+5. CAPTCHA、手机验证、条款/年龄确认、窗口关闭、取消或超时不产生 session/checkpoint/PAT/JSON，且 finally 只 stop 目标 Profile。
+6. 仅有 session 邮箱等于 Alias、Workspace ID 等于目标 Team、成员回读满足两人硬上限时，才按原顺序写 checkpoint、生成 PAT/CPA/Sub2API JSON 并晋升。
+7. 重试和进程恢复始终使用同一 Alias/Profile，不调用 stop-all、不读取池外 Cookie、不创建第二个 Alias 或 Profile。
+
+#### AJ.6 回滚、上线与安全边界
+
+- 代码回滚恢复节点 AI 的只读人工等待模式；不涉及 schema 回滚，保留账号/Profile 永久绑定、Alias 和已有 checkpoint。
+- 所有页面动作只在 `chatgpt.com` / `www.chatgpt.com` / `auth.openai.com` 官方 HTTPS 主机；不调用私有注册 API，不伪造 Sentinel，不绕过 CAPTCHA、手机、条款、年龄或账号限制。
+- OTP、IMAP 凭据、OpenBrowser API Key、Cookie、session、CDP 端口、Profile ID/路径和代理凭据不进入日志、前端详情、计划、测试真实夹具或 Git。
+- 自动化仅解决“用户不需要手工输入”和“Profile 本地状态隔离”，不承诺匿名、指纹唯一、平台不关联或账号不受限。
+- 上线前必须空队列、SQLite 备份与离线回归通过；不自主触发真实换班、邮件发送、Team 邀请/退出或真实新号登录。
+
+#### AJ.7 实施记录
+
+- 2026-07-24：用户将新号接力改为完全自动：从 `Log in` 开始由程序操作官方页面，如果识别到姓名字段则自动填写，邮箱验证码直接由现有邮箱读取链获取，不再要求用户输入。
+- 2026-07-24：复核 OpenBrowser HEAD 仍为 `19554a8`；本项目现有官方页 `PlaywrightBrowserFlow` 已覆盖邮箱、组合/分段 OTP、OTP 自动提交、姓名/出生日期和挑战门禁；决定仅增加外部 CDP context/page 非所有权模式与 login 入口，不复制第二套页面解析器。
+- 2026-07-24：新增 5 个失败回归，分别覆盖 login 页直接提交邮箱、仅姓名资料页、外部 context/page 不可被 flow 关闭、空白 Profile 只调用一次自动登录驱动和错号立即终止；旧实现按预期 1 个断言失败、4 个结构错误。
+- 2026-07-24：又增加了首页显式点击 `Log in`、非固定 URL 姓名-only 页、空密码门禁、Registrar context/provider/profile 透传、iCloud 凭据失效分类和 Workflow 双反馈回归；BrowserFlow、Registrar、OpenBrowser、Workflow 与 TaskQueue 聚焦 140 项通过。
+- 2026-07-24：Web 聚焦扩大到 187 项通过；全量 400 项通过、6 项 Windows DPAPI 在 macOS 跳过。`compileall`、JavaScript 语法、`git diff --check` 和高置信秘密扫描通过；`1440x900` / `390x844` 无水平溢出且控制台错误为 0。
+- 2026-07-24：队列空闲后生成 `backups/console-pre-openbrowser-auto-20260724-020601.sqlite`，权限 `0600`，源库与备份 `quick_check=ok`。LaunchAgent PID `30024 -> 62991`，4 秒恢复 HTTP 200，migration `ready`，队列恢复未暂停且无活动任务；无新未知错误，未启动 OpenBrowser 或真实登录。

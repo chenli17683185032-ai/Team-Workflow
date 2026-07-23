@@ -1994,8 +1994,12 @@ function runOperationQueueEntry(operation) {
   const manualLoginState = safeString(operation.manual_login_state);
   const manualLoginLabels = {
     profile_started: "正在打开隔离环境",
-    waiting_for_user: "等待手工登录",
-    wrong_account: "账号不匹配，请重新登录",
+    automating_login: "正在自动登录",
+    submitting_email: "正在提交新账号邮箱",
+    waiting_for_otp: "正在等待邮箱验证码",
+    submitting_otp: "正在提交邮箱验证码",
+    submitting_profile: "正在填写账号姓名",
+    wrong_account: "OpenBrowser 环境中已登录其他账号",
     waiting_for_team: "等待进入目标 Team",
     verified: "登录与 Team 已确认",
     profile_stopped: "登录环境已关闭",

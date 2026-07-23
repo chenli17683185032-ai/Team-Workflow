@@ -675,6 +675,131 @@ import team_protocol.cli
                 snapshots[-1]["completed_aliases"],
             )
 
+    def test_login_in_browser_context_reuses_icloud_state_and_generated_profile(self):
+        adapter = RegistrarAdapter.__new__(RegistrarAdapter)
+        context = object()
+        page = object()
+        mailbox = MailboxCredentials(
+            primary_email="main@icloud.com",
+            registration_email="hidden@icloud.com",
+            client_id="",
+            refresh_token="",
+            provider="icloud_hme_imap",
+            imap_host="imap.mail.me.com",
+            imap_username="main@icloud.com",
+            imap_password="app-password",
+        )
+        snapshots = []
+        captured = {}
+
+        class FakeProvider:
+            def __init__(self, **kwargs):
+                captured["provider_kwargs"] = dict(kwargs)
+                self.state_callback = kwargs["state_callback"]
+
+        class FakeFlow:
+            def __init__(self, **kwargs):
+                captured["flow_kwargs"] = dict(kwargs)
+
+            def run_registration_and_oauth_sync(self, **kwargs):
+                captured["run_kwargs"] = dict(kwargs)
+                captured["flow_kwargs"]["state_callback"]("waiting_for_otp")
+                kwargs["mail_provider"].state_callback(
+                    {"version": 1, "seen_uids": {"hidden@icloud.com": ["12"]}}
+                )
+                return {
+                    "session_token_data": {
+                        "access_token": "access-secret",
+                        "session_token": "session-secret",
+                        "email": "hidden@icloud.com",
+                        "password": "must-be-removed",
+                    }
+                }
+
+        adapter._icloud_provider_class = FakeProvider
+        adapter._event_emitter = lambda **_kwargs: SimpleNamespace()
+        adapter._mailbox_identity_error_class = MailboxCredentialsInvalidError
+        adapter._register_module = SimpleNamespace(
+            _load_browser_register_flow_class=lambda: FakeFlow,
+            _generate_random_profile=lambda: {
+                "name": "Generated User",
+                "birthdate": "1994-05-17",
+            },
+        )
+        states = []
+
+        result = adapter.login_in_browser_context(
+            context=context,
+            page=page,
+            email=mailbox.registration_email,
+            account_password="",
+            mailbox=mailbox,
+            timeout_seconds=90,
+            provider_initial_state={"version": 1, "seen_uids": {}},
+            provider_state_callback=snapshots.append,
+            state_callback=states.append,
+            verbose=False,
+        )
+
+        self.assertEqual(result["email"], mailbox.registration_email)
+        self.assertNotIn("password", result)
+        self.assertIs(captured["flow_kwargs"]["context"], context)
+        self.assertIs(captured["flow_kwargs"]["page"], page)
+        self.assertEqual(captured["flow_kwargs"]["config"]["entry_intent"], "login")
+        self.assertEqual(
+            captured["run_kwargs"]["random_profile"]["name"], "Generated User"
+        )
+        self.assertEqual(
+            captured["run_kwargs"]["mail_auth_credential"],
+            mailbox.as_auth_credential(),
+        )
+        self.assertEqual(states, ["waiting_for_otp"])
+        self.assertEqual(snapshots[-1]["seen_uids"][mailbox.registration_email], ["12"])
+
+    def test_login_in_browser_context_maps_invalid_icloud_credentials(self):
+        adapter = RegistrarAdapter.__new__(RegistrarAdapter)
+        mailbox = MailboxCredentials(
+            primary_email="main@icloud.com",
+            registration_email="hidden@icloud.com",
+            client_id="",
+            refresh_token="",
+            provider="icloud_hme_imap",
+            imap_host="imap.mail.me.com",
+            imap_username="main@icloud.com",
+            imap_password="bad-password",
+        )
+
+        class FakeFlow:
+            def __init__(self, **_kwargs):
+                pass
+
+            def run_registration_and_oauth_sync(self, **_kwargs):
+                raise MailboxCredentialsInvalidError("invalid")
+
+        adapter._icloud_provider_class = lambda **_kwargs: object()
+        adapter._event_emitter = lambda **_kwargs: SimpleNamespace()
+        adapter._mailbox_identity_error_class = MailboxCredentialsInvalidError
+        adapter._register_module = SimpleNamespace(
+            _load_browser_register_flow_class=lambda: FakeFlow,
+            _generate_random_profile=lambda: {
+                "name": "Generated User",
+                "birthdate": "1994-05-17",
+            },
+        )
+
+        with self.assertRaises(RegistrarIdentityError) as caught:
+            adapter.login_in_browser_context(
+                context=object(),
+                page=object(),
+                email=mailbox.registration_email,
+                account_password="",
+                mailbox=mailbox,
+                timeout_seconds=90,
+                verbose=False,
+            )
+
+        self.assertEqual(caught.exception.code, "mailbox_credentials_invalid")
+
 
 if __name__ == "__main__":
     unittest.main()

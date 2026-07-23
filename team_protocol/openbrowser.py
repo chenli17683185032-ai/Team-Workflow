@@ -393,6 +393,7 @@ class OpenBrowserManualLogin:
         self,
         *,
         session_validator: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+        login_runner: Callable[[Any, Any], Mapping[str, Any]] | None = None,
         stop_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if not callable(session_validator):
@@ -409,7 +410,6 @@ class OpenBrowserManualLogin:
             else:
                 playwright_factory = self.playwright_factory
             deadline = self.monotonic() + self.timeout_seconds
-            wrong_account_reported = False
             with playwright_factory() as playwright:
                 try:
                     browser = playwright.chromium.connect_over_cdp(
@@ -422,23 +422,61 @@ class OpenBrowserManualLogin:
                     raise OpenBrowserError("OpenBrowser profile context is unavailable")
                 context = contexts[0]
                 page = self._page_for_manual_login(context, self.login_url)
-                self._status("waiting_for_user")
-                while self.monotonic() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    raise OpenBrowserError("OpenBrowser automatic login was cancelled")
+                if not bool(browser.is_connected()):
+                    raise OpenBrowserError("OpenBrowser profile was closed")
+                session = read_chatgpt_session(context)
+                if session is not None and (
+                    str(session.get("email") or "").strip().casefold()
+                    != self.expected_email
+                ):
+                    self._status("wrong_account")
+                    raise OpenBrowserError(
+                        "OpenBrowser profile is logged in to a different account"
+                    )
+                if session is None:
+                    if not callable(login_runner):
+                        raise OpenBrowserError(
+                            "OpenBrowser automatic login runner is unavailable"
+                        )
+                    self._status("automating_login")
+                    session = login_runner(context, page)
+                    if not isinstance(session, Mapping):
+                        raise OpenBrowserError(
+                            "OpenBrowser automatic login returned invalid session data"
+                        )
+                    session = dict(session)
+                    if (
+                        str(session.get("email") or "").strip().casefold()
+                        != self.expected_email
+                    ):
+                        self._status("wrong_account")
+                        raise OpenBrowserError(
+                            "OpenBrowser automatic login returned a different account"
+                        )
+                waiting_for_team_reported = False
+                while True:
                     if stop_event is not None and stop_event.is_set():
-                        raise OpenBrowserError("OpenBrowser manual login was cancelled")
+                        raise OpenBrowserError("OpenBrowser automatic login was cancelled")
                     if not bool(browser.is_connected()):
                         raise OpenBrowserError("OpenBrowser profile was closed")
-                    session = read_chatgpt_session(context)
+                    latest_session = read_chatgpt_session(context)
+                    if latest_session is not None:
+                        session = latest_session
                     if session is not None:
                         if str(session.get("email") or "").strip().casefold() != self.expected_email:
-                            if not wrong_account_reported:
-                                self._status("wrong_account")
-                                wrong_account_reported = True
+                            self._status("wrong_account")
+                            raise OpenBrowserError(
+                                "OpenBrowser profile is logged in to a different account"
+                            )
                         else:
                             try:
                                 validated = session_validator(session)
                             except Exception:
-                                self._status("waiting_for_team")
+                                if not waiting_for_team_reported:
+                                    self._status("waiting_for_team")
+                                    waiting_for_team_reported = True
                             else:
                                 if not isinstance(validated, Mapping):
                                     raise OpenBrowserError(
@@ -446,15 +484,17 @@ class OpenBrowserManualLogin:
                                     )
                                 self._status("verified")
                                 return dict(validated)
+                    if self.monotonic() >= deadline:
+                        break
                     wait_page = page
                     if bool(getattr(wait_page, "is_closed", lambda: False)()):
                         pages = list(getattr(context, "pages", []) or [])
                         if not pages:
-                            raise OpenBrowserError("OpenBrowser login page was closed")
+                            raise OpenBrowserError("OpenBrowser automatic login page was closed")
                         wait_page = pages[-1]
                         page = wait_page
                     wait_page.wait_for_timeout(int(self.poll_seconds * 1000))
-            raise OpenBrowserError("OpenBrowser manual login timed out")
+            raise OpenBrowserError("OpenBrowser automatic login timed out")
         finally:
             self.client.stop_profile(self.profile_id)
             self._status("profile_stopped")

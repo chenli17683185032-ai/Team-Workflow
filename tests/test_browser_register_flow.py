@@ -77,6 +77,8 @@ class _FakePage:
         otp_auto_submit=False,
         otp_auto_submit_delay_polls=0,
         complete_checkbox=False,
+        login_email=False,
+        profile_name_only=False,
     ):
         self.scenario = scenario
         self.segmented_otp = segmented_otp
@@ -84,6 +86,8 @@ class _FakePage:
         self.otp_auto_submit = otp_auto_submit
         self.otp_auto_submit_delay_polls = int(otp_auto_submit_delay_polls)
         self.complete_checkbox = complete_checkbox
+        self.login_email = login_email
+        self.profile_name_only = profile_name_only
         self._pending_otp_submit_polls = 0
         self.stage = "login"
         self.url = f"{browser_register_flow.AUTH_BASE}/log-in"
@@ -108,6 +112,8 @@ class _FakePage:
         self.events.append("goto")
         if url.startswith(f"{browser_register_flow.CHATGPT_BASE}/auth/login_with"):
             self._set_stage("login")
+        elif url.rstrip("/") == browser_register_flow.CHATGPT_BASE:
+            self._set_stage("landing")
         elif url.startswith(browser_register_flow.CHATGPT_BASE):
             self._set_stage("complete")
         else:
@@ -119,6 +125,9 @@ class _FakePage:
             if not self._pending_otp_submit_polls:
                 self._set_stage("complete" if self.scenario == "existing" else "profile")
         time.sleep(min(float(milliseconds) / 1000.0, 0.005))
+
+    def close(self):
+        self.closed = True
 
     def locator(self, selector):
         if selector == "body":
@@ -150,6 +159,7 @@ class _FakePage:
         self.stage = stage
         self.url = {
             "login": f"{browser_register_flow.AUTH_BASE}/log-in",
+            "landing": f"{browser_register_flow.CHATGPT_BASE}/",
             "email": f"{browser_register_flow.AUTH_BASE}/create-account",
             "password": f"{browser_register_flow.AUTH_BASE}/create-account/password",
             "otp": f"{browser_register_flow.AUTH_BASE}/email-verification/register",
@@ -167,8 +177,24 @@ class _FakePage:
         self._render()
 
     def _render(self):
-        if self.stage == "login":
-            self._elements = [_FakeElement("a", "signup", href="/create-account")]
+        if self.stage == "landing":
+            self._elements = [
+                _FakeElement("button", "login", data_testid="login-button")
+            ]
+        elif self.stage == "login":
+            if self.login_email:
+                self._elements = [
+                    _FakeElement(
+                        "input",
+                        "email",
+                        type="email",
+                        name="email",
+                        autocomplete="email",
+                    ),
+                    _FakeElement("button", "submit-email", type="submit"),
+                ]
+            else:
+                self._elements = [_FakeElement("a", "signup", href="/create-account")]
         elif self.stage == "email":
             self._elements = [
                 _FakeElement("input", "email", type="email", name="email", autocomplete="email"),
@@ -206,7 +232,9 @@ class _FakePage:
             self._elements = [
                 _FakeElement("input", "name", name="name", autocomplete="name")
             ]
-            if self.segmented_birthdate:
+            if self.profile_name_only:
+                pass
+            elif self.segmented_birthdate:
                 self._elements.extend(
                     [
                         _FakeElement("input", "birth-month", name="birth-month", placeholder="MM"),
@@ -228,6 +256,9 @@ class _FakePage:
 
     def _click(self, element):
         self.events.append(f"click:{element.key}")
+        if element.key == "login":
+            self._set_stage("login")
+            return
         if element.key == "signup":
             self._set_stage("email")
             return
@@ -406,6 +437,100 @@ class BrowserRegisterFlowTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result["identity_branch"], "existing_identity")
+
+    def test_login_entry_submits_email_without_clicking_signup(self):
+        flow, page = self._flow("existing", login_email=True)
+        flow.config["entry_intent"] = "login"
+
+        result = self._run(flow)
+
+        self.assertEqual(
+            page.events,
+            [
+                "fill:email",
+                "click:submit-email",
+                "mail:otp",
+                "fill:otp",
+                "click:submit-otp",
+            ],
+        )
+        self.assertEqual(result["identity_branch"], "existing_identity")
+
+    def test_login_entry_clicks_the_official_login_control_from_home(self):
+        page = _FakePage("existing", login_email=True)
+        page._set_stage("landing")
+        flow = browser_register_flow.PlaywrightBrowserFlow(
+            config={
+                "entry_intent": "login",
+                "chatgpt_warmup_wait_ms": 0,
+                "stage_timeout_seconds": 0.03,
+            },
+            context=SimpleNamespace(pages=[page]),
+            page=page,
+        )
+
+        result = flow._warm_chatgpt_page()
+
+        self.assertIs(result, page)
+        self.assertEqual(page.events, ["click:login"])
+        self.assertEqual(page.stage, "login")
+
+    def test_name_only_profile_is_recognized_without_a_known_profile_url(self):
+        flow, page = self._flow("new", profile_name_only=True)
+        page._set_stage("profile")
+        page.url = f"{browser_register_flow.AUTH_BASE}/profile-details"
+
+        self.assertEqual(flow._classify_stage(page), "profile")
+
+    def test_login_entry_does_not_submit_an_unknown_password(self):
+        flow, page = self._flow("new", login_email=True)
+        flow.config["entry_intent"] = "login"
+
+        with self.assertRaisesRegex(RuntimeError, "password value is missing"):
+            flow._run_registration_and_oauth_sync(
+                email="new-child@example.test",
+                account_password="",
+                mail_provider=object(),
+                mail_auth_credential="mail-credential",
+                random_profile={"name": "Test User", "birthdate": "1994-05-17"},
+            )
+
+        self.assertNotIn("fill:password", page.events)
+
+    def test_name_only_profile_page_is_supported(self):
+        flow, page = self._flow("new", profile_name_only=True)
+
+        self._run(flow)
+
+        self.assertIn("fill:name", page.events)
+        self.assertIn("click:submit-profile", page.events)
+        self.assertFalse(any(event.startswith("fill:birth-") for event in page.events))
+
+    def test_external_context_and_page_are_not_closed_by_flow(self):
+        page = _FakePage("existing", login_email=True)
+
+        class ExternalContext:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            @staticmethod
+            def cookies():
+                return []
+
+        context = ExternalContext()
+        flow = browser_register_flow.PlaywrightBrowserFlow(
+            config={"entry_intent": "login"},
+            context=context,
+            page=page,
+        )
+
+        flow.close()
+
+        self.assertFalse(context.closed)
+        self.assertFalse(page.closed)
 
     def test_segmented_otp_and_birthdate_are_filled_semantically(self):
         flow, page = self._flow(

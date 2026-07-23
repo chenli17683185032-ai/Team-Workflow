@@ -2707,7 +2707,7 @@ class WebConsoleController:
         if not api_key or not profile_ids:
             raise StateConflictError("OpenBrowser is not configured")
         if not 60 <= timeout_seconds <= 86_400:
-            raise StateConflictError("OpenBrowser manual login timeout is invalid")
+            raise StateConflictError("OpenBrowser automatic login timeout is invalid")
         return clean_base_url, api_key, profile_ids, timeout_seconds
 
     def _query_openbrowser(

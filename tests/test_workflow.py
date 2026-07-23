@@ -458,7 +458,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(caught.exception.role, role)
 
-    def test_openbrowser_manual_login_verifies_team_before_pat_without_registrar(self):
+    def test_openbrowser_automatic_login_verifies_team_before_pat(self):
         with tempfile.TemporaryDirectory() as directory:
             persisted_sessions = []
             config = make_workflow_config(
@@ -473,6 +473,29 @@ class WorkflowTests(unittest.TestCase):
             )
             checkpoint = InMemoryCheckpoint()
             registrar = FakeRegistrar()
+            browser_login_calls = []
+
+            def login_in_browser_context(**kwargs):
+                browser_login_calls.append(dict(kwargs))
+                for state in (
+                    "submitting_email",
+                    "waiting_for_otp",
+                    "submitting_otp",
+                    "submitting_profile",
+                ):
+                    kwargs["state_callback"](state)
+                kwargs["provider_state_callback"](
+                    {
+                        "version": 1,
+                        "seen_uids": {config.new_account.email: ["12"]},
+                    }
+                )
+                return {
+                    "email": kwargs["email"],
+                    "session_token": "manual-browser-session",
+                }
+
+            registrar.login_in_browser_context = login_in_browser_context
             chatgpt = FakeChatGPT(
                 config.workspace_id,
                 config.old_account.email,
@@ -507,16 +530,11 @@ class WorkflowTests(unittest.TestCase):
                     self.status_callback = kwargs["status_callback"]
                     self.expected_email = kwargs["expected_email"]
 
-                def wait(self, *, session_validator, stop_event=None):
+                def wait(self, *, login_runner, session_validator, stop_event=None):
                     self.status_callback("profile_started")
-                    self.status_callback("waiting_for_user")
+                    self.status_callback("automating_login")
                     self.assert_stop_event = stop_event
-                    validated = session_validator(
-                        {
-                            "email": self.expected_email,
-                            "session_token": "manual-browser-session",
-                        }
-                    )
+                    validated = session_validator(login_runner(object(), object()))
                     self.status_callback("verified")
                     self.status_callback("profile_stopped")
                     return validated
@@ -542,6 +560,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             [email for email, _proxy in registrar.calls],
             [config.old_account.email],
+        )
+        self.assertEqual(len(browser_login_calls), 1)
+        self.assertEqual(browser_login_calls[0]["email"], config.new_account.email)
+        self.assertEqual(
+            browser_login_calls[0]["mailbox"].registration_email,
+            config.new_account.email,
+        )
+        self.assertEqual(
+            browser_login_calls[0]["timeout_seconds"],
+            config.openbrowser_manual_timeout_seconds,
         )
         self.assertEqual(client_calls[0][0], config.openbrowser_base_url)
         self.assertEqual(client_calls[0][1], config.openbrowser_api_key)
@@ -577,9 +605,75 @@ class WorkflowTests(unittest.TestCase):
                 for event in status_events
                 if event.get("type") == "manual_login"
             ],
-            ["profile_started", "waiting_for_user", "verified", "profile_stopped"],
+            [
+                "profile_started",
+                "automating_login",
+                "submitting_email",
+                "waiting_for_otp",
+                "submitting_otp",
+                "submitting_profile",
+                "verified",
+                "profile_stopped",
+            ],
+        )
+        self.assertEqual(
+            checkpoint.get("_registrar_provider_state")["seen_uids"][
+                config.new_account.email
+            ],
+            ["12"],
         )
         self.assertFalse(any("openbrowser-secret" in message for message in logs))
+
+    def test_openbrowser_mailbox_failure_is_classified_as_next_identity_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory),
+                openbrowser_base_url="http://127.0.0.1:50325",
+                openbrowser_api_key="openbrowser-secret",
+                openbrowser_profile_id="profile_auto",
+            )
+            registrar = FakeRegistrar()
+
+            def fail_login_in_browser_context(**_kwargs):
+                raise RegistrarIdentityError("mailbox_credentials_invalid")
+
+            registrar.login_in_browser_context = fail_login_in_browser_context
+
+            class FakeClient:
+                @staticmethod
+                def close():
+                    return None
+
+            class FakeAutomaticLogin:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                @staticmethod
+                def wait(*, login_runner, session_validator, stop_event=None):
+                    del session_validator, stop_event
+                    return login_runner(object(), object())
+
+            runner = WorkflowRunner(
+                config,
+                **run_dependencies(config),
+                registrar=registrar,
+                chatgpt=FakeChatGPT(
+                    config.workspace_id,
+                    config.old_account.email,
+                    config.new_account.email,
+                ),
+                openbrowser_client_factory=lambda *_args, **_kwargs: FakeClient(),
+                openbrowser_manual_login_factory=FakeAutomaticLogin,
+                verbose=False,
+            )
+            try:
+                with self.assertRaises(WorkflowIdentityError) as caught:
+                    runner._manual_new_login(config.new_account)
+            finally:
+                runner.close()
+
+        self.assertEqual(caught.exception.code, "mailbox_credentials_invalid")
+        self.assertEqual(caught.exception.role, "next")
 
     def test_openbrowser_execution_preflight_stops_before_old_login_and_team_writes(self):
         for profile in (None, SimpleNamespace(profile_id="profile_manual", running=True)):

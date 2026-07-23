@@ -168,24 +168,43 @@ class PlaywrightBrowserFlow:
         user_agent: str = "",
         session_profile: Optional[SessionProfile] = None,
         emitter: Any = None,
+        context: Any = None,
+        page: Any = None,
+        state_callback: Any = None,
     ) -> None:
+        if (context is None) != (page is None):
+            raise ValueError("external browser context and page must be supplied together")
         self.config = dict(config or {})
         self.proxy = str(proxy or "").strip()
         supplied_user_agent = str(user_agent or "").strip()
-        self.session_profile = session_profile or create_session_profile(
-            user_agent=supplied_user_agent
+        self._external_resources = context is not None
+        self.session_profile = (
+            session_profile
+            if session_profile is not None
+            else None
+            if self._external_resources
+            else create_session_profile(user_agent=supplied_user_agent)
         )
-        if supplied_user_agent and supplied_user_agent != self.session_profile.user_agent:
+        if (
+            supplied_user_agent
+            and self.session_profile is not None
+            and supplied_user_agent != self.session_profile.user_agent
+        ):
             raise ValueError("user_agent conflicts with the supplied SessionProfile")
-        self.user_agent = self.session_profile.user_agent
+        self.user_agent = (
+            supplied_user_agent
+            if self.session_profile is None
+            else self.session_profile.user_agent
+        )
         self.emitter = emitter
+        self.state_callback = state_callback
         self._profile_dir = str(self.config.get("profile_dir") or "").strip()
         self._cleanup_profile_dir = False
         self._playwright_cm = None
         self._playwright = None
         self._browser = None
-        self._context = None
-        self._page = None
+        self._context = context
+        self._page = page
         self._proxy_lease = None
 
     def _log(self, level: str, message: str, step: str = "browser_flow") -> None:
@@ -199,6 +218,14 @@ class PlaywrightBrowserFlow:
                 emitter.emit(level, message, step=step)
             except Exception:
                 pass
+
+    def _state(self, value: str) -> None:
+        if self.state_callback is None:
+            return
+        try:
+            self.state_callback(str(value))
+        except Exception:
+            pass
 
     def _resolve_profile_dir(self) -> Optional[str]:
         if self._profile_dir:
@@ -236,6 +263,8 @@ class PlaywrightBrowserFlow:
     def open(self) -> None:
         if self._context is not None and self._page is not None:
             return
+        if self._external_resources:
+            raise RuntimeError("external browser context is unavailable")
         from playwright.sync_api import sync_playwright
 
         self._playwright_cm = sync_playwright()
@@ -247,6 +276,8 @@ class PlaywrightBrowserFlow:
         self._proxy_lease.__enter__()
         launch_options = apply_playwright_proxy(launch_options, self._proxy_lease)
         self._browser = self._playwright.chromium.launch(**launch_options)
+        if self.session_profile is None:
+            raise RuntimeError("browser flow SessionProfile is unavailable")
         self._context = create_browserforge_context(
             self._browser,
             fingerprint_scope=self.session_profile.scope,
@@ -255,6 +286,10 @@ class PlaywrightBrowserFlow:
         self._page = self._context.new_page()
 
     def close(self) -> None:
+        if self._external_resources:
+            self._page = None
+            self._context = None
+            return
         for resource_name in ("_page", "_context", "_browser"):
             resource = getattr(self, resource_name, None)
             if resource is None:
@@ -320,8 +355,54 @@ class PlaywrightBrowserFlow:
 
     def _warm_chatgpt_page(self):
         page = self._ensure_page_origin("chatgpt")
+        entry_intent = str(self.config.get("entry_intent") or "signup").strip().casefold()
+        if entry_intent not in {"login", "signup"}:
+            raise RuntimeError("browser flow entry intent is invalid")
+        if entry_intent == "login":
+            parsed = urlparse(str(getattr(page, "url", "") or ""))
+            if (
+                str(parsed.hostname or "").casefold()
+                not in {"chatgpt.com", "www.chatgpt.com"}
+                or str(parsed.path or "/").rstrip("/")
+            ):
+                page.goto(
+                    f"{CHATGPT_BASE}/",
+                    wait_until="domcontentloaded",
+                    timeout=self._navigation_timeout_ms(),
+                )
+            warmup_ms = max(
+                0,
+                int(
+                    self.config.get(
+                        "chatgpt_warmup_wait_ms", DEFAULT_CHATGPT_WARMUP_WAIT_MS
+                    )
+                ),
+            )
+            if warmup_ms:
+                page.wait_for_timeout(warmup_ms)
+            login_control = self._unique_visible_locator(
+                page,
+                (
+                    'button[data-testid="login-button"]',
+                    'a[data-testid="login-button"]',
+                    'a[href="/auth/login"]',
+                    'a[href^="/auth/login?"]',
+                    'a[href^="/auth/login_with"]',
+                ),
+                label="login entry",
+            )
+            login_control.click()
+            self._wait_for_stage(
+                page,
+                ("login",),
+                overall_deadline=time.monotonic() + self._stage_timeout_seconds(),
+                label="login entry",
+            )
+            return page
+        target = f"{CHATGPT_BASE}/auth/login_with"
+        target += "?screen_hint=signup"
         page.goto(
-            f"{CHATGPT_BASE}/auth/login_with?screen_hint=signup",
+            target,
             wait_until="domcontentloaded",
             timeout=self._navigation_timeout_ms(),
         )
@@ -377,18 +458,7 @@ class PlaywrightBrowserFlow:
         return False
 
     def _profile_controls_present(self, page: Any) -> bool:
-        if not self._has_visible(page, _PROFILE_NAME_SELECTORS):
-            return False
-        if self._has_visible(page, _PROFILE_BIRTHDATE_SELECTORS):
-            return True
-        return all(
-            self._has_visible(page, selectors)
-            for selectors in (
-                _BIRTH_MONTH_SELECTORS,
-                _BIRTH_DAY_SELECTORS,
-                _BIRTH_YEAR_SELECTORS,
-            )
-        )
+        return self._has_visible(page, _PROFILE_NAME_SELECTORS)
 
     def _classify_stage(self, page: Any) -> str:
         raw_url = str(getattr(page, "url", "") or "")
@@ -422,16 +492,22 @@ class PlaywrightBrowserFlow:
             page, ('input[type="checkbox"]', 'input[type="radio"]')
         ):
             return "manual_confirmation"
-        if path.rstrip("/") in {"/log-in", "/login"}:
-            return "login"
+        if self._has_visible(
+            page, (*_OTP_COMBINED_SELECTORS, *_OTP_SEGMENT_SELECTORS)
+        ):
+            return "otp"
+        if self._has_visible(page, _PASSWORD_SELECTORS):
+            return "password"
+        if self._profile_controls_present(page):
+            return "profile"
         if "email-verification" in path or "email-otp" in path:
             return "otp"
         if path.startswith("/create-account/password"):
             return "password"
-        if self._has_visible(page, _PASSWORD_SELECTORS):
-            return "password"
-        if path.startswith("/about-you") or self._profile_controls_present(page):
+        if path.startswith("/about-you"):
             return "profile"
+        if path.rstrip("/") in {"/log-in", "/login"}:
+            return "login"
         if path.rstrip("/") == "/create-account" and self._has_visible(
             page, _EMAIL_SELECTORS
         ):
@@ -499,6 +575,10 @@ class PlaywrightBrowserFlow:
             stop_event=stop_event,
         )
         if stage == "email":
+            return
+        if str(self.config.get("entry_intent") or "signup").strip().casefold() == "login":
+            if not self._has_visible(page, _EMAIL_SELECTORS):
+                raise RuntimeError("browser flow missing login email control")
             return
         signup_link = self._unique_visible_locator(
             page,
@@ -667,6 +747,19 @@ class PlaywrightBrowserFlow:
                 value = f"{year}-{month}-{day}"
             birthdate.fill(value)
             return
+
+        segmented_present = [
+            self._has_visible(page, selectors)
+            for selectors in (
+                _BIRTH_MONTH_SELECTORS,
+                _BIRTH_DAY_SELECTORS,
+                _BIRTH_YEAR_SELECTORS,
+            )
+        ]
+        if not any(segmented_present):
+            return
+        if not all(segmented_present):
+            raise RuntimeError("browser flow profile birthdate controls are incomplete")
 
         month_input = self._unique_visible_locator(
             page, _BIRTH_MONTH_SELECTORS, label="birth month"
@@ -878,6 +971,7 @@ class PlaywrightBrowserFlow:
             )
 
             email_submitted_at = time.time()
+            self._state("submitting_email")
             self._fill_unique_input(
                 page,
                 _EMAIL_SELECTORS,
@@ -913,6 +1007,7 @@ class PlaywrightBrowserFlow:
                 )
 
             self._log("info", "浏览器全流程：官方 OTP 页面已就绪，等待邮件")
+            self._state("waiting_for_otp")
             remaining_seconds = max(
                 1,
                 int(
@@ -940,6 +1035,7 @@ class PlaywrightBrowserFlow:
                 raise RuntimeError("browser flow total timeout before otp entry")
             if self._classify_stage(page) != "otp":
                 raise RuntimeError("browser flow otp page changed before code entry")
+            self._state("submitting_otp")
             self._fill_otp(page, otp_code)
             stage_after_otp_fill = self._wait_for_otp_auto_submit(
                 page,
@@ -960,6 +1056,7 @@ class PlaywrightBrowserFlow:
 
             if stage == "profile":
                 existing_identity = False
+                self._state("submitting_profile")
                 profile = dict(
                     random_profile
                     or {"name": "Alex Wilson", "birthdate": "1994-05-17"}
@@ -995,6 +1092,25 @@ class PlaywrightBrowserFlow:
             }
         finally:
             self.close()
+
+    def run_registration_and_oauth_sync(
+        self,
+        *,
+        email: str,
+        account_password: str,
+        mail_provider: Any,
+        mail_auth_credential: str,
+        random_profile: Optional[Dict[str, Any]] = None,
+        stop_event: Any = None,
+    ) -> Dict[str, Any]:
+        return self._run_registration_and_oauth_sync(
+            email=email,
+            account_password=account_password,
+            mail_provider=mail_provider,
+            mail_auth_credential=mail_auth_credential,
+            random_profile=random_profile,
+            stop_event=stop_event,
+        )
 
     def run_registration_and_oauth(
         self,

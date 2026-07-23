@@ -604,3 +604,74 @@ class RegistrarAdapter:
         token_data.pop("account_password", None)
         token_data.pop("password", None)
         return token_data
+
+    def login_in_browser_context(
+        self,
+        *,
+        context: Any,
+        page: Any,
+        email: str,
+        account_password: str,
+        mailbox: MailboxCredentials,
+        timeout_seconds: float,
+        provider_initial_state: Mapping[str, Any] | None = None,
+        provider_state_callback: Callable[[dict[str, Any]], None] | None = None,
+        state_callback: Callable[[str], None] | None = None,
+        verbose: bool = True,
+        stop_event: threading.Event | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        if context is None or page is None:
+            raise ValueError("browser context and page are required")
+        if provider_initial_state is not None and not isinstance(
+            provider_initial_state, Mapping
+        ):
+            raise TypeError("provider_initial_state must be a mapping")
+        provider_name = str(mailbox.provider or "").strip().casefold()
+        if provider_name != "icloud_hme_imap":
+            raise ValueError("OpenBrowser automatic login requires an iCloud HME mailbox")
+        provider = self._icloud_provider_class(
+            accounts=[mailbox],
+            initial_state=dict(provider_initial_state or {}),
+            state_callback=provider_state_callback,
+        )
+        emitter_queue = (
+            _CallbackEventQueue(event_callback) if event_callback is not None else None
+        )
+        emitter = self._event_emitter(q=emitter_queue, cli_mode=verbose)
+        FlowClass = self._register_module._load_browser_register_flow_class()
+        flow = FlowClass(
+            config={
+                "entry_intent": "login",
+                "timeout_seconds": max(1, int(float(timeout_seconds))),
+                "flow_timeout_seconds": max(1.0, float(timeout_seconds)),
+            },
+            context=context,
+            page=page,
+            emitter=emitter,
+            state_callback=state_callback,
+        )
+        try:
+            result = flow.run_registration_and_oauth_sync(
+                email=str(email or "").strip(),
+                account_password=str(account_password or ""),
+                mail_provider=provider,
+                mail_auth_credential=mailbox.as_auth_credential(),
+                random_profile=self._register_module._generate_random_profile(),
+                stop_event=stop_event,
+            )
+        except self._mailbox_identity_error_class as exc:
+            raise RegistrarIdentityError("mailbox_credentials_invalid") from exc
+        token_data = (
+            result.get("session_token_data") if isinstance(result, Mapping) else None
+        )
+        if not isinstance(token_data, Mapping):
+            raise RuntimeError("OpenBrowser automatic login did not return session data")
+        session = dict(token_data)
+        expected_email = str(email or "").strip().casefold()
+        session_email = str(session.get("email") or "").strip().casefold()
+        if not session_email or session_email != expected_email:
+            raise RuntimeError("OpenBrowser automatic login returned a different account")
+        session.pop("account_password", None)
+        session.pop("password", None)
+        return session

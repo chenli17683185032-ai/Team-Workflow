@@ -443,7 +443,7 @@ class TaskQueueTests(unittest.TestCase):
         self.assertNotIn("refresh-bounded-logs-current", serialized_logs)
         self.assertIn("***", serialized_logs)
 
-    def test_manual_login_state_is_visible_and_stop_cancels_without_secret_leak(self):
+    def test_automatic_login_state_is_visible_and_stop_cancels_without_secret_leak(self):
         workspace, _, _ = self.make_workspace("manual-state")
         started = threading.Event()
 
@@ -459,7 +459,7 @@ class TaskQueueTests(unittest.TestCase):
                     {"type": "step", "step": "new_login", "state": "active"}
                 )
                 self.callback(
-                    {"type": "manual_login", "state": "waiting_for_user"}
+                    {"type": "manual_login", "state": "waiting_for_otp"}
                 )
                 self.logger(
                     f"waiting with api-key={self.config.openbrowser_api_key}"
@@ -475,7 +475,7 @@ class TaskQueueTests(unittest.TestCase):
         self.assertTrue(started.wait(2.0))
         operation = queue.snapshot()["run_operation"]
         self.assertEqual(operation["current_step"], "new_login")
-        self.assertEqual(operation["manual_login_state"], "waiting_for_user")
+        self.assertEqual(operation["manual_login_state"], "waiting_for_otp")
         self.assertNotIn("openbrowser-api-secret", json.dumps(operation))
 
         self.assertEqual(queue.stop(run["id"]), "stopping")

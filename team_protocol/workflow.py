@@ -629,15 +629,19 @@ class WorkflowRunner:
     def _manual_login_status(self, state: str) -> None:
         messages = {
             "profile_started": "OpenBrowser profile started",
-            "waiting_for_user": "waiting for manual login",
-            "wrong_account": "manual login is using the wrong account",
+            "automating_login": "automatic login started",
+            "submitting_email": "submitting the new account email",
+            "waiting_for_otp": "waiting for the mailbox verification code",
+            "submitting_otp": "submitting the mailbox verification code",
+            "submitting_profile": "submitting the required profile name",
+            "wrong_account": "OpenBrowser profile is using the wrong account",
             "waiting_for_team": "waiting for the target Team",
-            "verified": "manual login and Team verified",
+            "verified": "automatic login and Team verified",
             "profile_stopped": "OpenBrowser profile stopped",
         }
         clean_state = str(state)
-        message = messages.get(clean_state, "manual login state changed")
-        self._log(f"[manual-login] {message}")
+        message = messages.get(clean_state, "automatic login state changed")
+        self._log(f"[openbrowser-login] {message}")
         self._emit_event({"type": "manual_login", "state": clean_state})
 
     def _preflight_manual_login(self) -> None:
@@ -783,8 +787,15 @@ class WorkflowRunner:
 
     def _manual_new_login(self, spec: AccountSpec) -> dict[str, Any]:
         if not self.config.openbrowser_base_url or not self.config.openbrowser_api_key:
-            raise RuntimeError("OpenBrowser manual login is not configured")
-        self._log(f"[manual-login] {spec.email}")
+            raise RuntimeError("OpenBrowser automatic login is not configured")
+        mailbox = self._mailboxes.get("new_login")
+        login_in_context = getattr(self.registrar, "login_in_browser_context", None)
+        if mailbox is None or not callable(login_in_context):
+            raise RuntimeError("OpenBrowser automatic login integration is unavailable")
+        provider_state = self.state.get(_REGISTRAR_PROVIDER_STATE_STEP)
+        if provider_state is not None and not isinstance(provider_state, Mapping):
+            raise RuntimeError("stored registrar provider state is not a JSON object")
+        self._log(f"[openbrowser-login] {spec.email}")
         client = self.openbrowser_client_factory(
             self.config.openbrowser_base_url,
             self.config.openbrowser_api_key,
@@ -811,14 +822,40 @@ class WorkflowRunner:
                 context = AuthContext.from_mapping(verified)
                 if context.account_id != self.config.workspace_id:
                     raise _WorkspaceSwitchError(
-                        "manual login did not enter the target workspace"
+                        "OpenBrowser login did not enter the target workspace"
                     )
                 return dict(verified)
 
+            def run_login(context: Any, page: Any) -> Mapping[str, Any]:
+                self._check_cancel()
+                return login_in_context(
+                    context=context,
+                    page=page,
+                    email=spec.email,
+                    account_password=spec.password,
+                    mailbox=mailbox,
+                    timeout_seconds=self.config.openbrowser_manual_timeout_seconds,
+                    provider_initial_state=dict(provider_state or {}),
+                    provider_state_callback=self._checkpoint_provider_state,
+                    state_callback=self._manual_login_status,
+                    verbose=self.verbose and self.logger is None,
+                    stop_event=self.stop_event,
+                    event_callback=(
+                        self._registrar_event if self.logger is not None else None
+                    ),
+                )
+
             session = manual_login.wait(
+                login_runner=run_login,
                 session_validator=validate_session,
                 stop_event=self.stop_event,
             )
+        except RegistrarIdentityError as exc:
+            self._check_cancel()
+            raise WorkflowIdentityError(exc.code, "next") from exc
+        except Exception:
+            self._check_cancel()
+            raise
         finally:
             client.close()
         self._check_cancel()

@@ -285,7 +285,7 @@ class OpenBrowserManualLoginTests(unittest.TestCase):
         self.assertEqual(session["session_token"], "onetwo")
         self.assertEqual(session["token_source"], "openbrowser_manual")
 
-    def test_waits_for_manual_session_validates_and_stops_only_target(self):
+    def test_reuses_existing_session_validates_and_stops_only_target(self):
         client = FakeOpenBrowserClient()
         context = FakeContext(
             [self.session_page()],
@@ -317,7 +317,7 @@ class OpenBrowserManualLoginTests(unittest.TestCase):
         self.assertEqual(client.calls, [("start", "team_01"), ("stop", "team_01")])
         self.assertEqual(
             statuses,
-            ["profile_started", "waiting_for_user", "verified", "profile_stopped"],
+            ["profile_started", "verified", "profile_stopped"],
         )
         self.assertEqual(len(validator_calls), 1)
         self.assertNotIn("access-secret", str(statuses))
@@ -342,7 +342,7 @@ class OpenBrowserManualLoginTests(unittest.TestCase):
 
         self.assertEqual(client.calls, [("start", "team_01"), ("stop", "team_01")])
 
-    def test_wrong_account_can_be_corrected_in_the_same_profile(self):
+    def test_wrong_account_fails_without_clearing_or_replacing_the_profile(self):
         client = FakeOpenBrowserClient()
         page = FakePage(
             "https://chatgpt.com/",
@@ -361,7 +361,6 @@ class OpenBrowserManualLoginTests(unittest.TestCase):
             ],
         )
         statuses = []
-        validator_calls = []
         login = OpenBrowserManualLogin(
             client,
             "team_01",
@@ -371,17 +370,58 @@ class OpenBrowserManualLoginTests(unittest.TestCase):
             playwright_factory=lambda: FakePlaywrightContext(
                 FakeChromium(FakeBrowser(context))
             ),
-            monotonic=lambda: 0.0,
+        )
+
+        with self.assertRaisesRegex(OpenBrowserError, "different account"):
+            login.wait(session_validator=lambda session: dict(session))
+
+        self.assertEqual(statuses.count("wrong_account"), 1)
+        self.assertEqual(client.calls, [("start", "team_01"), ("stop", "team_01")])
+
+    def test_empty_profile_runs_automatic_login_driver_once(self):
+        client = FakeOpenBrowserClient()
+        page = FakePage("https://chatgpt.com/", None)
+        context = FakeContext(
+            [page],
+            [
+                {
+                    "name": "__Secure-next-auth.session-token",
+                    "value": "session-secret",
+                }
+            ],
+        )
+        statuses = []
+        login_calls = []
+        login = OpenBrowserManualLogin(
+            client,
+            "team_01",
+            expected_email="child@example.com",
+            timeout_seconds=30,
+            status_callback=statuses.append,
+            playwright_factory=lambda: FakePlaywrightContext(
+                FakeChromium(FakeBrowser(context))
+            ),
         )
 
         result = login.wait(
-            session_validator=lambda session: validator_calls.append(dict(session))
-            or dict(session)
+            login_runner=lambda browser_context, login_page: login_calls.append(
+                (browser_context, login_page)
+            )
+            or {
+                "access_token": "access-secret",
+                "session_token": "session-secret",
+                "email": "child@example.com",
+            },
+            session_validator=lambda session: {
+                **session,
+                "account_id": "workspace-1",
+            },
         )
 
-        self.assertEqual(result["email"], "child@example.com")
-        self.assertEqual(len(validator_calls), 1)
-        self.assertEqual(statuses.count("wrong_account"), 1)
+        self.assertEqual(result["account_id"], "workspace-1")
+        self.assertEqual(login_calls, [(context, page)])
+        self.assertIn("automating_login", statuses)
+        self.assertNotIn("waiting_for_user", statuses)
         self.assertEqual(client.calls, [("start", "team_01"), ("stop", "team_01")])
 
     def test_team_validation_retries_until_the_target_team_appears(self):
@@ -440,7 +480,7 @@ class OpenBrowserManualLoginTests(unittest.TestCase):
 
         self.assertEqual(client.calls, [("start", "team_01"), ("stop", "team_01")])
 
-    def test_manual_login_timeout_is_bounded_and_stops_the_profile(self):
+    def test_automatic_login_timeout_is_bounded_and_stops_the_profile(self):
         client = FakeOpenBrowserClient()
         context = FakeContext([FakePage("https://chatgpt.com/")])
         clock = iter((0.0, 0.0, 2.0))
@@ -456,7 +496,16 @@ class OpenBrowserManualLoginTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(OpenBrowserError, "timed out"):
-            login.wait(session_validator=lambda session: session)
+            login.wait(
+                login_runner=lambda _context, _page: {
+                    "access_token": "access-secret",
+                    "session_token": "session-secret",
+                    "email": "child@example.com",
+                },
+                session_validator=lambda _session: (_ for _ in ()).throw(
+                    RuntimeError("Team has not appeared yet")
+                ),
+            )
 
         self.assertEqual(client.calls, [("start", "team_01"), ("stop", "team_01")])
 

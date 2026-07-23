@@ -713,7 +713,11 @@ class TaskQueue:
                     manual_state = str(event.get("state") or "")
                     if manual_state not in {
                         "profile_started",
-                        "waiting_for_user",
+                        "automating_login",
+                        "submitting_email",
+                        "waiting_for_otp",
+                        "submitting_otp",
+                        "submitting_profile",
                         "wrong_account",
                         "waiting_for_team",
                         "verified",
@@ -1172,7 +1176,7 @@ class TaskQueue:
             "openbrowser_manual_timeout_seconds", 1800, minimum=60
         )
         if openbrowser_manual_timeout_seconds > 86_400:
-            raise StateConflictError("OpenBrowser manual login timeout is invalid")
+            raise StateConflictError("OpenBrowser automatic login timeout is invalid")
         if old_identity["proxy_sid"] == new_identity["proxy_sid"]:
             raise StateConflictError("old and new accounts share the same proxy SID")
         legacy_profile = checkpoint.get("_fingerprint_profile")
