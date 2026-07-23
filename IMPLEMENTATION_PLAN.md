@@ -1838,7 +1838,7 @@ Workflow/Refresh runner 原始反馈
 - 2026-07-23：使用加密保存的浏览器 session 独立回读 ChatGPT 成功，身份与 Alias 再次一致、access token 存在、计划类型仍为 `free`；本地 `registered_account=true`，母号归属为空，Workspace 关联数为 0。
 - 2026-07-23：canary 前后数据库差异仅为 `accounts +1`、`icloud_aliases +1`；`workspaces=2`、`runs=16`、`queue_items=16` 均无增量。队列无 active/pending/run/refresh，未创建 Team 邀请、PAT 或 Sub2API 写入，服务无需重启。
 
-### 节点 AE：官方页面驱动的自动注册协议（进行中）
+### 节点 AE：官方页面驱动的自动注册协议（完成）
 
 #### AE.1 目标与性能指标
 
@@ -1893,7 +1893,7 @@ Workflow/Refresh runner 原始反馈
 - [x] 更新 README、CHANGELOG 和本节实施记录，完成全部离线回归与静态检查。
 - [x] 用户明确要求重启后，在队列空闲时备份 SQLite 并校验源库/备份 `quick_check=ok`，以单次 LaunchAgent 重启在 60 秒内恢复 HTTP/health/队列。
 - [x] 上线只核对服务 HTTP/health、队列总状态和错误日志，不读取或测试组二 Workspace，不创建第二个 canary，不触发 Alias/邀请/退出/PAT/Sub2API 写入。
-- [ ] 提交并推送 GitHub `main`；保留用户原有 `.DS_Store` 不纳入提交，清理本次临时文件并确认本地与 `origin/main` 一致。
+- [x] 提交并推送 GitHub `main`；保留用户原有 `.DS_Store` 不纳入提交，清理本次临时文件并确认本地与 `origin/main` 一致。
 
 #### AE.5 验收场景
 
@@ -2015,3 +2015,4 @@ OTP 填写后短暂等待页面反馈
 
 - 2026-07-23：物理删除旧不可达注册块后，BrowserRegisterFlow 23 项、五组联动 193 项全部通过；全量 365 项中 359 项通过、6 项 Windows DPAPI 按 macOS 平台跳过。Python compileall、JavaScript 语法、跟踪 JSON、`git diff --check` 和差异高置信秘密扫描通过；未读取或测试组二，未访问真实账号。
 - 2026-07-23：保留重启前队列未暂停状态，直接通过 SQLite 暂停领取并确认活动 queue/run 均为 0；单次重启 LaunchAgent 后 PID 从 `37502` 变为 `49513`，HTTP 在 5 秒内恢复 `200`，重启窗口新增错误日志为 0。随后数据库迁移元数据为 `ready`、schema v7、`quick_check=ok`，恢复队列未暂停状态后活动 queue/run 仍为 0。全程未读取组二 Workspace、账号、成员或邀请。
+- 2026-07-23：主实现提交 `09d8fba` 已推送 GitHub `main`；推送前 `git fetch` 确认本地与远端基线双向差异均为 0。用户原有 `.DS_Store` 保持未跟踪，未删除、未暂存、未提交。
