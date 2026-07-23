@@ -326,6 +326,13 @@ def validate_proxy_source(value: str) -> str:
         if _is_generator_host(host) and parsed.path.rstrip("/") == "/gen":
             return validate_generator_url(text)
         normalized = validate_proxy_url(text)
+        if host == _LINKUP_FIXED_PROXY_HOST:
+            normalized_parsed = urllib.parse.urlsplit(normalized)
+            return validate_proxy_url(
+                urllib.parse.urlunsplit(
+                    normalized_parsed._replace(scheme="socks5")
+                )
+            )
         _parse_proxy_address(normalized, label="proxy source")
         return normalized
     if scheme == "https":

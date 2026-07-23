@@ -2187,7 +2187,7 @@ OTP 填写后短暂等待页面反馈
 
 - `-L` / `--location` 只作为可忽略的 curl 跟随跳转标记；工具不执行命令、不访问 TARGET，也不保存 TARGET。
 - 仍只提取唯一的 `-x` / `--proxy` 和唯一的 `-U` / `--proxy-user` 凭据；其他未知选项继续拒绝。
-- 现场闭环证明精确入口 `global.rp.linkup.onl` 的 HTTP 模式可访问 IP 查询但无法建立 OpenAI CONNECT，而同一入口按 SOCKS5 经 Clash 可在 3 秒内完成两个 OpenAI 域名 TLS；因此只对该精确主机把无显式 scheme 的 `-x` 解释为 SOCKS5，其他 `-x` 仍为 HTTP。
+- 现场闭环证明精确入口 `global.rp.linkup.onl` 的 HTTP 模式可访问 IP 查询但无法建立 OpenAI CONNECT，而同一入口按 SOCKS5 经 Clash 可在 3 秒内完成两个 OpenAI 域名 TLS；因此该精确固定入口的裸 `-x` 和已存 `http://` source 都在运行时解释为 SOCKS5，其他主机仍保持原 scheme。
 - 解析结果仍进入固定代理路径，连接必须经过共享 Clash `http://127.0.0.1:7897`，不增加直连回退。
 - 用户提供的真实代理凭据不得进入源码、测试、计划、日志或 Git；回归只使用保留域名和假凭据。
 
@@ -2207,7 +2207,7 @@ curl 文本 -> shlex 分词 -> 忽略 -L/--location
 #### AH.3 实施与验收
 
 - [x] 增加 `-L`、`--location` 和精确 Linkup 主机 SOCKS5 归一化回归，并保留普通 `-x` 为 HTTP、近似主机及未知选项拒绝测试。
-- [x] 对 `_proxy_source_from_curl()` 做最小修改：忽略两个 location 标记，并仅覆写精确 Linkup 固定入口的缺省 scheme。
+- [x] 对 `_proxy_source_from_curl()` 与 `validate_proxy_source()` 做最小修改：忽略两个 location 标记，并仅覆写精确 Linkup 固定入口，使已存 HTTP source 无需改库即可按 SOCKS5 运行。
 - [x] 运行 proxy-chain 聚焦回归、Python 编译和差异检查；确认新增差异无真实凭据。
 - [x] 队列空闲时重启 LaunchAgent，60 秒内恢复 HTTP，并验证迁移、数据库和队列原状态。
 
@@ -2216,4 +2216,4 @@ curl 文本 -> shlex 分词 -> 忽略 -L/--location
 #### AH.4 实施记录
 
 - 2026-07-23：同一 Linkup 固定入口经 Clash 前置时，HTTP 模式对两个 OpenAI 域名均停在 TLS 前；强制 SOCKS5 后分别约 2.4 秒和 3.1 秒完成 TLS并获得站点响应，证明协议模式是首个失效环节。
-- 2026-07-23：精确主机覆写、普通/近似主机不回归和 `-L/--location` 共随 Proxy/Web 61 项回归通过；Python 编译、差异检查和真实凭据扫描通过。LaunchAgent PID `44150 -> 50700`，HTTP 在 6 秒内恢复，迁移 ready、数据库 `quick_check=ok`、队列恢复未暂停且活动运行 0。
+- 2026-07-23：精确主机覆写、存量 HTTP source 运行时兼容、普通/近似主机不回归和 `-L/--location` 共随 Proxy/Web 62 项回归通过；Python 编译、差异检查和真实凭据扫描通过。首轮 LaunchAgent PID `44150 -> 50700`，HTTP 在 6 秒内恢复，迁移 ready、数据库 `quick_check=ok`、队列恢复未暂停且活动运行 0。

@@ -414,6 +414,19 @@ class ProxyChainTests(unittest.TestCase):
             with self.subTest(command=command.split()[1]):
                 self.assertEqual(validate_proxy_source(command), expected)
 
+    def test_saved_linkup_http_source_is_normalized_to_socks5(self):
+        source = (
+            "http://USER-example-zone-custom:proxy-pass@"
+            "global.rp.linkup.onl:10000"
+        )
+        near_match = "http://user:pass@global.rp.linkup.onl.example:10000"
+
+        self.assertEqual(
+            validate_proxy_source(source),
+            source.replace("http://", "socks5://", 1),
+        )
+        self.assertEqual(validate_proxy_source(near_match), near_match)
+
     def test_curl_proxy_commands_reject_ambiguous_or_incomplete_input(self):
         invalid = (
             "curl mayips.com",
