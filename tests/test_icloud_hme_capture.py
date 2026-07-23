@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
 import os
 import stat
@@ -19,11 +21,14 @@ from team_protocol.icloud_hme_capture import (
     ICloudHmeCaptureManager,
     _capture_timeout_error,
     _browser_app_bundle,
+    _authenticated_icloud_origin,
+    _click_hide_my_email,
     _click_icloud_sign_in,
     _is_authenticated_setup_response,
     _macos_browser_command,
     _prepare_capture_profile,
-    _session_from_authenticated_context,
+    _request_headers_and_cookies,
+    capture_hme_session,
 )
 
 
@@ -212,6 +217,31 @@ class ICloudHmeCaptureTests(unittest.TestCase):
         self.assertEqual(clicked, [("登录", {"timeout": 5_000})])
         self.assertEqual(page.assertions[0], ("button", "登录", True))
 
+    def test_capture_opens_the_authenticated_hide_my_email_panel(self):
+        clicked = []
+        patterns = []
+
+        class Locator:
+            @staticmethod
+            def count():
+                return 1
+
+            @staticmethod
+            def click(**kwargs):
+                clicked.append(kwargs)
+
+        class Page:
+            @staticmethod
+            def get_by_role(role, *, name):
+                patterns.append((role, name))
+                return Locator()
+
+        self.assertTrue(_click_hide_my_email(Page()))
+        self.assertEqual(clicked, [{"timeout": 5_000}])
+        self.assertEqual(patterns[0][0], "button")
+        self.assertIsNotNone(patterns[0][1].search("Show more options for 隐藏邮件地址"))
+        self.assertIsNotNone(patterns[0][1].search("Show more options for Hide My Email"))
+
     def test_capture_timeout_distinguishes_missing_and_rejected_list_requests(self):
         missing = _capture_timeout_error(0, 0)
         rejected = _capture_timeout_error(1, 1)
@@ -241,7 +271,7 @@ class ICloudHmeCaptureTests(unittest.TestCase):
             self.assertNotIn("--disable-blink-features=AutomationControlled", command)
             self.assertNotIn("--remote-debugging-port=0", command)
 
-    def test_authenticated_icloud_setup_builds_a_session_from_core_cookies(self):
+    def test_authenticated_icloud_setup_only_returns_the_matching_origin(self):
         template = captured_session()
 
         class Context:
@@ -252,18 +282,20 @@ class ICloudHmeCaptureTests(unittest.TestCase):
                     for index, name in enumerate(sorted(CORE_SESSION_COOKIE_NAMES))
                 ]
 
-        class Page:
+        origin = _authenticated_icloud_origin(Context(), template)
+
+        self.assertEqual(origin, "https://www.icloud.com.cn")
+
+        class IncompleteContext:
             @staticmethod
-            def evaluate(_expression):
-                return "Fresh Browser"
+            def cookies(*_args):
+                return [
+                    {"name": "X-APPLE-WEBAUTH-USER", "value": "incomplete"}
+                ]
 
-        session = _session_from_authenticated_context(Context(), Page(), template)
-
-        self.assertIsNotNone(session)
-        self.assertEqual(session.host, template.host)
-        self.assertEqual(session.client_id, template.client_id)
-        self.assertEqual(session.user_agent, "Fresh Browser")
-        self.assertIn("X-APPLE-WEBAUTH-TOKEN=fresh-1", session.cookie)
+        self.assertIsNone(
+            _authenticated_icloud_origin(IncompleteContext(), template)
+        )
         self.assertTrue(
             _is_authenticated_setup_response(
                 "https://setup.icloud.com.cn/setup/ws/1/validate?clientId=secret",
@@ -276,6 +308,52 @@ class ICloudHmeCaptureTests(unittest.TestCase):
                 421,
             )
         )
+
+    def test_authenticated_cookies_cannot_complete_capture_without_list_request(self):
+        source = inspect.getsource(capture_hme_session)
+        nonempty_returns = [
+            ast.unparse(node.value)
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Return) and node.value is not None
+        ]
+
+        self.assertNotIn("_session_from_authenticated_context(", source)
+        self.assertIn('/icloudplus/', source)
+        self.assertIn("_click_hide_my_email(page)", source)
+        self.assertIn("page.wait_for_timeout(250)", source)
+        self.assertEqual(nonempty_returns, ["captured[0]"])
+
+    def test_capture_falls_back_to_cached_headers_and_full_context_cookies(self):
+        class Request:
+            headers = {
+                "referer": "https://www.icloud.com.cn/icloudplus/",
+                "user-agent": "Capture Test Browser",
+            }
+
+            @staticmethod
+            def all_headers():
+                raise RuntimeError("iframe target changed")
+
+        class Context:
+            @staticmethod
+            def cookies(_url):
+                return [
+                    {"name": name, "value": f"value-{index}"}
+                    for index, name in enumerate(
+                        (
+                            "X-APPLE-DS-WEB-SESSION-TOKEN",
+                            "X-APPLE-WEBAUTH-USER",
+                            "X-APPLE-WEBAUTH-TOKEN",
+                            "X-APPLE-WEBAUTH-HSA-TRUST",
+                        )
+                    )
+                ]
+
+        headers, cookies = _request_headers_and_cookies(Request(), Context(), URL)
+        session = parse_hme_request(URL, headers, cookies=cookies)
+
+        self.assertEqual(len(cookies), 4)
+        self.assertIn("X-APPLE-WEBAUTH-HSA-TRUST=value-3", session.cookie)
 
 
 if __name__ == "__main__":

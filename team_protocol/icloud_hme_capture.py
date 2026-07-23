@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import signal
 import shutil
 import socket
@@ -326,11 +327,10 @@ def _is_authenticated_setup_response(url: str, status: int) -> bool:
     )
 
 
-def _session_from_authenticated_context(
+def _authenticated_icloud_origin(
     context: Any,
-    page: Any,
     template: ICloudHmeSession | None,
-) -> ICloudHmeSession | None:
+) -> str | None:
     if template is None:
         return None
     origin = (
@@ -361,23 +361,24 @@ def _session_from_authenticated_context(
         )
     if not CORE_SESSION_COOKIE_NAMES.issubset(values):
         return None
-    data = template.as_secret_dict()
-    data.update(
-        {
-            "cookie": "; ".join(
-                f"{name}={values[name]}" for name in sorted(CORE_SESSION_COOKIE_NAMES)
-            ),
-            "origin": origin,
-            "referer": f"{origin}/",
-        }
-    )
+    return origin
+
+
+def _request_headers_and_cookies(
+    request: Any,
+    context: Any,
+    url: str,
+) -> tuple[dict[str, str], Any]:
     try:
-        user_agent = str(page.evaluate("navigator.userAgent") or "").strip()
+        headers = dict(request.all_headers())
     except Exception:
-        user_agent = ""
-    if user_agent:
-        data["user_agent"] = user_agent
-    return ICloudHmeSession.from_mapping(data)
+        # HME's iframe can replace its target immediately after issuing list.
+        # Playwright keeps the ordinary request headers available in that race.
+        headers = dict(getattr(request, "headers", {}) or {})
+    cookies = ()
+    if not str(headers.get("cookie") or "").strip():
+        cookies = context.cookies(url)
+    return headers, cookies
 
 
 def capture_hme_session(
@@ -406,6 +407,8 @@ def capture_hme_session(
     captured: list[ICloudHmeSession] = []
     captured_event = threading.Event()
     authenticated_event = threading.Event()
+    hme_navigation_started = False
+    hme_entry_opened = False
     list_responses = 0
     rejected_sessions = 0
 
@@ -442,10 +445,11 @@ def capture_hme_session(
             if str(getattr(request, "method", "GET") or "GET").upper() != "GET":
                 rejected_sessions += 1
                 return
-            headers = request.all_headers()
-            cookies = ()
-            if not str(headers.get("cookie") or "").strip():
-                cookies = context.cookies(response_url)
+            headers, cookies = _request_headers_and_cookies(
+                request,
+                context,
+                response_url,
+            )
             session = parse_hme_request(
                 response_url,
                 headers,
@@ -465,10 +469,22 @@ def capture_hme_session(
                 raise HmeCaptureError("iCloud HME capture was cancelled")
             if sys.platform == "darwin":
                 external_browser = _launch_macos_browser(playwright, profile_path)
-                browser = playwright.chromium.connect_over_cdp(
-                    external_browser.endpoint,
-                    timeout=15_000,
-                )
+                connect_deadline = time.monotonic() + 30.0
+                while browser is None:
+                    remaining = connect_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise HmeCaptureUnavailableError(
+                            "iCloud 登录窗口连接超时"
+                        )
+                    try:
+                        browser = playwright.chromium.connect_over_cdp(
+                            external_browser.endpoint,
+                            timeout=max(1_000, min(10_000, int(remaining * 1_000))),
+                        )
+                    except PlaywrightError:
+                        if time.monotonic() >= connect_deadline:
+                            raise
+                        time.sleep(0.25)
                 if not browser.contexts:
                     raise HmeCaptureUnavailableError(
                         "iCloud 登录窗口没有可用的浏览器上下文"
@@ -512,19 +528,38 @@ def capture_hme_session(
             _click_icloud_sign_in(page)
             deadline = time.monotonic() + max(30.0, float(timeout_seconds))
             while time.monotonic() < deadline:
-                if cancel_event.wait(0.25):
+                if cancel_event.is_set():
+                    raise HmeCaptureError("iCloud HME capture was cancelled")
+                try:
+                    page.wait_for_timeout(250)
+                except PlaywrightError:
+                    if cancel_event.wait(0.25):
+                        raise HmeCaptureError("iCloud HME capture was cancelled")
+                if cancel_event.is_set():
                     raise HmeCaptureError("iCloud HME capture was cancelled")
                 if captured_event.is_set() and captured:
                     return captured[0]
-                if session_template is not None:
-                    session = _session_from_authenticated_context(
-                        context,
-                        page,
-                        session_template,
-                    )
-                    if session is not None:
+                if session_template is not None and not hme_navigation_started:
+                    origin = _authenticated_icloud_origin(context, session_template)
+                    if origin is not None:
                         mark_authenticated()
-                        return session
+                        hme_navigation_started = True
+                        try:
+                            page.goto(
+                                f"{origin}/icloudplus/",
+                                wait_until="domcontentloaded",
+                                timeout=20_000,
+                            )
+                        except (PlaywrightTimeoutError, PlaywrightError):
+                            # The response listener remains authoritative even
+                            # when SPA navigation interrupts page.goto().
+                            pass
+                        try:
+                            page.bring_to_front()
+                        except PlaywrightError:
+                            pass
+                if hme_navigation_started and not hme_entry_opened:
+                    hme_entry_opened = _click_hide_my_email(page)
                 try:
                     has_pages = bool(context.pages)
                 except PlaywrightError:
@@ -568,6 +603,22 @@ def _click_icloud_sign_in(page: Any) -> bool:
         except Exception:
             continue
     return False
+
+
+def _click_hide_my_email(page: Any) -> bool:
+    """Open the authenticated HME panel so the browser issues its list request."""
+
+    try:
+        button = page.get_by_role(
+            "button",
+            name=re.compile(r"(?:隐藏邮件地址|Hide My Email)", re.IGNORECASE),
+        )
+        if button.count() != 1:
+            return False
+        button.click(timeout=5_000)
+        return True
+    except Exception:
+        return False
 
 
 def _capture_timeout_error(
@@ -697,7 +748,7 @@ class ICloudHmeCaptureManager:
             self._transition(
                 mailbox_id,
                 "verifying",
-                "已检测到 Apple 登录，正在验证 HME Session",
+                "已检测到 Apple 登录，正在捕获完整 HME Session",
             )
 
         try:

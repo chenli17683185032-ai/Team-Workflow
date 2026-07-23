@@ -227,7 +227,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 
 ### 准备信息
 
-1. 推荐直接使用控制台的“登录更新 HME”：应用会打开独立的可见 Chrome for Testing 窗口，并自动进入 Apple 登录页。首次在其中登录 [中国区 iCloud](https://www.icloud.com.cn/) 并完成双重验证后，同一资源池会长期复用该浏览器的 Cookie 和设备信任状态。登录验证成功后，应用优先等待 `GET /v2/hme/list`，即使 Hide My Email 子页面打不开，也会用当前 Cookie 做一次 HME 只读校验并自动保存。
+1. 推荐直接使用控制台的“登录更新 HME”：应用会打开独立的可见 Chrome for Testing 窗口，并自动进入 Apple 登录页。首次在其中登录 [中国区 iCloud](https://www.icloud.com.cn/) 并完成双重验证后，同一资源池会长期复用该浏览器的 Cookie 和设备信任状态。登录验证成功后，应用会自动进入 iCloud+ 并打开“隐藏邮件地址 / Hide My Email”；只有真实浏览器 `GET /v2/hme/list` 返回 200 时才捕获完整请求会话。仅检测到 Apple 登录 Cookie 不会保存或将资源池标记为可用。
 2. 准备隐藏邮箱实际转发到的邮箱 IMAP 信息。使用 iCloud Mail 时，通常为 `imap.mail.me.com:993`、完整 iCloud 邮箱地址，以及在 [Apple Account](https://account.apple.com/) 生成的 App 专用密码；其他邮箱使用对应服务商的 IMAP 参数。iCloud 转发 OTP 最长等待 90 秒，资源池代理显式留空时 IMAP 不会继承子号工作流代理。
 3. 按需准备资源池的 HME / IMAP S5。若希望 iCloud HME 直连，保持此字段为空；应用会显式忽略系统 `HTTP_PROXY/ALL_PROXY` 环境变量。若使用代理，建议填写稳定的 `socks5h://user:password@host:port`，不要使用会频繁轮换的动态源。
 4. 分别准备每个 Team 的代理。可以粘贴完整的 `http://user:password@host:port` / SOCKS5 URL，也可以直接粘贴供应商给出的 `curl -x HOST:PORT -U "USER:PASS" TARGET` 或 `curl --socks5 HOST:PORT -U "USER:PASS" TARGET`；历史 Loki `/gen` 链接继续兼容。curl 文本只做受限参数解析，不会执行，探针目标也不会保存。新建子号会按归属继承对应本地中继地址，这不是母号登录代理。
@@ -247,7 +247,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 
 如本机 Clash 端口不同，可通过 `TEAM_WORKFLOW_LOCAL_CLASH_PROXY` 覆盖统一前置。HME / IMAP 仍按资源池自己的直连或独立 S5 设置运行，不进入上述工作流链路。
 
-自动捕获为每个 iCloud 资源池使用一个隔离的持久 Chrome for Testing profile，不读取你日常使用的 Chrome profile，也不在不同 iCloud 资源池间共享状态。捕获完成、取消或超时后应用会关闭浏览器进程，但保留 profile 中的 Cookie、站点存储、Apple 设备信任和本地密码管理数据，供下次登录复用。该目录位于 Git 工作区外、权限为 `0700`，不进入项目加密备份；应当按照已登录浏览器处理这个敏感目录。应用不接收或记录 Apple 密码、验证码或 2FA 内容，也不保存 HAR、截图或额外 storage state；只把通过白名单校验并经过 HME 只读列表验证的最小 Session 加密写入资源池。Apple 仍可根据服务端策略让 Cookie 过期或再次要求 2FA。
+自动捕获为每个 iCloud 资源池使用一个隔离的持久 Chrome for Testing profile，不读取你日常使用的 Chrome profile，也不在不同 iCloud 资源池间共享状态。捕获完成、取消或超时后应用会关闭浏览器进程，但保留 profile 中的 Cookie、站点存储、Apple 设备信任和本地密码管理数据，供下次登录复用。该目录位于 Git 工作区外、权限为 `0700`，不进入项目加密备份；应当按照已登录浏览器处理这个敏感目录。应用不接收或记录 Apple 密码、验证码或 2FA 内容，也不保存 HAR、截图或额外 storage state；只把来自真实 HME list 请求、通过 host/path/origin 白名单并经服务端再次只读验证的完整请求 Session 加密写入资源池。Apple 仍可根据服务端策略让 Cookie 过期或再次要求 2FA。
 
 手动导入仍然可用：如果自动捕获无法启动，在已登录的 iCloud 页面 Network 中找到 `/v2/hme/list`，使用“Copy as cURL”或导出 HAR，再在资源池编辑窗口粘贴。控制台只解析允许的 Apple HME host/path，导入原文不落盘。
 
@@ -271,7 +271,7 @@ socks5h://user-b:password-b@proxy-b.example:1080
 
 当前子号刷新时，第一次点击会立即把账号行切换为“刷新中…”并展开底部执行栏；其中以实时详细日志显示本地时间、当前阶段、级别和每一步脱敏消息。正常接力和母号提拉使用同一日志框，不再用步骤卡概括执行过程。日志位于底部时自动跟随新消息，向上查看历史时保持阅读位置，可用向下按钮回到最新；账号表被实时事件重绘后刷新按钮仍保持禁用。同账号成功后 60 秒内的重复请求只返回刚才的导出路径，不会再次创建 PAT，操作结束后日志框继续保留最后状态、脱敏错误和输出路径。
 
-本地直连测试只验证网络可达性，不会自动延长 Apple Session。Session 失效时，点击“登录更新 HME”重新登录即可自动捕获或验证最新会话，不必强行打开隐藏邮箱子页面；如果直连后仍立即失效，应优先检查 Apple 登录状态和 Cookie，而不是反复点击检测。
+本地直连测试只验证网络可达性，不会自动延长 Apple Session。Session 失效时，点击“登录更新 HME”重新登录；应用会自动打开隐藏邮件地址面板并等待真实 list 请求。若面板未打开或未发出 list，本次捕获会失败且不覆盖原会话；此时可重试一次，仍失败则按上文手动导入最新 cURL/HAR。
 
 若 Apple 已创建并完成本地绑定，但任务暂时未能入队，空间会保留这个下一子号并显示“开始接力”；再次点击只会入队，不会重复创建 Alias。之后仍可在账号行单独覆盖新子号代理；任务开始后使用冻结的账号代理快照。
 
@@ -329,7 +329,7 @@ $env:PYTHONDONTWRITEBYTECODE = '1'
 python -B -m unittest discover -s '.\tests' -v
 ```
 
-当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 回退与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、Sub2API 告警 UID 消费与动作幂等、官方页面驱动的新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与详细日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 365 项测试，其中 359 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
+当前测试覆盖数据库事务、并发分配、账号轮换、迁移与备份、DPAPI、macOS Keychain/AES-GCM、队列恢复、Web API、账号级独立 S5 与 SID、iCloud HME cURL/HAR、登录后 HME 自动捕获状态机、按资源池隔离的持久登录 profile、Sentinel 预取总时限与超时回收、可见 Chrome/CDP、认证 Cookie 完整请求捕获门禁与只读 Session 验证、Workspace 自动识别与两人唯一匹配、选择性 Alias 接管、幂等 Team 导入、母号归属与按需创建、已用完池、IMAP 精确收件与代理隔离、Sub2API 告警 UID 消费与动作幂等、官方页面驱动的新号注册、失败下一子号 JSON 恢复、当前子号 PAT 刷新、刷新幂等与详细日志、子号 browser cookie 生命周期、正常子号换班、外部 iCloud 晋升、母号应急提拉、逐人清退反馈、Team 两人硬上限、无关待邀请阻断、退出前成员反馈、入组后成员反馈、双账号网络隔离、统一 Clash 第一跳、固定 HTTP/SOCKS 与受限 curl 命令输入、历史动态源字节流中继、TTL 缓存与并发隔离、BrowserForge 持久化、Chrome major 门禁、地域时区与 UTC 时钟一致性、PAT + Session 的 Sub2API 导出、私有原子文件恢复以及双目标可选推送。当前为 368 项测试，其中 362 项通过，6 项 Windows DPAPI 测试按 macOS 平台跳过。
 
 ## 隐私发布检查
 

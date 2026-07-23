@@ -2016,3 +2016,91 @@ OTP 填写后短暂等待页面反馈
 - 2026-07-23：物理删除旧不可达注册块后，BrowserRegisterFlow 23 项、五组联动 193 项全部通过；全量 365 项中 359 项通过、6 项 Windows DPAPI 按 macOS 平台跳过。Python compileall、JavaScript 语法、跟踪 JSON、`git diff --check` 和差异高置信秘密扫描通过；未读取或测试组二，未访问真实账号。
 - 2026-07-23：保留重启前队列未暂停状态，直接通过 SQLite 暂停领取并确认活动 queue/run 均为 0；单次重启 LaunchAgent 后 PID 从 `37502` 变为 `49513`，HTTP 在 5 秒内恢复 `200`，重启窗口新增错误日志为 0。随后数据库迁移元数据为 `ready`、schema v7、`quick_check=ok`，恢复队列未暂停状态后活动 queue/run 仍为 0。全程未读取组二 Workspace、账号、成员或邀请。
 - 2026-07-23：主实现提交 `09d8fba` 已推送 GitHub `main`；推送前 `git fetch` 确认本地与远端基线双向差异均为 0。用户原有 `.DS_Store` 保持未跟踪，未删除、未暂存、未提交。
+
+### 节点 AF：iCloud HME 写会话假健康修复与组 2 手工换班对账（完成）
+
+#### AF.1 目标与性能指标
+
+用户现场表现为“iCloud 检测通过，点一键换班后却立即报 iCloud 被拒绝”；同时组 2 已由用户手工换到新子号，需要以远端 Team 成员事实校正本地绑定。本节以“先消除假健康，再恢复可重复的 HME 读写闭环”为目标：
+
+- “登录更新 HME”只能保存真实浏览器 HME 请求中的完整 Cookie/请求上下文，不再用“旧模板 + 3 个核心 Cookie”直接进入成功终态。
+- 资源池 `ready` 必须表示当前持久化会话至少是来自权威 `/v2/hme/list` 请求并通过远端列表验证；仅检测到 Apple 登录 Cookie 时保持“验证中”，不假报可写。
+- 一键换班在创建 Alias 前仍先检查 mailbox `ready`，且任何 HME `401/403/421` 继续收敛为 `session_invalid`；不自动重放、不生成第二个 Alias。
+- 离线回归覆盖权威捕获、Cookie 完整性、无 list 请求超时、检测状态和换班拒绝语义；不使用真实 Alias 作为测试样本。
+- 组 2 只执行远端成员只读核对；若远端子号已是本地 `recoil_chugs9y@icloud.com`，不写数据库；只有不一致时才备份后原子更新本地 current child，不邀请、踢人、退出、注册或创建 PAT。
+- 上线前确认队列和 run 无 active，备份 SQLite 并校验源库/备份 `quick_check=ok`；单次重启在 60 秒内恢复 HTTP 200、migration ready 和队列原状态。
+
+#### AF.2 GitHub 与现场证据
+
+- GitHub [`ultra2207/Accounts-Generator-public`](https://github.com/ultra2207/Accounts-Generator-public) HEAD `d7a7203b9358afebfa2d43cfcd5ec22651d40ee5` 的 HME 实现对 list/generate/reserve 共用完整 Cookie，并保留 `Origin`/`Referer`、`Sec-Fetch-*`、`Accept-Language` 和 UA 客户端提示；不把 3 个核心 Cookie 当作完整写会话。
+- GitHub [`heartmore/icloud-hme`](https://github.com/heartmore/icloud-hme) HEAD `40a1d847c6886d5ad641b3fd0e9dec90f90be389` 同样对 list/generate/reserve 复用同一 requests Session 与全量 Cookie，先经 setup validate 解析当前 maildomain service URL；说明 HME host/build 会演进，不应依赖旧模板外推新会话。
+- GitHub [`not-knope/Hide-My-Email-iCloud-Manager`](https://github.com/not-knope/Hide-My-Email-iCloud-Manager) HEAD `b38567de55bedc9feb86d1bb50f876a3cf53515e` 也以全量 Cookie 和浏览器同源请求头访问 HME；其固定 host/build 只作为对照，不纳入本项目契约。
+- 生产路径证据：检测调用 `GET /v2/hme/list`，换班首个远端写操作调用 `POST /v1/hme/generate`；后者的 `401/403/421` 会将 mailbox 置为 `session_invalid`。
+- 2026-07-23 21:09 持久化的生产 HME Session 恢好只有 `X-APPLE-DS-WEB-SESSION-TOKEN`、`X-APPLE-WEBAUTH-TOKEN`、`X-APPLE-WEBAUTH-USER` 三个 Cookie，与 `_session_from_authenticated_context()` 的回退输出完全一致；因此已证明本次 ready 由回退会话产生，而非真实 HME list 请求捕获。
+
+#### AF.3 动态控制结构与最小充分模型
+
+```text
+可见 Apple 登录窗口
+  -> setup validate 200 / 核心 Cookie 出现（仅为“已认证”测量）
+  -> 引导浏览器进入 Hide My Email 界面
+  -> 真实 GET /v2/hme/list 200
+  -> 捕获该请求的 URL + 全量 Cookie + 必要浏览器请求头
+  -> 服务端只读 list 复验
+  -> 加密持久化 -> mailbox ready
+
+仅有核心 Cookie / 未发生 list / list 被拒绝 / 超时
+  -> 不持久化候选会话 -> mailbox 不进入 ready -> 结构化可重试失败
+
+组 2 本地 current child + 已保存子号 Session
+  -> 刷新同一身份的 session
+  -> GET Team members（只读）
+  -> 远端唯一非母号成员 == 本地 current child：无写入
+     否则：停止并仅在有可验证本地账号对应时执行备份后原子校正
+```
+
+控制对象是 Apple HME 会话和 Team 成员绑定随时间的演化；浏览器真实 list 请求、Apple HTTP 状态、Team members 和 SQLite 绑定是测量；捕获器、Web controller 和对账逻辑是控制器；可见浏览器、HME client、ChatGPT client 和数据库事务是执行器；Cookie 过期、Apple 页面跳转、网络时延与手工换班时序是扰动。稳定性约束是不用局部成功代替最终可用性、不在事实不明时执行远端写操作。
+
+#### AF.4 实施节点
+
+- [x] 确认 `main` 与 `origin/main` 同步、只有用户原有 `.DS_Store` 未跟踪；当前 LaunchAgent PID `49513` 且本地 HTTP 可用。
+- [x] 定位 list 检测与 generate/reserve 写路径的差异，证明生产会话是 3-Cookie 回退产物，并完成三个 GitHub 对照。
+- [x] 先写失败回归：核心 Cookie 只能发出“已认证”信号，不得在无真实 list 请求时保存会话；真实 list 捕获保留全量 Cookie 与浏览器上下文。
+- [x] 对捕获器做最小修改：移除 3-Cookie 成功回退，登录后有界地引导到 HME 页面并等待权威 list 请求；不捕获页面全文、密码、2FA 或额外 storage state。
+- [x] 检查 HME client 是否需要保留被白名单允许的 `Accept-Language`/`Sec-Fetch-*`/客户端提示；现有元数据已保留同一 host/query/origin/referer/UA，且对照实现中基础请求头 + 完整 Cookie 即可共用 list/generate/reserve，因此不扩展会话 schema。
+- [x] 通过现有子号 session 对组 2 Team members 做只读核对；实时 GET 经主二既有中继超时，未发生写操作，随后使用无更新 run 覆盖的最新远端成员反馈完成对账：15:38 成功 run 确认两人、旧号不在、`recoil_chugs9y@icloud.com` 在组。
+- [x] 组 2 本地 current child 已是 `recoil_chugs9y@icloud.com`，账号 `bound_current`、Alias active、母号归属匹配、next child 为空；对账一致，无数据库写入。
+- [x] 运行 HME capture/client/Web/Database 聚焦回归，再运行全量测试、`compileall`、JavaScript 语法、`git diff --check` 和差异秘密扫描；同步 README、CHANGELOG 与本节记录。
+- [x] 备份生产 SQLite，暂停队列并确认无 active run；首次重启只读冒烟发现事件泵竞态后完成一次纠正重启，两次均在 60 秒内恢复，并验证 HTTP、migration、`quick_check`、队列和新错误日志后恢复原队列状态。
+- [x] 提交并推送 GitHub `main`，保留 `.DS_Store` 不纳入提交，清理仅为本节创建的临时 GitHub 对照目录。
+
+#### AF.5 验收场景
+
+1. 浏览器只出现 setup validate 200 或 3 个核心 Cookie，但未观测到 HME list 时，捕获不返回 session，最终给出 `hme_capture_no_list_request`。
+2. 真实 `/v2/hme/list` 200 发生时，从该请求构建 session，保留当时全量 Cookie，并经 controller 再次 list 验证后才持久化为 ready。
+3. list 非 200、请求字段不完整、浏览器关闭、取消或超时都不覆盖已保存会话，错误状态不包含 Cookie/token/账号密钥。
+4. HME list/generate/reserve 继续使用同一个 host、dsid、client id/build、Origin/Referer、UA 和 Cookie，不改变 Alias 两阶段创建及失败补偿语义。
+5. 组 2 远端 Team 仅有母号和用户手工换入的子号；本地 current child 与该子号一致，next child 为空，对账不产生邀请/踢人/退出/PAT/Sub2API 写操作。
+6. 部署后控制台在 60 秒内恢复，队列无遗留 active 任务，数据库正常，已存的组 1 和非目标账号无变化。
+
+#### AF.6 回滚、上线与安全边界
+
+- 本节不通过真实 `generate/reserve` 证明修复，不会为测试创建或停用 Alias；修复后的第一次真实闭环由用户重新执行“登录更新 HME”后的正常换班触发。
+- 捕获器不读取 Apple 密码、2FA 内容、页面全文或无关 Cookie；持久化字段仍经 host/path/origin 白名单和加密存储。
+- 组 2 只读核对失败时不猜测新子号、不修改本地绑定；远端成员多于 2 人、身份不完整或 session 无效均是停止条件。
+- 代码回滚到上一 Git 提交不自动恢复旧会话为 ready；数据修正若发生，仅可从本节上线前备份中恢复，不手工拼接加密 blob。
+- 部署仅允许一次有界重启；若 HTTP 在 60 秒内不恢复，立即恢复上一版代码并重启，不留在暂停队列或无服务状态等待人工。
+
+#### AF.7 实施记录
+
+- 2026-07-23：用户报告 iCloud 检测通过但一键换班报拒绝，并要求把组 2 子号更新为手工换入的账号。当前本地组 2 current child 已是 `recoil_chugs9y@icloud.com`、next child 为空，但仍需远端 Team members 只读证据才能判定无需写入。
+- 2026-07-23：生产 HME Session 的 host/build 已是当前 Apple 返回值，但 Cookie 名称集恰好为回退函数硬编码的 3 项；结合 list 成功、generate 拒绝，根因收敛为“用认证存在替代完整 HME 请求上下文并标记 ready”。
+- 2026-07-23：备份时间线显示 7 月 18 日原始 HME 会话有 18 个 Cookie，7 月 19 日自动更新后被截成 3 个；这个旧会话仍在 7 月 23 日 14:40 成功创建 Alias，而 21:09 再登录产生的新 3-Cookie 会话出现 list 通过、generate 拒绝。结论是早已存在的会话截断缺陷被 Apple 新会话/写接口授权校验暴露，不是 iCloud 账号整体失效。
+- 2026-07-23：先增加“无 list 不得返回会话”的失败门禁，旧实现按预期失败；修复后 20 项 HME capture/client 回归通过。真实持久 profile 只读确认存在 18 个 Cookie，iCloud+ 页面存在唯一“隐藏邮件地址”语义按钮；本次不落库冒烟的 CDP 启动有抖动，已改为 30 秒总预算内短握手重试。
+- 2026-07-23：组 2 最新成功 run 的远端 `member_verify` 证明 `recoil_chugs9y@icloud.com` 已在组、旧号已离开且活跃成员恰为 2；本地 current child 及关联状态全部一致，因此未更新 SQLite，也未邀请、踢人、退出、注册、创建 PAT 或推送 Sub2API。
+- 2026-07-23：初版 HME capture/client 20 项与 HME、Web、Database 聚焦回归 121 项通过；现场事件泵竞态修正后分别增至 21 项与 122 项，全量 368 项中 362 项通过、6 项 Windows DPAPI 按 macOS 平台跳过。Python `compileall`、JavaScript 语法和 `git diff --check` 通过。
+- 2026-07-23：首次部署后 LaunchAgent PID 从 `49513` 更新为 `20276`，HTTP 在 6 秒内恢复；迁移 `ready`、schema v7、源库 `quick_check=ok`、队列保持暂停且活动 queue/run 为 0。只读 HME 冒烟确认浏览器已认证、iCloud+ 页面两次 `/v2/hme/list` 均为 200，但捕获线程停在 `verifying`；已取消该次捕获，未保存会话或调用 generate/reserve。
+- 2026-07-23：进一步用同一 CDP 页面只读复现，确认 HME iframe 目标切换会让 `request.all_headers()` 出现竞态，同时原等待循环的 `threading.Event.wait()` 不会持续泵送 Playwright 网络事件；最小修正为等待期 `page.wait_for_timeout(250)`，并在完整头读取失败时使用缓存请求头与 `context.cookies(request_url)`。现场观测后者返回 18 个 Cookie 且可成功解析，未打印 Cookie 值。
+- 2026-07-23：上线前在线备份 `backups/console-pre-hme-session-capture-20260723-215519.sqlite` 权限为 `0600`，源库与备份均 `quick_check=ok`。首次 PID `49513 -> 20276` 在 6 秒恢复，纠正部署 PID `20276 -> 47516` 在 5 秒恢复；两次迁移均 `ready`、schema v7、活动 queue/run 为 0，新增日志仅为既有 `sub2api_current_child_mapping_ambiguous`。
+- 2026-07-23：纠正部署后的唯一重试在约 35 秒内进入 `captured`；加密落库会话包含 18 个不重复 Cookie，其中 15 个为核心三项之外的上下文 Cookie。随后现有检测对 HME list、转发地址和 IMAP 全部通过，资源池恢复 `ready`，只读远端 Alias 数为 67；全程未调用 generate/reserve，最后恢复队列未暂停状态且活动 queue/run 仍为 0、源库 `quick_check=ok`。
+- 2026-07-23：提交前 `git fetch origin` 确认 `main` 与 `origin/main` 双向差异均为 0；差异格式和高置信秘密扫描通过，仅保留 6 个目标跟踪文件。用户原有 `.DS_Store` 未纳入提交，本节 3 个 GitHub 对照克隆已从临时目录移入废纸篓，可恢复且不再占用项目工作区。

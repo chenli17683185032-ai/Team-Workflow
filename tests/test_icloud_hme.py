@@ -101,6 +101,7 @@ class ICloudHmeTests(unittest.TestCase):
                         "X-APPLE-DS-WEB-SESSION-TOKEN",
                         "X-APPLE-WEBAUTH-USER",
                         "X-APPLE-WEBAUTH-TOKEN",
+                        "X-APPLE-WEBAUTH-HSA-TRUST",
                     )
                 )
             ],
@@ -110,6 +111,7 @@ class ICloudHmeTests(unittest.TestCase):
         self.assertEqual(session.origin, "https://www.icloud.com.cn")
         self.assertEqual(session.user_agent, "Captured Browser")
         self.assertIn("X-APPLE-WEBAUTH-TOKEN=captured-2", session.cookie)
+        self.assertIn("X-APPLE-WEBAUTH-HSA-TRUST=captured-3", session.cookie)
 
         header_session = parse_hme_request(
             URL,
