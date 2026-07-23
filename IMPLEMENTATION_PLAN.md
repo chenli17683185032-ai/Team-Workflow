@@ -2218,3 +2218,105 @@ curl 文本 -> shlex 分词 -> 忽略 -L/--location
 - 2026-07-23：同一 Linkup 固定入口经 Clash 前置时，HTTP 模式对两个 OpenAI 域名均停在 TLS 前；强制 SOCKS5 后分别约 2.4 秒和 3.1 秒完成 TLS并获得站点响应，证明协议模式是首个失效环节。
 - 2026-07-23：精确主机覆写、存量 HTTP source 运行时兼容、普通/近似主机不回归和 `-L/--location` 共随 Proxy/Web 62 项回归通过；Python 编译、差异检查和真实凭据扫描通过。首轮 LaunchAgent PID `44150 -> 50700`，HTTP 在 6 秒内恢复，迁移 ready、数据库 `quick_check=ok`、队列恢复未暂停且活动运行 0。
 - 2026-07-23：现场重试已通过旧号登录、邀请、旧号退出并进入新号官方注册页，证明 SOCKS5 链路生效；其后失败点为独立的 OTP 控件歧义，本节点未修改。待运行结束后加载存量 source 兼容补丁，PID `50700 -> 58827`，HTTP 仍在 6 秒内恢复，数据库与队列保持正常。
+
+### 节点 AI：OpenBrowser 隔离环境与新子号手工登录接力（进行中）
+
+#### AI.1 目标与性能指标
+
+把新子号注册从自动 Playwright/BrowserForge 执行器改为 OpenBrowser 独立持久环境中的人工登录，同时保留现有 Alias 创建、旧号登录、邀请、旧号退出、Team 成员反馈、PAT、CPA/Sub2API JSON 和推送闭环：
+
+- 用户点击现有“一键换班”后，系统继续自动创建且只创建一个 iCloud HME Alias，登录旧子号、邀请新 Alias 并退出旧子号。
+- 在任何旧号邀请/退出写操作前，系统必须确认 OpenBrowser Local API 可用、API Key 正确，并为新账号从用户显式配置的环境池中独占分配一个存在且未被其他账号绑定的环境。
+- 新号阶段不再调用自动注册器，不自动填写邮箱、密码、OTP 或资料；系统只启动新号绑定的 OpenBrowser 环境并打开 ChatGPT 官方登录入口，随后等待用户在可见页面中手工完成登录。
+- 等待必须有明确的 `new_login` 运行状态、可见日志、取消入口和有界超时；用户不操作时最多等待配置时限后结构化失败，不能无限占用队列。
+- 程序只在同一 OpenBrowser 环境中读到 ChatGPT session、session 邮箱与目标 Alias 一致，并能切换到目标 Workspace 后才关闭该环境并继续；局部页面跳转、任意已登录账号或口头确认均不能代替反馈。
+- 后续继续复用现有 `new_login -> member_verify -> pat -> cpa -> sub2api_export -> push` checkpoint；Team 成员必须恰好满足两人上限、旧子号已离开且新子号已加入，之后才生成 PAT/JSON。
+- 一个 OpenBrowser Profile 永久绑定一个 OpenAI 账号；失败和重试复用原 Profile，不清 Cookie、不换环境，不把已绑定环境重新分配给其他账号。
+- OpenBrowser API Key、ChatGPT session、Cookie、代理和环境本地路径不得进入日志、前端响应、计划或 Git；API 只允许回环地址。
+
+#### AI.2 GitHub 参考与采用结论
+
+- 用户指定的 GitHub [`lyu0805/OpenBrowser`](https://github.com/lyu0805/OpenBrowser) 当前 HEAD `19554a8652777373f638143655087373471af93a`（2026-07-23）提供独立 Chromium Profile、按环境代理/指纹、Local API、CDP 和 RPA；项目自身明确不保证匿名、指纹唯一或特定网站兼容性，因此本项目只依赖“本地存储隔离和持久环境”契约，不承诺平台风控结果。
+- OpenBrowser Local API 默认监听 `127.0.0.1:50325`，以 `api-key` 鉴权；`GET /api/v1/user/list` 返回环境 ID、运行状态和 CDP 端口，`POST /api/v1/browser/start` 精确启动一个既有环境，`POST /api/v1/browser/stop` 精确关闭该环境。
+- OpenBrowser 启动时为每个环境使用独立 `--user-data-dir`，CDP 端口随机且只在回环地址可达；停止接口优先通过 `Browser.close` 优雅退出，并保留该环境持久数据。
+- 当前上游 Local API 没有创建 Profile 的 HTTP 端点。第一条可重复闭环不修改或 fork OpenBrowser 本体，而是让用户先在 OpenBrowser UI 中建立空白环境池；Team 工具只管理用户明确列入配置的 Profile ID。环境池耗尽时在任何 Team 写操作前停止。
+- 现有 `WorkflowRunner` 已有加密完整 checkpoint、账号级 runtime identity、单运行队列和最终 session/Team/PAT 反馈；采用“账号 runtime identity 保存 OpenBrowser Profile ID + 新号阶段 CDP 只读验收”的最小改动，不重写旧号登录和下游导出器。
+
+#### AI.3 动态控制结构与最小充分模型
+
+```text
+点击一键换班
+  -> OpenBrowser API/环境池预检
+  -> 为目标 Alias 预留且绑定唯一空白 Profile
+  -> 创建一个 HME Alias
+  -> 旧号登录 -> 邀请新 Alias -> 旧号退出并回读
+  -> 启动目标 Profile -> 打开官方登录入口
+  -> 用户手工完成邮箱/OTP/资料/邀请进入
+  -> 同 Profile CDP 轮询：ChatGPT session + 目标邮箱
+  -> 使用该 session 切换并核验目标 Team
+  -> 精确停止目标 Profile
+  -> member_verify -> PAT -> CPA/Sub2API JSON -> 可选推送 -> 原子晋升
+
+API 不可用 / Key 错误 / 环境池为空 / Profile 已绑定或正在运行
+  -> Team 写操作前停止
+
+超时 / 用户关闭窗口 / 登录错账号 / session 缺失 / Team 不可访问
+  -> 不生成 PAT/JSON、不晋升账号
+  -> 保留 Alias、邀请、checkpoint 和 Profile 绑定供同一任务重试
+```
+
+控制对象是 Alias、Team 成员和新账号认证状态随人工操作演化的联合过程；OpenBrowser API 状态、CDP 页面/session、目标邮箱、Workspace session 和 Team members 是测量；队列、WorkflowRunner 与 OpenBrowser 客户端是控制器；HME、旧号客户端、OpenBrowser 可见环境和 ChatGPT 客户端是执行器；人工时延、窗口关闭、登录错号、网络/代理、OpenBrowser 退出和上游页面变化是不确定环境。稳定性约束是先完成环境资源预检，再允许不可逆的旧号动作；没有最终反馈绝不进入 PAT/JSON。
+
+#### AI.4 实施节点
+
+- [x] 拉取并只读审计 OpenBrowser HEAD，确认 Local API 鉴权、环境列表、单环境启停、CDP 端口、持久 `user-data-dir`、优雅关闭及“不提供 HTTP 创建环境”边界。
+- [x] 对照当前 Workflow、TaskQueue、数据库 runtime identity、设置 API 和控制台，确定以预建环境池和账号永久绑定形成最小闭环，不修改 OpenBrowser 上游源码。
+- [x] 先增加 OpenBrowser 客户端失败回归：只允许回环 base URL、API envelope/鉴权错误、环境列表、启动/停止、Profile 不存在、占用冲突和响应脱敏。
+- [x] 实现最小 `OpenBrowserClient`，使用标准 HTTP 与既有 Playwright CDP 连接；API Key 只从加密设置读取，错误不带响应正文或凭据。
+- [x] 扩展账号 runtime identity，允许并校验 `openbrowser_profile_id`；从用户显式配置的 Profile 池中原子选择未绑定环境，首次分配后永久绑定，重试幂等复用。
+- [x] 在“一键换班”创建 Alias/入队前增加 OpenBrowser 预检；API 不可用、环境池不足或候选正在运行时不创建 Alias、不邀请、不清退。
+- [x] 重写新号执行边界：只启动已绑定 OpenBrowser Profile、打开官方入口并有界等待人工登录；不调用 `RegistrarAdapter.register()`，不自动填写或提交注册表单。
+- [x] 从同一 CDP context 只读提取 session，严格校验目标邮箱；再用现有 ChatGPT 客户端切换目标 Workspace。成功后加密写入 `new_login` checkpoint 和账号 browser session，并精确停止该 Profile。
+- [x] 禁止手工模式在 `new_workspace` 失败时回退自动 OTP 登录；登录错号、窗口关闭、超时和 Workspace 不可访问均保持同账号/Profile 可恢复失败。
+- [x] 更新队列快照和本地控制台：设置 OpenBrowser API 地址、加密 API Key、显式 Profile ID 池和人工登录时限；展示连接/可用池状态、当前“等待手工登录”状态和明确的取消动作。
+- [x] 覆盖正常换班、提拉、重试、进程恢复、环境池耗尽、并发占用、登录错号、窗口关闭、超时、Team 未加入、成功后单环境关闭和后续 PAT/JSON 顺序测试。
+- [x] 恢复离线 CLI 导入契约：`team_protocol.cli` 只被导入时不加载 OpenBrowser 的 `requests`/Playwright 网络依赖；只在实际创建 Local API 客户端或连接 CDP 时延迟加载。
+- [x] 运行 OpenBrowser/Workflow/TaskQueue/Database/Web 聚焦测试，再运行全量测试、`compileall`、JavaScript 语法、`git diff --check` 和秘密扫描；更新 README、CHANGELOG 与本节实施记录。
+- [ ] 本机安装或启动用户指定 OpenBrowser，建立最小空白 Profile 池并以本地 API 只做版本、列表、单环境启停和 CDP 空白页冒烟；不登录真实账号、不读取其他环境 Cookie。
+- [x] 队列空闲时备份生产 SQLite并校验源库/备份 `quick_check=ok`；部署服务重启控制在 60 秒内，验证 HTTP、migration、队列原状态和新增错误日志。
+- [ ] 用户明确点击一次正常换班后，以一个真实 Alias 完成人工接力 canary；每个不可逆节点写后回读，失败不新建第二个 Alias、不自动换 Profile。
+- [ ] 验收通过后提交并推送 GitHub `main`；删除本轮临时 OpenBrowser 参考克隆与测试产物，保留用户原有 `.DS_Store` 和正式 OpenBrowser Profile 数据。
+
+#### AI.5 验收场景
+
+1. OpenBrowser 未启动、API Key 错误、base URL 非回环、配置 Profile 不存在/已运行/已绑定或池为空时，一键换班在 HME Alias 创建及 Team 邀请前失败，现有账号和成员不变。
+2. 首次运行从显式池中选择一个未绑定 Profile 并持久绑定到新账号；同一 run 重试仍使用该 ID，另一个账号永远不能获得该 ID。
+3. 旧号邀请和退出完成后，OpenBrowser 只启动目标 Profile；页面可见且用户可手工输入，应用不自动操作邮箱、OTP、密码、资料或挑战。
+4. 用户未操作时运行显示“等待手工登录”，到达时限后有界失败；取消或关闭窗口立即停止等待，且不生成 PAT/JSON、不晋升、不分配第二个环境。
+5. 登录错误邮箱时程序拒绝继续并保持浏览器可供用户纠正；只有 session 邮箱等于目标 Alias 且目标 Workspace 可切换时才保存 checkpoint。
+6. 成功后只关闭本次 Profile，不调用 stop-all、不影响其他正在运行的 OpenBrowser 环境；Profile 的 Cookie/存储保留用于账号后续登录。
+7. 后续 Team members 回读确认旧子号缺失、新子号存在且活跃成员不超过 2，随后才创建 PAT、CPA/Sub2API JSON 和可选推送，最终原子晋升新子号。
+8. 服务在人工等待期间重启后，同一 run、Alias、邀请和 Profile 绑定可恢复；重新领取时跳过已完成的旧号步骤并继续同一 Profile，不重复邀请/退出。
+9. API 响应、运行日志、前端 DOM、测试夹具和 Git 差异中不出现 OpenBrowser API Key、Cookie、session、邮箱验证码、代理凭据或 Profile 本地目录。
+
+#### AI.6 回滚、上线与安全边界
+
+- 功能通过设置显式启用；未配置 OpenBrowser 时不得静默回退到自动新号注册。代码回滚保留已绑定 Profile 数据，不自动复用、删除或清空任何 OpenBrowser 环境。
+- 不调用 OpenBrowser `stop-all`、Cookie 清理、批量同步或池外 Profile；只允许回环 API，API Key 加密保存，CDP 端口从已鉴权的启动/列表响应获取且不写日志。
+- 不以指纹浏览器规避 CAPTCHA、手机验证、账号停用或平台策略；这些状态由用户在官方页面处理或停止。OpenBrowser 只能提供本地 Profile 隔离，不能保证账号不被服务端关联或限制。
+- 人工登录等待失败后，旧号可能已经退出；系统保留母号/旧号可审计状态、邀请、Alias 和 checkpoint，不盲目回滚成员，也不创建第二个 Alias。用户重试只恢复同一 run 和 Profile。
+- 真实 canary 仅在离线回归、空队列、数据库备份和服务健康检查全部通过后由用户明确点击触发；不使用组 2 稳定账号做试验，不主动读取 OpenBrowser 中其他账号。
+
+#### AI.7 实施记录
+
+- 2026-07-24：用户确认新号从自动注册改为人工接力：点击开始后自动准备 Apple Alias、旧号邀请/清退；用户在隔离浏览器手工登录新号；程序随后关闭该页面并继续 JSON 等后续步骤。
+- 2026-07-24：拉取 OpenBrowser HEAD `19554a8` 完成只读审计。确认其 Local API 可列出/启动/停止既有 Profile 并返回回环 CDP 端口，每个环境使用独立持久 `user-data-dir`；上游没有 Profile 创建 HTTP API，因此采用“OpenBrowser UI 预建空白池 + Team 工具显式池内独占绑定”，不修改第三方本体。
+- 2026-07-24：新增最小 OpenBrowser 客户端与人工登录观察器；只允许带显式端口的回环 HTTP origin，错误不回显响应正文。观察器只打开官方 ChatGPT 首页、读取同一 CDP context 的 session 并调用上层验证，不填写注册控件；成功、取消和失败均精确停止目标 Profile。OpenBrowser 离线 8 项测试通过。
+- 2026-07-24：账号加密 runtime identity 新增 `openbrowser_profile_id`，在 `BEGIN IMMEDIATE` 事务内扫描绑定并从显式池中唯一预留；首次绑定与账号网络身份一并加密，重试保持原值，池耗尽或重复绑定明确失败。HME handoff 在创建新账号的同一事务内完成预留，失败由既有补偿边界停用刚创建的远端 Alias。
+- 2026-07-24：控制台新增回环地址、Profile 池、人工超时和加密 API Key 设置，以及不暴露 Profile 细节的容量状态接口。“开始”在 HME `create_alias` 前完成 Local API、Profile 存在性、运行状态和池容量预检；聚焦验证覆盖未配置零远端写、正常换班和救援重试。
+- 2026-07-24：正常换班与母号提拉的新号阶段均改为 OpenBrowser 人工接力；任务执行前再次复检绑定 Profile，排队期间缺失或占用会在 Team 写操作前停止。人工模式从同一 CDP context 读 session，以目标邮箱和 Workspace 双反馈为放行条件，同时写入 `new_login`/`new_workspace` 加密 checkpoint 与账号 browser session；不调用 Registrar 新号注册，也不回退 `new_workspace_login` OTP。
+- 2026-07-24：队列快照增加 `manual_login_state`，页面显示等待手工登录、错号、等待 Team、验证和关闭状态，停止按钮沿用现有协作取消。离线覆盖错号纠正、Team 延迟、窗口关闭、超时、取消、单 Profile 停止、PAT 顺序和秘密脱敏；OpenBrowser/Database/Workflow/TaskQueue/Web Console 共 189 项聚焦回归通过。
+- 2026-07-24：首轮 390 项全量回归发现离线 `team_protocol.cli` 导入会被 OpenBrowser 顶层 `requests` 依赖破坏；将 Local API session 与对应网络异常类延迟到客户端实例化后，离线导入与 OpenBrowser 客户端 13 项聚焦回归通过。
+- 2026-07-24：修复后全量 390 项通过，6 项 Windows DPAPI 在 macOS 正常跳过；`compileall`、JavaScript 语法、`git diff --check` 和只返回文件名的高置信秘密扫描通过。控制台在 `1440x900` 与 `390x844` 验证 OpenBrowser 设置、容量状态和队列栏，无水平溢出，可见控件均在视口内，浏览器控制台错误为 0。
+- 2026-07-24：部署前队列和运行活动项均为 0；生成 `backups/console-pre-openbrowser-20260724-011633.sqlite`，源库与备份均 `quick_check=ok`。LaunchAgent PID `58827 -> 25161`，26 秒内恢复 HTTP 200，migration `ready`、队列不暂停且仍无活动任务，重启窗口错误日志新增 0 行。
+- 2026-07-24：最终差异审计将 `requests` 统一延迟到 Local API 客户端实例化，并让人工登录状态复用容错事件出口；聚焦 14 项与全量 390 项再次通过。队列仍空闲后第二次有界重启 PID `25161 -> 30024`，7 秒内恢复 HTTP 200，migration 与 SQLite 正常，活动队列/运行均为 0，错误日志新增 0 行。

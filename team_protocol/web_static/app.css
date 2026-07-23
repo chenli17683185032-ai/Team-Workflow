@@ -1133,6 +1133,26 @@ input[readonly] {
   color: var(--danger);
 }
 
+.openbrowser-status-row {
+  display: flex;
+  min-height: var(--control-height);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 4px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.openbrowser-status-row[data-state="ready"] {
+  color: var(--success);
+}
+
+.openbrowser-status-row[data-state="unavailable"],
+.openbrowser-status-row[data-state="pool_exhausted"] {
+  color: var(--danger);
+}
+
 .field.is-invalid input,
 .field.is-invalid select {
   border-color: var(--danger);

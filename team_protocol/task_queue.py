@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .database import Database, StateConflictError
+from .openbrowser import (
+    parse_openbrowser_profile_ids,
+    validate_openbrowser_base_url,
+    validate_openbrowser_profile_id,
+)
 from .registrar import (
     MailboxCredentials,
     bind_proxy_sid,
@@ -677,6 +682,7 @@ class TaskQueue:
                         for step, _label in step_definitions
                     },
                     "error": "",
+                    "manual_login_state": None,
                     "logs": [],
                 }
                 self._bump_locked()
@@ -702,7 +708,25 @@ class TaskQueue:
                 )
 
             def on_event(event: Mapping[str, Any]) -> None:
-                if event.get("type") != "step":
+                event_type = str(event.get("type") or "")
+                if event_type == "manual_login":
+                    manual_state = str(event.get("state") or "")
+                    if manual_state not in {
+                        "profile_started",
+                        "waiting_for_user",
+                        "wrong_account",
+                        "waiting_for_team",
+                        "verified",
+                        "profile_stopped",
+                    }:
+                        return
+                    with self._condition:
+                        operation = self._run_operation
+                        if operation is not None and operation.get("run_id") == run_id:
+                            operation["manual_login_state"] = manual_state
+                            self._bump_locked()
+                    return
+                if event_type != "step":
                     return
                 step = str(event.get("step") or "")
                 state = str(event.get("state") or "")
@@ -1123,6 +1147,32 @@ class TaskQueue:
             new_account["id"],
             proxy_sid=generate_proxy_sid(),
         )
+        try:
+            openbrowser_profile_id = validate_openbrowser_profile_id(
+                new_identity.get("openbrowser_profile_id")
+            )
+            openbrowser_profile_ids = parse_openbrowser_profile_ids(
+                self._text_setting("openbrowser_profile_ids", "")
+            )
+            openbrowser_base_url = validate_openbrowser_base_url(
+                self._text_setting(
+                    "openbrowser_base_url", "http://127.0.0.1:50325"
+                )
+            )
+        except ValueError as exc:
+            raise StateConflictError("OpenBrowser run configuration is invalid") from exc
+        if openbrowser_profile_id not in openbrowser_profile_ids:
+            raise StateConflictError(
+                "bound OpenBrowser profile is outside the configured pool"
+            )
+        openbrowser_api_key = self._secret_setting("openbrowser_api_key")
+        if not openbrowser_api_key:
+            raise StateConflictError("OpenBrowser API key is not configured")
+        openbrowser_manual_timeout_seconds = self._int_setting(
+            "openbrowser_manual_timeout_seconds", 1800, minimum=60
+        )
+        if openbrowser_manual_timeout_seconds > 86_400:
+            raise StateConflictError("OpenBrowser manual login timeout is invalid")
         if old_identity["proxy_sid"] == new_identity["proxy_sid"]:
             raise StateConflictError("old and new accounts share the same proxy SID")
         legacy_profile = checkpoint.get("_fingerprint_profile")
@@ -1331,6 +1381,10 @@ class TaskQueue:
             persist_new_session=lambda token: self.database.set_account_browser_session(
                 str(new_account["id"]), token
             ),
+            openbrowser_base_url=openbrowser_base_url,
+            openbrowser_api_key=openbrowser_api_key,
+            openbrowser_profile_id=openbrowser_profile_id,
+            openbrowser_manual_timeout_seconds=openbrowser_manual_timeout_seconds,
         )
         known_secrets = tuple(
             sorted(
@@ -1351,6 +1405,7 @@ class TaskQueue:
                         sub2api_password,
                         sub2api_api_key,
                         sub2api_totp_secret,
+                        openbrowser_api_key,
                     )
                     if value
                 },

@@ -182,6 +182,7 @@ const state = {
   runs: [],
   queue: {items: [], paused: false},
   settings: {},
+  openbrowserStatus: null,
   migration: null,
   migrationBlocked: false,
   selectedWorkspaceIds: new Set(),
@@ -1990,6 +1991,15 @@ function runOperationQueueEntry(operation) {
     kind: operation.kind,
   };
   const operationState = safeString(operation.state, "running");
+  const manualLoginState = safeString(operation.manual_login_state);
+  const manualLoginLabels = {
+    profile_started: "正在打开隔离环境",
+    waiting_for_user: "等待手工登录",
+    wrong_account: "账号不匹配，请重新登录",
+    waiting_for_team: "等待进入目标 Team",
+    verified: "登录与 Team 已确认",
+    profile_stopped: "登录环境已关闭",
+  };
   const entry = element("li", {
     className: "queue-item queue-item--refresh",
     dataset: {state: operationState},
@@ -1998,7 +2008,9 @@ function runOperationQueueEntry(operation) {
   const copy = element("div", {className: "queue-item__copy"}, [
     element("strong", {text: `${runKindLabel(run)} · ${runWorkspaceLabel(run)}`}),
     element("span", {
-      text: operation.current_step
+      text: operation.current_step === "new_login" && manualLoginLabels[manualLoginState]
+        ? manualLoginLabels[manualLoginState]
+        : operation.current_step
         ? `${RUN_STATUS[operationState]?.[0] || operationState} / ${STEP_LABELS[operation.current_step] || operation.current_step}`
         : RUN_STATUS[operationState]?.[0] || operationState,
     }),
@@ -2141,6 +2153,9 @@ function safeSettings(payload, previous = {}) {
     pat_name: safeString(firstValue(settings, ["pat_name"])),
     pat_ttl: firstValue(settings, ["pat_ttl", "pat_ttl_seconds"], ""),
     invite_settle_seconds: firstValue(settings, ["invite_settle_seconds"], ""),
+    openbrowser_base_url: safeString(firstValue(settings, ["openbrowser_base_url"])),
+    openbrowser_profile_ids: safeString(firstValue(settings, ["openbrowser_profile_ids"])),
+    openbrowser_manual_timeout_seconds: firstValue(settings, ["openbrowser_manual_timeout_seconds"], ""),
     management_url: safeString(firstValue(settings, ["management_base_url", "management_url"])),
     management_filename: safeString(firstValue(settings, ["management_remote_name", "management_filename", "remote_filename"])),
     management_push: booleanValue(firstValue(settings, ["management_push", "push_management"], false)),
@@ -2154,12 +2169,28 @@ function safeSettings(payload, previous = {}) {
     sub2api_all_groups: booleanValue(firstValue(settings, ["sub2api_all_groups"], true)),
     sub2api_group_id: firstValue(settings, ["sub2api_group_id"], ""),
     proxy_configured: configuredSecret(secrets, ["proxy", "proxy_configured", "proxy_present"], previous.proxy_configured),
+    openbrowser_api_key_configured: configuredSecret(secrets, ["openbrowser_api_key", "openbrowser_api_key_configured"], previous.openbrowser_api_key_configured),
     management_api_key_configured: configuredSecret(secrets, ["management_api_key", "management_api_key_configured", "management_key_present"], previous.management_api_key_configured),
     sub2api_password_configured: configuredSecret(secrets, ["sub2api_password", "sub2api_password_configured", "sub2api_password_present"], previous.sub2api_password_configured),
     sub2api_api_key_configured: configuredSecret(secrets, ["sub2api_api_key", "sub2api_api_key_configured", "sub2api_api_key_present"], previous.sub2api_api_key_configured),
     sub2api_totp_secret_configured: configuredSecret(secrets, ["sub2api_totp_secret", "sub2api_totp_secret_configured", "sub2api_totp_secret_present"], previous.sub2api_totp_secret_configured),
     last_backup_path: safeString(firstValue(settings, ["last_backup_path", "backup_path"])),
     last_backup_at: firstValue(settings, ["last_backup_at"]),
+  };
+}
+
+function safeOpenBrowserStatus(payload) {
+  const source = payload && typeof payload === "object" ? payload : {};
+  return {
+    configured: Boolean(source.configured),
+    connected: Boolean(source.connected),
+    state: safeString(firstValue(source, ["state"], "not_configured")),
+    version: safeString(firstValue(source, ["version"])),
+    poolSize: Number(firstValue(source, ["pool_size"], 0)) || 0,
+    availableCount: Number(firstValue(source, ["available_count"], 0)) || 0,
+    boundCount: Number(firstValue(source, ["bound_count"], 0)) || 0,
+    runningCount: Number(firstValue(source, ["running_count"], 0)) || 0,
+    missingCount: Number(firstValue(source, ["missing_count"], 0)) || 0,
   };
 }
 
@@ -2226,6 +2257,7 @@ function renderSecretControls(form = byId("settings-form")) {
   const values = state.settings;
   const secretDefinitions = [
     ["proxy", "proxy-secret-state", "proxy_configured"],
+    ["openbrowser_api_key", "openbrowser-secret-state", "openbrowser_api_key_configured"],
     ["management_api_key", "management-secret-state", "management_api_key_configured"],
     ["sub2api_password", "sub2api-secret-state", "sub2api_password_configured"],
     ["sub2api_api_key", "sub2api-api-key-secret-state", "sub2api_api_key_configured"],
@@ -2245,6 +2277,28 @@ function renderSecretControls(form = byId("settings-form")) {
   }
 }
 
+function renderOpenBrowserStatus() {
+  const row = byId("openbrowser-status")?.closest(".openbrowser-status-row");
+  if (!row) return;
+  const status = state.openbrowserStatus;
+  if (!status) {
+    row.dataset.state = "not_configured";
+    byId("openbrowser-status").textContent = "尚未检测";
+    return;
+  }
+  row.dataset.state = status.state;
+  if (status.state === "not_configured") {
+    byId("openbrowser-status").textContent = "尚未配置";
+  } else if (status.state === "unavailable") {
+    byId("openbrowser-status").textContent = "Local API 无法连接";
+  } else {
+    const version = status.version ? ` · v${status.version}` : "";
+    const missing = status.missingCount ? ` · 缺失 ${status.missingCount}` : "";
+    const running = status.runningCount ? ` · 运行中 ${status.runningCount}` : "";
+    byId("openbrowser-status").textContent = `可用 ${status.availableCount} / ${status.poolSize} · 已绑定 ${status.boundCount}${running}${missing}${version}`;
+  }
+}
+
 function renderSettings({force = false} = {}) {
   if (state.settingsDirty && !force) return;
   const form = byId("settings-form");
@@ -2254,6 +2308,9 @@ function renderSettings({force = false} = {}) {
     "pat_name",
     "pat_ttl",
     "invite_settle_seconds",
+    "openbrowser_base_url",
+    "openbrowser_profile_ids",
+    "openbrowser_manual_timeout_seconds",
     "management_url",
     "management_filename",
     "sub2api_url",
@@ -2272,11 +2329,12 @@ function renderSettings({force = false} = {}) {
   }
   renderSub2APIGroupOptions(form, values.sub2api_group_id);
   syncSub2APIGroupMode(form);
-  for (const name of ["proxy", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"]) {
+  for (const name of ["proxy", "openbrowser_api_key", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"]) {
     const control = form.elements.namedItem(name);
     if (control) control.value = "";
   }
   renderSecretControls(form);
+  renderOpenBrowserStatus();
   byId("backup-status").textContent = values.last_backup_path
     ? `最近备份：${values.last_backup_path}${values.last_backup_at ? ` · ${formatDate(values.last_backup_at)}` : ""}`
     : "尚未创建备份";
@@ -2297,6 +2355,7 @@ function updateResource(name, payload) {
   if (name === "runs") state.runs = asList(payload, ["runs"]);
   if (name === "queue") state.queue = normalizeQueue(payload);
   if (name === "settings") state.settings = safeSettings(payload, state.settings);
+  if (name === "openbrowserStatus") state.openbrowserStatus = safeOpenBrowserStatus(payload);
   if (name === "sub2apiGroups") state.sub2apiGroups = safeSub2APIGroups(payload);
   if (name === "icloudTeamOwners") state.icloudTeamOwners = asList(payload, ["owners", "icloud_team_owners"]);
   if (name === "icloudMailboxes") {
@@ -2329,6 +2388,7 @@ async function refreshResources(names) {
     runs: "/api/runs",
     queue: "/api/queue",
     settings: "/api/settings",
+    openbrowserStatus: "/api/openbrowser/status",
     sub2apiGroups: "/api/sub2api/groups",
     icloudTeamOwners: "/api/icloud-team-owners",
     icloudMailboxes: "/api/icloud-mailboxes",
@@ -3863,6 +3923,8 @@ function settingsPayload(form) {
   const values = {
     output_dir: safeString(data.get("output_dir")).trim(),
     pat_name: safeString(data.get("pat_name")).trim(),
+    openbrowser_base_url: safeString(data.get("openbrowser_base_url")).trim(),
+    openbrowser_profile_ids: safeString(data.get("openbrowser_profile_ids")).trim(),
     management_base_url: safeString(data.get("management_url")).trim(),
     management_remote_name: safeString(data.get("management_filename")).trim(),
     management_push: data.get("management_push") === "on",
@@ -3872,14 +3934,14 @@ function settingsPayload(form) {
     sub2api_all_groups: data.get("sub2api_all_groups") === "on",
     sub2api_push: data.get("sub2api_push") === "on",
   };
-  for (const name of ["pat_ttl", "invite_settle_seconds", "sub2api_concurrency", "sub2api_load_factor", "sub2api_priority"]) {
+  for (const name of ["pat_ttl", "invite_settle_seconds", "openbrowser_manual_timeout_seconds", "sub2api_concurrency", "sub2api_load_factor", "sub2api_priority"]) {
     const raw = safeString(data.get(name)).trim();
     if (raw) values[name] = Number(raw);
   }
   const sub2apiGroupId = safeString(data.get("sub2api_group_id")).trim();
   values.sub2api_group_id = sub2apiGroupId ? Number(sub2apiGroupId) : "";
   const secrets = {};
-  for (const secretName of ["proxy", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"]) {
+  for (const secretName of ["proxy", "openbrowser_api_key", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"]) {
     const value = safeString(data.get(secretName));
     if (value && !state.clearSecrets.has(secretName)) secrets[secretName] = value;
   }
@@ -3903,12 +3965,29 @@ async function handleSettingsSubmit(form) {
   state.settings = safeSettings(response || {values: payload.values, secrets: state.settings});
   state.settingsDirty = false;
   state.clearSecrets.clear();
+  await loadResource("openbrowserStatus", "/api/openbrowser/status");
   renderSettings({force: true});
   byId("settings-save-state").textContent = `已保存 · ${formatDate(new Date().toISOString())}`;
   showToast("设置已保存", "success");
   void loadResource("sub2apiGroups", "/api/sub2api/groups").then(() => {
     renderSettings();
   });
+}
+
+async function testOpenBrowserConnection() {
+  const payload = await api("/api/openbrowser/test", {method: "POST"});
+  state.openbrowserStatus = safeOpenBrowserStatus(payload);
+  renderOpenBrowserStatus();
+  if (state.openbrowserStatus.connected) {
+    showToast("OpenBrowser 连接正常", "success");
+  } else {
+    showToast(
+      state.openbrowserStatus.state === "not_configured"
+        ? "请先保存 OpenBrowser 设置"
+        : "OpenBrowser Local API 无法连接",
+      "error",
+    );
+  }
 }
 
 document.addEventListener("click", (event) => {
@@ -4024,6 +4103,7 @@ document.addEventListener("click", (event) => {
     if (action === "retry-migration-cleanup") return retryMigrationCleanup();
     if (action === "create-backup") return createBackup();
     if (action === "restore-backup") return restoreBackup();
+    if (action === "test-openbrowser") return testOpenBrowserConnection();
     if (action === "toggle-secret-clear") {
       const secret = button.dataset.secret;
       if (state.clearSecrets.has(secret)) state.clearSecrets.delete(secret);
@@ -4079,7 +4159,7 @@ document.addEventListener("input", (event) => {
   } else if (target.closest("#icloud-team-import-form")) {
     updateIcloudTeamImportSubmitState();
   } else if (target.closest("#settings-form")) {
-    if (["proxy", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"].includes(target.name) && target.value) {
+    if (["proxy", "openbrowser_api_key", "management_api_key", "sub2api_password", "sub2api_api_key", "sub2api_totp_secret"].includes(target.name) && target.value) {
       state.clearSecrets.delete(target.name);
     }
     state.settingsDirty = true;
@@ -4291,6 +4371,7 @@ async function bootstrap() {
       loadResource("runs", "/api/runs"),
       loadResource("queue", "/api/queue"),
       loadResource("settings", "/api/settings"),
+      loadResource("openbrowserStatus", "/api/openbrowser/status"),
       loadResource("sub2apiGroups", "/api/sub2api/groups"),
       loadResource("icloudTeamOwners", "/api/icloud-team-owners"),
       loadResource("icloudMailboxes", "/api/icloud-mailboxes"),

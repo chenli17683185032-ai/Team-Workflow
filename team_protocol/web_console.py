@@ -67,6 +67,15 @@ from .migration import (
     validate_legacy,
     verify_backup,
 )
+from .openbrowser import (
+    DEFAULT_OPENBROWSER_BASE_URL,
+    OpenBrowserClient,
+    OpenBrowserError,
+    OpenBrowserProfile,
+    choose_openbrowser_profile,
+    parse_openbrowser_profile_ids,
+    validate_openbrowser_base_url,
+)
 from .secret_store import SecretStore, SecretStoreError
 from .registrar_runtime.appleemail_provider import MailboxCredentialsInvalidError
 from .registrar_runtime.icloud_imap_provider import (
@@ -74,7 +83,7 @@ from .registrar_runtime.icloud_imap_provider import (
     ImapMailboxError,
     check_imap_mailbox,
 )
-from .registrar import validate_proxy_url
+from .registrar import generate_proxy_sid, validate_proxy_url
 from .proxy_chain import (
     CHAIN_PROXY_MODE,
     ProxyChainError,
@@ -101,6 +110,7 @@ _SECRET_SETTING_KEYS = frozenset(
         "sub2api_password",
         "sub2api_api_key",
         "sub2api_totp_secret",
+        "openbrowser_api_key",
     }
 )
 _TEXT_SETTING_KEYS = frozenset(
@@ -121,6 +131,9 @@ _TEXT_SETTING_KEYS = frozenset(
         "sub2api_load_factor",
         "sub2api_all_groups",
         "sub2api_group_id",
+        "openbrowser_base_url",
+        "openbrowser_profile_ids",
+        "openbrowser_manual_timeout_seconds",
     }
 )
 _VISIBLE_TEXT_SETTING_KEYS = _TEXT_SETTING_KEYS | {
@@ -522,6 +535,7 @@ class WebConsoleController:
         hme_capture_manager: Any | None = None,
         workspace_lookup_service: Any | None = None,
         sub2api_alert_coordinator: Any | None = None,
+        openbrowser_client_factory: Any = OpenBrowserClient,
         enable_proxy_chains: bool = True,
         console_port: int = 8765,
     ) -> None:
@@ -580,6 +594,7 @@ class WebConsoleController:
                 refresh_callback=self._start_alert_refresh,
             )
         )
+        self.openbrowser_client_factory = openbrowser_client_factory
         self._proxy_chain_startup_error: str | None = None
         self._icloud_operation_lock = threading.Lock()
         self._dialog_lock = threading.Lock()
@@ -2229,6 +2244,14 @@ class WebConsoleController:
                             "run": last_run,
                         }
                     )
+            openbrowser_candidates = self._preflight_openbrowser_profile(
+                str(workspace["next_account_id"])
+            )
+            self.database.reserve_account_openbrowser_profile(
+                str(workspace["next_account_id"]),
+                openbrowser_candidates,
+                proxy_sid=generate_proxy_sid(),
+            )
             run = (
                 self.task_queue.enqueue_rescue(workspace_id)
                 if rescue
@@ -2255,6 +2278,7 @@ class WebConsoleController:
         mailbox = self.database.get_icloud_mailbox(owner["mailbox_id"])
         if mailbox["status"] != "ready":
             raise StateConflictError("iCloud mailbox must pass detection before handoff")
+        openbrowser_candidates = self._preflight_openbrowser_profile()
         if not self._icloud_operation_lock.acquire(blocking=False):
             raise StateConflictError("another iCloud mailbox operation is running")
         remote: Mapping[str, Any] | None = None
@@ -2300,6 +2324,8 @@ class WebConsoleController:
                     email=email,
                     remote_metadata=remote,
                     label=label,
+                    openbrowser_profile_ids=openbrowser_candidates,
+                    openbrowser_proxy_sid=generate_proxy_sid(),
                 )
             except DatabaseError:
                 anonymous_id = (
@@ -2655,6 +2681,150 @@ class WebConsoleController:
         }
         return {"values": values, "secrets": configured}
 
+    def _openbrowser_config(self) -> tuple[str, str, tuple[str, ...], int]:
+        base_url = str(
+            self.database.get_text_setting(
+                "openbrowser_base_url", DEFAULT_OPENBROWSER_BASE_URL
+            )
+            or DEFAULT_OPENBROWSER_BASE_URL
+        ).strip()
+        raw_profile_ids = str(
+            self.database.get_text_setting("openbrowser_profile_ids", "") or ""
+        )
+        api_key_blob = self.database.get_secret_setting("openbrowser_api_key")
+        api_key = "" if api_key_blob is None else api_key_blob.decode("utf-8").strip()
+        try:
+            clean_base_url = validate_openbrowser_base_url(base_url)
+            profile_ids = parse_openbrowser_profile_ids(raw_profile_ids)
+            timeout_seconds = int(
+                self.database.get_text_setting(
+                    "openbrowser_manual_timeout_seconds", "1800"
+                )
+                or "1800"
+            )
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise StateConflictError("OpenBrowser settings are invalid") from exc
+        if not api_key or not profile_ids:
+            raise StateConflictError("OpenBrowser is not configured")
+        if not 60 <= timeout_seconds <= 86_400:
+            raise StateConflictError("OpenBrowser manual login timeout is invalid")
+        return clean_base_url, api_key, profile_ids, timeout_seconds
+
+    def _query_openbrowser(
+        self,
+        base_url: str,
+        api_key: str,
+    ) -> tuple[str, list[OpenBrowserProfile]]:
+        client = None
+        try:
+            client = self.openbrowser_client_factory(
+                base_url,
+                api_key,
+                timeout=10.0,
+            )
+            version = str(client.version())
+            profiles = list(client.list_profiles())
+        except (OpenBrowserError, OSError, TimeoutError, ValueError) as exc:
+            raise StateConflictError("OpenBrowser Local API is unavailable") from exc
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        return version, profiles
+
+    def _preflight_openbrowser_profile(
+        self,
+        account_id: str | None = None,
+    ) -> tuple[str, ...]:
+        base_url, api_key, configured_ids, _timeout_seconds = self._openbrowser_config()
+        _version, profiles = self._query_openbrowser(base_url, api_key)
+        bound_ids = self.database.list_bound_openbrowser_profile_ids()
+        existing_id = ""
+        if account_id:
+            identity = self.database.get_account_network_identity(str(account_id))
+            existing_id = str(identity.get("openbrowser_profile_id") or "").strip()
+            if existing_id and existing_id not in configured_ids:
+                raise StateConflictError(
+                    "bound OpenBrowser profile is outside the configured pool"
+                )
+        try:
+            selected = choose_openbrowser_profile(
+                profiles,
+                configured_ids,
+                bound_ids,
+                existing_id=existing_id,
+            )
+        except (OpenBrowserError, ValueError) as exc:
+            raise StateConflictError("no usable OpenBrowser profile is available") from exc
+        if selected.running:
+            raise StateConflictError("OpenBrowser profile is already running")
+        if existing_id:
+            return (selected.profile_id,)
+        by_id = {profile.profile_id: profile for profile in profiles}
+        bound = set(bound_ids)
+        candidates = tuple(
+            profile_id
+            for profile_id in configured_ids
+            if profile_id in by_id
+            and not by_id[profile_id].running
+            and profile_id not in bound
+        )
+        if not candidates:
+            raise StateConflictError("no usable OpenBrowser profile is available")
+        return candidates
+
+    def get_openbrowser_status(self) -> dict[str, Any]:
+        try:
+            base_url, api_key, profile_ids, _timeout_seconds = self._openbrowser_config()
+        except StateConflictError:
+            return {
+                "configured": False,
+                "connected": False,
+                "state": "not_configured",
+                "version": "",
+                "pool_size": 0,
+                "available_count": 0,
+                "bound_count": 0,
+                "running_count": 0,
+                "missing_count": 0,
+            }
+        try:
+            version, profiles = self._query_openbrowser(base_url, api_key)
+        except StateConflictError:
+            return {
+                "configured": True,
+                "connected": False,
+                "state": "unavailable",
+                "version": "",
+                "pool_size": len(profile_ids),
+                "available_count": 0,
+                "bound_count": 0,
+                "running_count": 0,
+                "missing_count": len(profile_ids),
+            }
+        by_id = {profile.profile_id: profile for profile in profiles}
+        bound_ids = set(self.database.list_bound_openbrowser_profile_ids())
+        present = [by_id[profile_id] for profile_id in profile_ids if profile_id in by_id]
+        bound_count = sum(profile.profile_id in bound_ids for profile in present)
+        running_count = sum(profile.running for profile in present)
+        available_count = sum(
+            not profile.running and profile.profile_id not in bound_ids
+            for profile in present
+        )
+        return {
+            "configured": True,
+            "connected": True,
+            "state": "ready" if available_count else "pool_exhausted",
+            "version": version,
+            "pool_size": len(profile_ids),
+            "available_count": available_count,
+            "bound_count": bound_count,
+            "running_count": running_count,
+            "missing_count": len(profile_ids) - len(present),
+        }
+
     def list_sub2api_groups(self) -> dict[str, Any]:
         with self._sub2api_client() as client:
             remote_groups = client.list_groups(
@@ -2700,10 +2870,30 @@ class WebConsoleController:
             fields["secrets"] = f"unsupported secrets: {', '.join(invalid_secrets)}"
         if set(secret_updates) & set(clear_secrets):
             fields["clear_secrets"] = "a secret cannot be updated and cleared together"
+        normalized_values: dict[str, str] = {}
+        for key, value in values.items():
+            text_value = _setting_text(value).strip()
+            try:
+                if key == "openbrowser_base_url":
+                    text_value = (
+                        validate_openbrowser_base_url(text_value)
+                        if text_value
+                        else ""
+                    )
+                elif key == "openbrowser_profile_ids":
+                    text_value = "\n".join(parse_openbrowser_profile_ids(text_value))
+                elif key == "openbrowser_manual_timeout_seconds" and text_value:
+                    timeout_seconds = int(text_value)
+                    if not 60 <= timeout_seconds <= 86_400:
+                        raise ValueError("timeout is outside the allowed range")
+                    text_value = str(timeout_seconds)
+            except (TypeError, ValueError):
+                fields[key] = "setting value is invalid"
+            normalized_values[key] = text_value
         if fields:
             raise FieldInputError(fields)
-        for key, value in values.items():
-            self.database.set_text_setting(key, _setting_text(value))
+        for key, value in normalized_values.items():
+            self.database.set_text_setting(key, value)
         for key, value in secret_updates.items():
             if value:
                 self.database.set_secret_setting(key, value)
@@ -3341,6 +3531,14 @@ def create_app(
     @app.get("/api/settings")
     async def get_settings():
         return await _call_controller(controller.get_settings)
+
+    @app.get("/api/openbrowser/status")
+    async def openbrowser_status():
+        return await _call_controller(controller.get_openbrowser_status)
+
+    @app.post("/api/openbrowser/test")
+    async def test_openbrowser():
+        return await _call_controller(controller.get_openbrowser_status)
 
     @app.get("/api/sub2api/groups")
     async def list_sub2api_groups():

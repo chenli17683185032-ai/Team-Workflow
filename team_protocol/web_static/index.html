@@ -279,6 +279,20 @@
           </div>
         </section>
 
+        <section class="settings-section" aria-labelledby="openbrowser-settings-title">
+          <header><h2 id="openbrowser-settings-title">OpenBrowser</h2></header>
+          <div class="settings-fields">
+            <label class="field field--wide"><span>Local API 地址</span><input name="openbrowser_base_url" type="url" placeholder="http://127.0.0.1:50325" autocomplete="url" spellcheck="false"></label>
+            <div class="field"><label for="settings-openbrowser-key">API Key</label><input id="settings-openbrowser-key" name="openbrowser_api_key" type="password" placeholder="未更改" autocomplete="new-password"><span class="secret-state-row"><small id="openbrowser-secret-state">未设置</small><button type="button" class="text-action" data-action="toggle-secret-clear" data-secret="openbrowser_api_key">清除已保存值</button></span></div>
+            <label class="field"><span>人工登录时限（秒）</span><input name="openbrowser_manual_timeout_seconds" type="number" min="60" max="86400" step="60" inputmode="numeric" autocomplete="off"></label>
+            <label class="field field--wide"><span>Profile ID 池</span><textarea name="openbrowser_profile_ids" rows="5" placeholder="profile_01&#10;profile_02" autocomplete="off" spellcheck="false"></textarea></label>
+            <div class="openbrowser-status-row field--wide" data-state="not_configured">
+              <span id="openbrowser-status" role="status" aria-live="polite">尚未配置</span>
+              <button type="button" class="button button--quiet" data-action="test-openbrowser">检测连接</button>
+            </div>
+          </div>
+        </section>
+
         <section class="settings-section" aria-labelledby="cpa-settings-title">
           <header><h2 id="cpa-settings-title">CPA 可选推送</h2></header>
           <div class="settings-fields">

@@ -13,6 +13,12 @@ from typing import Any, Callable, Mapping, Protocol
 from .chatgpt import AuthContext, ChatGPTApiError, ChatGPTClient
 from .cpa import build_cpa, build_cpa_filename
 from .management import ManagementClient
+from .openbrowser import (
+    OpenBrowserClient,
+    OpenBrowserError,
+    OpenBrowserManualLogin,
+    validate_openbrowser_profile_id,
+)
 from .registrar import (
     MailboxCredentials,
     RegistrarAdapter,
@@ -108,6 +114,10 @@ class WorkflowConfig:
     persist_old_session: Callable[[str], Any] | None = None
     clear_old_session: Callable[[], Any] | None = None
     persist_new_session: Callable[[str], Any] | None = None
+    openbrowser_base_url: str = ""
+    openbrowser_api_key: str = ""
+    openbrowser_profile_id: str = ""
+    openbrowser_manual_timeout_seconds: float = 1800.0
 
 
 class CheckpointStore(Protocol):
@@ -223,6 +233,8 @@ class WorkflowRunner:
         stop_event: threading.Event | None = None,
         logger: Callable[[str], None] | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
+        openbrowser_client_factory: Callable[..., Any] = OpenBrowserClient,
+        openbrowser_manual_login_factory: Callable[..., Any] = OpenBrowserManualLogin,
     ):
         self.config = config
         self.state = checkpoint_store
@@ -327,6 +339,8 @@ class WorkflowRunner:
         self.stop_event = stop_event
         self.logger = logger
         self.event_callback = event_callback
+        self.openbrowser_client_factory = openbrowser_client_factory
+        self.openbrowser_manual_login_factory = openbrowser_manual_login_factory
         self._owns_chatgpt = bool(self._owned_chatgpt_clients)
         self._old_login_used_saved_session = False
 
@@ -612,6 +626,43 @@ class WorkflowRunner:
         step_text = f"[{step}] " if step else ""
         self._log(f"[{level}] {step_text}{message}")
 
+    def _manual_login_status(self, state: str) -> None:
+        messages = {
+            "profile_started": "OpenBrowser profile started",
+            "waiting_for_user": "waiting for manual login",
+            "wrong_account": "manual login is using the wrong account",
+            "waiting_for_team": "waiting for the target Team",
+            "verified": "manual login and Team verified",
+            "profile_stopped": "OpenBrowser profile stopped",
+        }
+        clean_state = str(state)
+        message = messages.get(clean_state, "manual login state changed")
+        self._log(f"[manual-login] {message}")
+        self._emit_event({"type": "manual_login", "state": clean_state})
+
+    def _preflight_manual_login(self) -> None:
+        if not self.config.openbrowser_profile_id:
+            return
+        profile_id = validate_openbrowser_profile_id(
+            self.config.openbrowser_profile_id
+        )
+        client = self.openbrowser_client_factory(
+            self.config.openbrowser_base_url,
+            self.config.openbrowser_api_key,
+            timeout=10.0,
+        )
+        try:
+            profiles = {
+                profile.profile_id: profile for profile in client.list_profiles()
+            }
+        finally:
+            client.close()
+        profile = profiles.get(profile_id)
+        if profile is None:
+            raise OpenBrowserError("bound OpenBrowser profile is unavailable")
+        if profile.running:
+            raise OpenBrowserError("bound OpenBrowser profile is already running")
+
     @staticmethod
     def _validate_login_session(
         spec: AccountSpec, session: Mapping[str, Any]
@@ -638,6 +689,10 @@ class WorkflowRunner:
             self._validate_login_session(spec, cached)
             self._log(f"[resume] {step}")
             return cached
+        if step == "new_login" and self.config.openbrowser_profile_id:
+            return self._manual_new_login(spec)
+        if step == "new_workspace_login" and self.config.openbrowser_profile_id:
+            raise RuntimeError("manual OpenBrowser login cannot fall back to OTP login")
         role = "old" if step in {"old_login", "owner_login"} else "new"
         mailbox = self._mailboxes.get(f"{role}_login")
         network = self._networks[role]
@@ -726,6 +781,60 @@ class WorkflowRunner:
         self.state.set(step, session)
         return session
 
+    def _manual_new_login(self, spec: AccountSpec) -> dict[str, Any]:
+        if not self.config.openbrowser_base_url or not self.config.openbrowser_api_key:
+            raise RuntimeError("OpenBrowser manual login is not configured")
+        self._log(f"[manual-login] {spec.email}")
+        client = self.openbrowser_client_factory(
+            self.config.openbrowser_base_url,
+            self.config.openbrowser_api_key,
+            timeout=10.0,
+        )
+        try:
+            manual_login = self.openbrowser_manual_login_factory(
+                client,
+                self.config.openbrowser_profile_id,
+                expected_email=spec.email,
+                timeout_seconds=self.config.openbrowser_manual_timeout_seconds,
+                status_callback=self._manual_login_status,
+            )
+
+            def validate_session(session: Mapping[str, Any]) -> Mapping[str, Any]:
+                self._check_cancel()
+                self._validate_login_session(spec, session)
+                session_token = AuthContext.from_mapping(session).session_token
+                verified = self._chatgpt_clients["new"].refresh_session(
+                    session_token,
+                    account_id=self.config.workspace_id,
+                )
+                self._validate_login_session(spec, verified)
+                context = AuthContext.from_mapping(verified)
+                if context.account_id != self.config.workspace_id:
+                    raise _WorkspaceSwitchError(
+                        "manual login did not enter the target workspace"
+                    )
+                return dict(verified)
+
+            session = manual_login.wait(
+                session_validator=validate_session,
+                stop_event=self.stop_event,
+            )
+        finally:
+            client.close()
+        self._check_cancel()
+        if not isinstance(session, Mapping):
+            raise RuntimeError("OpenBrowser login result is not an object")
+        self._validate_login_session(spec, session)
+        context = AuthContext.from_mapping(session)
+        if context.account_id != self.config.workspace_id:
+            raise RuntimeError("OpenBrowser login did not verify the target workspace")
+        if self.config.persist_new_session is not None:
+            self.config.persist_new_session(context.session_token)
+        result = dict(session)
+        self.state.set("new_login", result)
+        self.state.set("new_workspace", result)
+        return result
+
     def _checkpoint_provider_state(self, provider_state: dict[str, Any]) -> None:
         if not isinstance(provider_state, dict):
             raise TypeError("registrar provider state callback must provide an object")
@@ -754,6 +863,22 @@ class WorkflowRunner:
             )
         self.state.set(step, session)
         return session
+
+    def _new_workspace_session(
+        self,
+        new_login: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self._switch_workspace(new_login, "new_workspace")
+        except _WorkspaceSwitchError:
+            if self.config.openbrowser_profile_id:
+                raise
+            self._log("[reauth] new account workspace selection")
+            workspace_login = self._login(
+                self.config.new_account,
+                "new_workspace_login",
+            )
+            return self._switch_workspace(workspace_login, "new_workspace")
 
     def _ensure_invited(self, old_session: Mapping[str, Any]) -> dict[str, Any]:
         self._check_cancel()
@@ -1340,6 +1465,7 @@ class WorkflowRunner:
 
     def run(self) -> dict[str, Any]:
         try:
+            self._preflight_manual_login()
             self._log_network_context()
             self._check_cancel()
             def old_login_stage() -> dict[str, Any]:
@@ -1361,18 +1487,7 @@ class WorkflowRunner:
             )
 
             def member_verify_stage() -> tuple[dict[str, Any], dict[str, Any]]:
-                try:
-                    new_workspace = self._switch_workspace(new_login, "new_workspace")
-                except _WorkspaceSwitchError:
-                    self._log("[reauth] new account workspace selection")
-                    workspace_login = self._login(
-                        self.config.new_account,
-                        "new_workspace_login",
-                    )
-                    new_workspace = self._switch_workspace(
-                        workspace_login,
-                        "new_workspace",
-                    )
+                new_workspace = self._new_workspace_session(new_login)
                 member_verify = self._verify_team_membership(
                     new_workspace,
                     old_workspace,
@@ -1742,6 +1857,7 @@ class RescueWorkflowRunner(WorkflowRunner):
 
     def run(self) -> dict[str, Any]:
         try:
+            self._preflight_manual_login()
             self._log_network_context()
             self._check_cancel()
 
@@ -1768,18 +1884,7 @@ class RescueWorkflowRunner(WorkflowRunner):
             )
 
             def verify_stage() -> tuple[dict[str, Any], dict[str, Any]]:
-                try:
-                    new_workspace = self._switch_workspace(new_login, "new_workspace")
-                except _WorkspaceSwitchError:
-                    self._log("[reauth] new account workspace selection")
-                    workspace_login = self._login(
-                        self.config.new_account,
-                        "new_workspace_login",
-                    )
-                    new_workspace = self._switch_workspace(
-                        workspace_login,
-                        "new_workspace",
-                    )
+                new_workspace = self._new_workspace_session(new_login)
                 guard = self._verify_rescue_membership(
                     new_workspace,
                     owner_workspace,

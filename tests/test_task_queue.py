@@ -139,6 +139,16 @@ class TaskQueueTests(unittest.TestCase):
             "http://proxy-user-region-BR-sid-seed-t-60:"
             "proxy-password@proxy.invalid:9000/{rand}",
         )
+        self.database.set_text_setting(
+            "openbrowser_base_url", "http://127.0.0.1:50325"
+        )
+        self.database.set_text_setting(
+            "openbrowser_manual_timeout_seconds", "1800"
+        )
+        self.database.set_secret_setting(
+            "openbrowser_api_key", "openbrowser-api-secret"
+        )
+        self.openbrowser_profiles = []
         self.queues = []
 
     def tearDown(self):
@@ -170,6 +180,7 @@ class TaskQueueTests(unittest.TestCase):
             },
             source="test",
         )
+        self.bind_openbrowser(next_account["id"])
         workspace = self.database.create_workspace(
             workspace_id=f"workspace-{suffix}",
             name=f"Space {suffix}",
@@ -178,6 +189,19 @@ class TaskQueueTests(unittest.TestCase):
             next_account_id=next_account["id"],
         )
         return workspace, current, next_account
+
+    def bind_openbrowser(self, account_id):
+        profile_id = f"profile_{len(self.openbrowser_profiles) + 1:03d}"
+        self.openbrowser_profiles.append(profile_id)
+        self.database.set_text_setting(
+            "openbrowser_profile_ids", "\n".join(self.openbrowser_profiles)
+        )
+        self.database.reserve_account_openbrowser_profile(
+            account_id,
+            [profile_id],
+            proxy_sid=f"Browser{len(self.openbrowser_profiles):03d}",
+        )
+        return profile_id
 
     def make_queue(
         self,
@@ -418,6 +442,50 @@ class TaskQueueTests(unittest.TestCase):
         serialized_logs = json.dumps(operation["logs"])
         self.assertNotIn("refresh-bounded-logs-current", serialized_logs)
         self.assertIn("***", serialized_logs)
+
+    def test_manual_login_state_is_visible_and_stop_cancels_without_secret_leak(self):
+        workspace, _, _ = self.make_workspace("manual-state")
+        started = threading.Event()
+
+        class ManualStateRunner:
+            def __init__(self, config, **kwargs):
+                self.config = config
+                self.callback = kwargs["event_callback"]
+                self.logger = kwargs["logger"]
+                self.stop_event = kwargs["stop_event"]
+
+            def run(self):
+                self.callback(
+                    {"type": "step", "step": "new_login", "state": "active"}
+                )
+                self.callback(
+                    {"type": "manual_login", "state": "waiting_for_user"}
+                )
+                self.logger(
+                    f"waiting with api-key={self.config.openbrowser_api_key}"
+                )
+                started.set()
+                self.stop_event.wait(3.0)
+                raise WorkflowCancelled("cancelled")
+
+        queue = self.make_queue(ManualStateRunner)
+        run = queue.enqueue([workspace["id"]])[0]
+        queue.start()
+
+        self.assertTrue(started.wait(2.0))
+        operation = queue.snapshot()["run_operation"]
+        self.assertEqual(operation["current_step"], "new_login")
+        self.assertEqual(operation["manual_login_state"], "waiting_for_user")
+        self.assertNotIn("openbrowser-api-secret", json.dumps(operation))
+
+        self.assertEqual(queue.stop(run["id"]), "stopping")
+        self.assertTrue(
+            wait_until(
+                lambda: self.database.get_run(run["id"])["state"] == "cancelled"
+            )
+        )
+        events = json.dumps(self.database.list_run_events(run_id=run["id"]))
+        self.assertNotIn("openbrowser-api-secret", events)
 
     def test_fifo_single_active_failure_continues_and_redacts(self):
         first, _, _ = self.make_workspace("first")
@@ -726,6 +794,7 @@ class TaskQueueTests(unittest.TestCase):
             },
             source="test",
         )
+        self.bind_openbrowser(next_account["id"])
         workspace = self.database.create_workspace(
             name="No replacement",
             workspace_uid="no-replacement",
@@ -924,6 +993,7 @@ class TaskQueueTests(unittest.TestCase):
             )["account"]
             for index in range(2)
         ]
+        profile_id = self.bind_openbrowser(accounts[1]["id"])
         workspace = self.database.create_workspace(
             name="iCloud Space",
             workspace_uid="icloud-space",
@@ -934,7 +1004,9 @@ class TaskQueueTests(unittest.TestCase):
         queue = self.make_queue(RunnerHarness())
 
         inputs = queue._build_run_inputs(run["id"])
-        old_mailbox, new_mailbox, secrets = inputs[1], inputs[2], inputs[-1]
+        config, old_mailbox, new_mailbox, secrets = (
+            inputs[0], inputs[1], inputs[2], inputs[-1]
+        )
 
         self.assertEqual(old_mailbox.provider, "icloud_hme_imap")
         self.assertEqual(new_mailbox.provider, "icloud_hme_imap")
@@ -943,6 +1015,13 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(old_mailbox.mailbox_proxy, parent_proxy)
         self.assertIn("icloud-imap-secret", secrets)
         self.assertIn(parent_proxy, secrets)
+        self.assertEqual(config.openbrowser_profile_id, profile_id)
+        self.assertEqual(
+            config.openbrowser_base_url, "http://127.0.0.1:50325"
+        )
+        self.assertEqual(config.openbrowser_api_key, "openbrowser-api-secret")
+        self.assertEqual(config.openbrowser_manual_timeout_seconds, 1800)
+        self.assertIn("openbrowser-api-secret", secrets)
 
     def test_team_owner_is_passive_and_never_enters_run_inputs(self):
         parent_proxy = "socks5h://owner:owner-proxy-secret@proxy.invalid:1080"
@@ -994,6 +1073,7 @@ class TaskQueueTests(unittest.TestCase):
         )
         owner = next(item for item in imported if item["role"] == "team_owner")
         children = [item for item in imported if item["role"] == "rotating_child"]
+        self.bind_openbrowser(children[1]["account_id"])
         self.assertIsNone(owner["account_id"])
         workspace = self.database.create_workspace(
             name="Passive owner workspace",

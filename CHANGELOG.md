@@ -1,5 +1,24 @@
 # 更新日志
 
+## 2026-07-24
+
+### 新增
+
+- 接入 OpenBrowser Local API：设置页可保存回环地址、加密 API Key、显式 Profile ID 池和人工登录时限，并只显示连接与容量统计。
+- 每个新子号在账号加密 runtime identity 中永久绑定一个 OpenBrowser Profile；首次分配事务内唯一，失败、重试和进程恢复均复用原 Profile。
+- 新号阶段只打开绑定 Profile 的 ChatGPT 官方入口等待用户手工注册/登录；队列实时显示等待、错号、等待 Team、验证和关闭状态，现有停止按钮可协作取消。
+
+### 稳定性与安全
+
+- “一键换班”和“提拉”在 HME Alias 创建前检查 Local API、API Key、池容量、Profile 存在性与运行状态；执行器在任何 Team 写操作前再次检查，避免排队期间环境漂移。
+- 同一 CDP context 的 session 邮箱和目标 Team 均通过现有 ChatGPT 客户端验证后，才加密保存 session/checkpoint 并继续成员复核、PAT、CPA/Sub2API JSON 与推送。
+- 登录错号可在原窗口纠正；目标 Team 未出现时有界等待；窗口关闭、取消和超时只停止目标 Profile。手工模式禁止回退自动 OTP 注册，不调用 stop-all，不清 Cookie，不触碰配置池外 Profile。
+- API 响应与日志不包含 API Key、Cookie、session、CDP 端口或 Profile 本地路径。OpenBrowser 仅提供本地存储隔离，不承诺匿名、指纹唯一或避免平台服务端关联。
+
+### 验证
+
+- OpenBrowser、Database、Workflow、TaskQueue 与 Web Console 共 189 项聚焦测试通过；全量 390 项通过，6 项 Windows DPAPI 在 macOS 正常跳过。Python compileall、JavaScript 语法、`git diff --check`、高置信秘密扫描和桌面/移动端控制台验收通过；一致性备份与源库均 `quick_check=ok`。两次有界上线重启分别在 26 秒和 7 秒内恢复 HTTP 200、migration ready 和空活动队列，最终 PID 为 `30024`。真实空白 Profile 冒烟在首次启动 OpenBrowser 后单独完成。
+
 ## 2026-07-23
 
 ### 修复

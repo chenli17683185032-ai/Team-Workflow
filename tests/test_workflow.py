@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import team_protocol.workflow as workflow_module
 from team_protocol.chatgpt import ChatGPTApiError
 from team_protocol.cpa import OPENAI_AUTH_CLAIM, OPENAI_PROFILE_CLAIM
 from team_protocol.registrar import MailboxCredentials, RegistrarIdentityError
@@ -326,6 +327,10 @@ def make_workflow_config(
     persist_old_session=None,
     clear_old_session=None,
     persist_new_session=None,
+    openbrowser_base_url="",
+    openbrowser_api_key="",
+    openbrowser_profile_id="",
+    openbrowser_manual_timeout_seconds=1800,
 ):
     return WorkflowConfig(
         old_account=AccountSpec("main+2@example.com"),
@@ -354,6 +359,10 @@ def make_workflow_config(
         persist_old_session=persist_old_session,
         clear_old_session=clear_old_session,
         persist_new_session=persist_new_session,
+        openbrowser_base_url=openbrowser_base_url,
+        openbrowser_api_key=openbrowser_api_key,
+        openbrowser_profile_id=openbrowser_profile_id,
+        openbrowser_manual_timeout_seconds=openbrowser_manual_timeout_seconds,
     )
 
 
@@ -448,6 +457,211 @@ class WorkflowTests(unittest.TestCase):
                     runner.close()
                 self.assertEqual(caught.exception.code, code)
                 self.assertEqual(caught.exception.role, role)
+
+    def test_openbrowser_manual_login_verifies_team_before_pat_without_registrar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persisted_sessions = []
+            config = make_workflow_config(
+                Path(directory),
+                push=False,
+                sub2api_push=False,
+                persist_new_session=persisted_sessions.append,
+                openbrowser_base_url="http://127.0.0.1:50325",
+                openbrowser_api_key="openbrowser-secret",
+                openbrowser_profile_id="profile_manual",
+                openbrowser_manual_timeout_seconds=900,
+            )
+            checkpoint = InMemoryCheckpoint()
+            registrar = FakeRegistrar()
+            chatgpt = FakeChatGPT(
+                config.workspace_id,
+                config.old_account.email,
+                config.new_account.email,
+            )
+            client_calls = []
+            manual_calls = []
+            status_events = []
+            logs = []
+
+            class FakeOpenBrowserClient:
+                def __init__(self, base_url, api_key, **kwargs):
+                    client_calls.append((base_url, api_key, kwargs))
+
+                @staticmethod
+                def list_profiles():
+                    return [
+                        SimpleNamespace(
+                            profile_id=config.openbrowser_profile_id,
+                            running=False,
+                        )
+                    ]
+
+                @staticmethod
+                def close():
+                    client_calls.append(("closed",))
+
+            class FakeManualLogin:
+                def __init__(self, client, profile_id, **kwargs):
+                    del client
+                    manual_calls.append((profile_id, dict(kwargs)))
+                    self.status_callback = kwargs["status_callback"]
+                    self.expected_email = kwargs["expected_email"]
+
+                def wait(self, *, session_validator, stop_event=None):
+                    self.status_callback("profile_started")
+                    self.status_callback("waiting_for_user")
+                    self.assert_stop_event = stop_event
+                    validated = session_validator(
+                        {
+                            "email": self.expected_email,
+                            "session_token": "manual-browser-session",
+                        }
+                    )
+                    self.status_callback("verified")
+                    self.status_callback("profile_stopped")
+                    return validated
+
+            runner = WorkflowRunner(
+                config,
+                **run_dependencies(config, checkpoint),
+                registrar=registrar,
+                chatgpt=chatgpt,
+                management=FakeManagement(),
+                sub2api=FakeSub2API(),
+                openbrowser_client_factory=FakeOpenBrowserClient,
+                openbrowser_manual_login_factory=FakeManualLogin,
+                verbose=False,
+                logger=logs.append,
+                event_callback=lambda event: status_events.append(dict(event)),
+            )
+            try:
+                result = runner.run()
+            finally:
+                runner.close()
+
+        self.assertEqual(
+            [email for email, _proxy in registrar.calls],
+            [config.old_account.email],
+        )
+        self.assertEqual(client_calls[0][0], config.openbrowser_base_url)
+        self.assertEqual(client_calls[0][1], config.openbrowser_api_key)
+        self.assertEqual(client_calls[-1], ("closed",))
+        self.assertEqual(client_calls.count(("closed",)), 2)
+        self.assertEqual(manual_calls[0][0], config.openbrowser_profile_id)
+        self.assertEqual(
+            manual_calls[0][1]["expected_email"], config.new_account.email
+        )
+        self.assertEqual(
+            manual_calls[0][1]["timeout_seconds"],
+            config.openbrowser_manual_timeout_seconds,
+        )
+        self.assertEqual(
+            persisted_sessions,
+            [checkpoint.get("new_login")["sessionToken"]],
+        )
+        self.assertEqual(
+            checkpoint.get("new_workspace")["account"]["id"],
+            config.workspace_id,
+        )
+        self.assertTrue(any(call[0] == "pat" for call in chatgpt.calls))
+        self.assertLess(
+            chatgpt.calls.index(
+                ("refresh", "manual-browser-session", config.workspace_id)
+            ),
+            next(index for index, call in enumerate(chatgpt.calls) if call[0] == "pat"),
+        )
+        self.assertTrue(str(result["cpa_path"]).endswith(".json"))
+        self.assertEqual(
+            [
+                event["state"]
+                for event in status_events
+                if event.get("type") == "manual_login"
+            ],
+            ["profile_started", "waiting_for_user", "verified", "profile_stopped"],
+        )
+        self.assertFalse(any("openbrowser-secret" in message for message in logs))
+
+    def test_openbrowser_execution_preflight_stops_before_old_login_and_team_writes(self):
+        for profile in (None, SimpleNamespace(profile_id="profile_manual", running=True)):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                config = make_workflow_config(
+                    Path(directory),
+                    push=False,
+                    sub2api_push=False,
+                    openbrowser_base_url="http://127.0.0.1:50325",
+                    openbrowser_api_key="openbrowser-secret",
+                    openbrowser_profile_id="profile_manual",
+                )
+                registrar = FakeRegistrar()
+                chatgpt = FakeChatGPT(
+                    config.workspace_id,
+                    config.old_account.email,
+                    config.new_account.email,
+                )
+
+                class PreflightClient:
+                    @staticmethod
+                    def list_profiles():
+                        return [] if profile is None else [profile]
+
+                    @staticmethod
+                    def close():
+                        return None
+
+                runner = WorkflowRunner(
+                    config,
+                    **run_dependencies(config),
+                    registrar=registrar,
+                    chatgpt=chatgpt,
+                    openbrowser_client_factory=lambda *_args, **_kwargs: PreflightClient(),
+                    verbose=False,
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "unavailable|already running"
+                    ):
+                        runner.run()
+                finally:
+                    runner.close()
+
+                self.assertEqual(registrar.calls, [])
+                self.assertEqual(chatgpt.calls, [])
+
+    def test_openbrowser_manual_mode_never_falls_back_to_otp_workspace_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_workflow_config(
+                Path(directory),
+                openbrowser_base_url="http://127.0.0.1:50325",
+                openbrowser_api_key="openbrowser-secret",
+                openbrowser_profile_id="profile_manual",
+            )
+            registrar = FakeRegistrar()
+            runner = WorkflowRunner(
+                config,
+                **run_dependencies(config),
+                registrar=registrar,
+                chatgpt=FakeChatGPT(
+                    config.workspace_id,
+                    config.old_account.email,
+                    config.new_account.email,
+                ),
+                verbose=False,
+            )
+            runner._switch_workspace = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                workflow_module._WorkspaceSwitchError("wrong workspace")
+            )
+            try:
+                with self.assertRaises(workflow_module._WorkspaceSwitchError):
+                    runner._new_workspace_session(
+                        {
+                            "email": config.new_account.email,
+                            "session_token": "manual-session",
+                        }
+                    )
+            finally:
+                runner.close()
+
+        self.assertEqual(registrar.calls, [])
 
     def test_transient_login_error_is_not_promoted_to_identity_error(self):
         with tempfile.TemporaryDirectory() as directory:

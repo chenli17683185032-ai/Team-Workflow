@@ -70,6 +70,7 @@ _RUN_PROXY_SNAPSHOT_VERSION = 1
 _RUN_PROXY_SOURCES = frozenset({"account", "global", "direct"})
 _ICLOUD_OWNER_PROXY_CONFIG_PREFIX = "icloud-owner-proxy-config:"
 _ICLOUD_OWNER_RUNTIME_IDENTITY_PREFIX = "icloud-owner-runtime-identity:"
+_OPENBROWSER_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ACCOUNT_RUNTIME_IDENTITY_KEYS = frozenset(
     {
         "version",
@@ -78,6 +79,7 @@ _ACCOUNT_RUNTIME_IDENTITY_KEYS = frozenset(
         "fingerprint_profile",
         "browserforge_fingerprint",
         "toolchain",
+        "openbrowser_profile_id",
     }
 )
 
@@ -242,6 +244,14 @@ def _validate_account_runtime_identity(value: Any) -> dict[str, Any]:
     if not re.fullmatch(r"[A-Za-z0-9]{8,32}", sid):
         raise DatabaseError("account runtime identity has an invalid proxy SID")
     identity["proxy_sid"] = sid
+    openbrowser_profile_id = identity.get("openbrowser_profile_id")
+    if openbrowser_profile_id is not None:
+        profile_id = str(openbrowser_profile_id).strip()
+        if not _OPENBROWSER_PROFILE_ID_RE.fullmatch(profile_id):
+            raise DatabaseError(
+                "account runtime identity has an invalid OpenBrowser profile ID"
+            )
+        identity["openbrowser_profile_id"] = profile_id
     for key in (
         "proxy_geo",
         "fingerprint_profile",
@@ -3369,6 +3379,128 @@ class Database:
             )
             return validated
 
+    @staticmethod
+    def _normalize_openbrowser_profile_ids(profile_ids: Iterable[Any]) -> tuple[str, ...]:
+        if isinstance(profile_ids, (str, bytes, bytearray)):
+            raw_ids = [profile_ids]
+        else:
+            try:
+                raw_ids = list(profile_ids)
+            except TypeError as exc:
+                raise ValidationError("OpenBrowser profile pool is invalid") from exc
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_id in raw_ids:
+            profile_id = str(raw_id or "").strip()
+            if not _OPENBROWSER_PROFILE_ID_RE.fullmatch(profile_id):
+                raise ValidationError("OpenBrowser profile ID is invalid")
+            if profile_id not in seen:
+                normalized.append(profile_id)
+                seen.add(profile_id)
+        if not normalized:
+            raise ValidationError("OpenBrowser profile pool is empty")
+        return tuple(normalized)
+
+    def _bound_openbrowser_profiles_tx(
+        self,
+        connection: sqlite3.Connection,
+    ) -> dict[str, str]:
+        rows = connection.execute(
+            "SELECT id, runtime_identity_blob FROM accounts "
+            "WHERE runtime_identity_blob IS NOT NULL"
+        ).fetchall()
+        bindings: dict[str, str] = {}
+        for row in rows:
+            account_id = str(row["id"])
+            identity = self._decode_account_network_identity(
+                account_id,
+                row["runtime_identity_blob"],
+            )
+            profile_id = str(identity.get("openbrowser_profile_id") or "").strip()
+            if not profile_id:
+                continue
+            other_account_id = bindings.get(profile_id)
+            if other_account_id is not None and other_account_id != account_id:
+                raise StateConflictError(
+                    "OpenBrowser profile is bound to multiple accounts"
+                )
+            bindings[profile_id] = account_id
+        return bindings
+
+    def list_bound_openbrowser_profile_ids(self) -> tuple[str, ...]:
+        with self._read_connection() as connection:
+            bindings = self._bound_openbrowser_profiles_tx(connection)
+        return tuple(sorted(bindings))
+
+    def _reserve_account_openbrowser_profile_tx(
+        self,
+        connection: sqlite3.Connection,
+        account_id: str,
+        profile_ids: tuple[str, ...],
+        *,
+        proxy_sid: str,
+    ) -> str:
+        row = connection.execute(
+            "SELECT runtime_identity_blob FROM accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError("account not found")
+        identity = self._decode_account_network_identity(
+            account_id,
+            row["runtime_identity_blob"],
+        )
+        bindings = self._bound_openbrowser_profiles_tx(connection)
+        existing_id = str(identity.get("openbrowser_profile_id") or "").strip()
+        if existing_id:
+            if bindings.get(existing_id) != account_id:
+                raise StateConflictError(
+                    "OpenBrowser profile is already bound to another account"
+                )
+            return existing_id
+        selected_id = next(
+            (profile_id for profile_id in profile_ids if profile_id not in bindings),
+            "",
+        )
+        if not selected_id:
+            raise StateConflictError("no unused OpenBrowser profile is available")
+        if not identity:
+            identity = {
+                "version": _ACCOUNT_RUNTIME_IDENTITY_VERSION,
+                "proxy_sid": proxy_sid,
+            }
+        identity["openbrowser_profile_id"] = selected_id
+        validated = _validate_account_runtime_identity(identity)
+        ciphertext = self._require_secret_store().encrypt(
+            _json_bytes(validated),
+            f"account:{account_id}:runtime-identity:v1",
+        )
+        connection.execute(
+            """
+            UPDATE accounts
+            SET runtime_identity_blob = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (sqlite3.Binary(ciphertext), _now(), account_id),
+        )
+        return selected_id
+
+    def reserve_account_openbrowser_profile(
+        self,
+        account_id: str,
+        profile_ids: Iterable[Any],
+        *,
+        proxy_sid: str,
+    ) -> str:
+        candidates = self._normalize_openbrowser_profile_ids(profile_ids)
+        with self._write_transaction() as connection:
+            return self._reserve_account_openbrowser_profile_tx(
+                connection,
+                str(account_id),
+                candidates,
+                proxy_sid=str(proxy_sid),
+            )
+
     def transition_account_status(self, account_id: str, new_status: str) -> dict[str, Any]:
         if new_status not in {"available", "disabled", "retired"}:
             raise ValidationError("manual account status is invalid")
@@ -3839,9 +3971,16 @@ class Database:
         email: str,
         remote_metadata: Mapping[str, Any],
         label: str,
+        openbrowser_profile_ids: Iterable[Any] | None = None,
+        openbrowser_proxy_sid: str = "",
     ) -> dict[str, Any]:
         alias_email = _normalize_email_address(email, "alias_email")
         clean_label = _required_text(label, "label")
+        openbrowser_candidates = (
+            None
+            if openbrowser_profile_ids is None
+            else self._normalize_openbrowser_profile_ids(openbrowser_profile_ids)
+        )
         if len(clean_label) > 160:
             raise ValidationError("label is too long")
         if not isinstance(remote_metadata, Mapping) or not str(
@@ -3895,6 +4034,13 @@ class Database:
             )
             if account_id is None:
                 raise StateConflictError("new iCloud child account was not created")
+            if openbrowser_candidates is not None:
+                self._reserve_account_openbrowser_profile_tx(
+                    connection,
+                    account_id,
+                    openbrowser_candidates,
+                    proxy_sid=str(openbrowser_proxy_sid),
+                )
             cursor = connection.execute(
                 """
                 UPDATE workspaces

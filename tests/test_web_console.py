@@ -16,6 +16,7 @@ from team_protocol.database import Database, StateConflictError
 from team_protocol.icloud_hme import HmeError, HmeSessionError, parse_hme_request
 from team_protocol.icloud_hme_capture import HmeCaptureSessionRejectedError
 from team_protocol.migration import CleanupFailure, CleanupResult, cleanup_plaintext
+from team_protocol.openbrowser import OpenBrowserProfile
 from team_protocol.proxy_chain import (
     LokiProxyEndpoint,
     OwnerChainConfig,
@@ -227,6 +228,52 @@ class WebConsoleTests(unittest.TestCase):
             next_account_id=next_account["id"],
         )
         return workspace, current, next_account
+
+    def configure_openbrowser(
+        self,
+        profile_ids=("profile_a",),
+        *,
+        running=(),
+    ):
+        self.database.set_text_setting(
+            "openbrowser_base_url", "http://127.0.0.1:50325"
+        )
+        self.database.set_text_setting(
+            "openbrowser_profile_ids", "\n".join(profile_ids)
+        )
+        self.database.set_text_setting(
+            "openbrowser_manual_timeout_seconds", "1800"
+        )
+        self.database.set_secret_setting("openbrowser_api_key", "browser-api-secret")
+        calls = []
+        running_ids = set(running)
+
+        class FakeOpenBrowserClient:
+            def __init__(self, base_url, api_key, **kwargs):
+                calls.append((base_url, api_key, kwargs))
+
+            @staticmethod
+            def version():
+                return "1.0-test"
+
+            @staticmethod
+            def list_profiles():
+                return [
+                    OpenBrowserProfile(
+                        profile_id=profile_id,
+                        name=f"Browser {index}",
+                        running=profile_id in running_ids,
+                        debug_port=9222 if profile_id in running_ids else None,
+                    )
+                    for index, profile_id in enumerate(profile_ids, start=1)
+                ]
+
+            @staticmethod
+            def close():
+                return None
+
+        self.controller.openbrowser_client_factory = FakeOpenBrowserClient
+        return calls
 
     @staticmethod
     def inventory_record(email, order=0):
@@ -937,6 +984,16 @@ class WebConsoleTests(unittest.TestCase):
             workspace = created_workspace.json()
             self.assertEqual(workspace["status"], "needs_account")
 
+            missing_browser = client.post(
+                f"/api/workspaces/{workspace['id']}/replace-icloud-child",
+                json={"version": workspace["version"]},
+                headers=self.origin_headers,
+            )
+            self.assertEqual(missing_browser.status_code, 409, missing_browser.text)
+            self.assertEqual(generated, [])
+
+            self.configure_openbrowser(("profile_a", "profile_b"))
+
             handoff = client.post(
                 f"/api/workspaces/{workspace['id']}/replace-icloud-child",
                 json={"version": workspace["version"]},
@@ -1070,6 +1127,7 @@ class WebConsoleTests(unittest.TestCase):
         self.controller.hme_client_factory = (
             lambda _session, **_kwargs: RescueHmeClient()
         )
+        self.configure_openbrowser(("rescue_profile",))
         app = create_app(self.controller, testing=True)
         with TestClient(app) as client:
             first = client.post(
@@ -2042,6 +2100,63 @@ class WebConsoleTests(unittest.TestCase):
         self.assertNotIn("totp-canary", preserved.text + cleared.text)
         self.assertEqual(invalid.status_code, 422)
         self.assertIn("values", invalid.json()["detail"]["fields"])
+
+    def test_openbrowser_settings_are_validated_encrypted_and_testable(self):
+        self.configure_openbrowser(("profile_a", "profile_b"), running=("profile_b",))
+        app = create_app(self.controller, testing=True)
+        with TestClient(app) as client:
+            updated = client.put(
+                "/api/settings",
+                headers=self.origin_headers,
+                json={
+                    "values": {
+                        "openbrowser_base_url": "http://localhost:50325/",
+                        "openbrowser_profile_ids": "profile_a, profile_b, profile_a",
+                        "openbrowser_manual_timeout_seconds": 900,
+                    },
+                    "secrets": {"openbrowser_api_key": "replacement-api-secret"},
+                },
+            )
+            tested = client.post(
+                "/api/openbrowser/test",
+                headers=self.origin_headers,
+            )
+            invalid = client.put(
+                "/api/settings",
+                headers=self.origin_headers,
+                json={"values": {"openbrowser_base_url": "https://remote.example:50325"}},
+            )
+
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(
+            updated.json()["values"]["openbrowser_base_url"],
+            "http://localhost:50325",
+        )
+        self.assertEqual(
+            updated.json()["values"]["openbrowser_profile_ids"],
+            "profile_a\nprofile_b",
+        )
+        self.assertTrue(updated.json()["secrets"]["openbrowser_api_key"])
+        self.assertNotIn("replacement-api-secret", updated.text)
+        self.assertEqual(tested.status_code, 200, tested.text)
+        self.assertEqual(
+            tested.json(),
+            {
+                "configured": True,
+                "connected": True,
+                "state": "ready",
+                "version": "1.0-test",
+                "pool_size": 2,
+                "available_count": 1,
+                "bound_count": 0,
+                "running_count": 1,
+                "missing_count": 0,
+            },
+        )
+        self.assertNotIn("replacement-api-secret", tested.text)
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertIn("openbrowser_base_url", invalid.json()["detail"]["fields"])
+        self.assertNotIn(b"replacement-api-secret", (self.root / "console.db").read_bytes())
 
     def test_sub2api_groups_route_uses_saved_credentials_and_returns_safe_metadata(self):
         self.database.set_text_setting("sub2api_base_url", "https://sub2api.example")

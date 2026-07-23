@@ -620,6 +620,8 @@ class DatabaseTests(unittest.TestCase):
                 "isActive": True,
             },
             label="Team owner A handoff 1",
+            openbrowser_profile_ids=["team_profile_a"],
+            openbrowser_proxy_sid="Browser94",
         )
         fresh_alias = prepared["alias"]
         self.assertEqual(prepared["workspace"]["status"], "ready")
@@ -629,6 +631,12 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(fresh_alias["parent_owner_alias_id"], owner["id"])
         self.assertEqual(
             self.database.get_account_proxy(fresh_alias["account_id"]), owner_proxy
+        )
+        self.assertEqual(
+            self.database.get_account_network_identity(fresh_alias["account_id"])[
+                "openbrowser_profile_id"
+            ],
+            "team_profile_a",
         )
 
         run = self.database.enqueue_rescue_workspace(workspace["id"])
@@ -1061,6 +1069,74 @@ class DatabaseTests(unittest.TestCase):
             self.database.merge_account_network_identity(
                 account["id"],
                 {"proxy_sid": "Different90"},
+            )
+
+    def test_openbrowser_profile_binding_is_encrypted_stable_and_validated(self):
+        account = self.create_account("openbrowser")
+
+        selected = self.database.reserve_account_openbrowser_profile(
+            account["id"],
+            ["profile_primary", "profile_backup"],
+            proxy_sid="Browser90",
+        )
+        repeated = self.database.reserve_account_openbrowser_profile(
+            account["id"],
+            ["profile_backup"],
+            proxy_sid="Ignored99",
+        )
+
+        self.assertEqual(selected, "profile_primary")
+        self.assertEqual(repeated, "profile_primary")
+        self.assertEqual(
+            self.database.get_account_network_identity(account["id"])[
+                "openbrowser_profile_id"
+            ],
+            "profile_primary",
+        )
+        raw = b"".join(
+            path.read_bytes()
+            for path in self.path.parent.glob("console.db*")
+            if path.is_file()
+        )
+        self.assertNotIn(b"profile_primary", raw)
+
+        with self.assertRaises(StateConflictError):
+            self.database.merge_account_network_identity(
+                account["id"],
+                {"openbrowser_profile_id": "profile_other"},
+            )
+        with self.assertRaises(ValidationError):
+            self.database.reserve_account_openbrowser_profile(
+                account["id"],
+                ["invalid profile"],
+                proxy_sid="Browser90",
+            )
+
+    def test_openbrowser_profile_reservation_is_unique_and_pool_bounded(self):
+        first = self.create_account("openbrowser-first")
+        second = self.create_account("openbrowser-second")
+        third = self.create_account("openbrowser-third")
+        pool = ["profile_a", "profile_b"]
+
+        self.assertEqual(
+            self.database.reserve_account_openbrowser_profile(
+                first["id"], pool, proxy_sid="Browser91"
+            ),
+            "profile_a",
+        )
+        self.assertEqual(
+            self.database.reserve_account_openbrowser_profile(
+                second["id"], pool, proxy_sid="Browser92"
+            ),
+            "profile_b",
+        )
+        self.assertEqual(
+            self.database.list_bound_openbrowser_profile_ids(),
+            ("profile_a", "profile_b"),
+        )
+        with self.assertRaises(StateConflictError):
+            self.database.reserve_account_openbrowser_profile(
+                third["id"], pool, proxy_sid="Browser93"
             )
 
     def test_account_manual_lifecycle_blocks_bound_accounts(self):
