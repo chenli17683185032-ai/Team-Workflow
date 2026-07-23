@@ -20,8 +20,16 @@ from team_protocol.proxy_chain import (
     ProxySourceError,
     ProxySourceNotWhitelistedError,
     parse_lokiproxy_response,
+    parse_proxy_source_response,
     validate_generator_url,
     validate_proxy_source,
+)
+
+
+LINKUP_GENERATOR_URL = (
+    "http://global.rpapi.linkup.onl:8089/gen?zone=custom&ptype=1&region=PH&"
+    "asn=ASN17639&count=1&proto=http&stype=txt&sessType=sticky&"
+    "split=\\r\\n&sessTime=5&sessAuto=1"
 )
 
 
@@ -234,6 +242,109 @@ class ProxyChainTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_generator_url(invalid)
 
+    def test_linkup_generator_url_preserves_literal_line_separator(self):
+        self.assertEqual(
+            validate_generator_url(LINKUP_GENERATOR_URL),
+            LINKUP_GENERATOR_URL,
+        )
+        self.assertEqual(
+            validate_proxy_source(LINKUP_GENERATOR_URL),
+            LINKUP_GENERATOR_URL,
+        )
+        for invalid in (
+            LINKUP_GENERATOR_URL.replace(
+                "global.rpapi.linkup.onl",
+                "global.rpapi.linkup.onl.evil.example",
+            ),
+            LINKUP_GENERATOR_URL.replace("/gen?", "/other?"),
+            LINKUP_GENERATOR_URL.replace(
+                "http://",
+                "http://user:pass@",
+                1,
+            ),
+            LINKUP_GENERATOR_URL + "#fragment",
+            LINKUP_GENERATOR_URL.replace("region=PH", "region=P\r\nH"),
+        ):
+            with self.subTest(invalid=invalid.rsplit("/", 1)[-1][:24]):
+                with self.assertRaises(ValueError):
+                    validate_proxy_source(invalid)
+
+    def test_linkup_generator_uses_query_protocol_for_json_response(self):
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _FakeResponse(
+                {
+                    "code": 200,
+                    "success": "success",
+                    "msg": "success",
+                    "request_ip": "",
+                    "data": [{"ip": "203.0.113.28", "port": 10000}],
+                }
+            )
+
+        endpoint = LokiProxyFetcher(requester=request).fetch(
+            LINKUP_GENERATOR_URL,
+            "http://127.0.0.1:7897",
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0:2], ("GET", LINKUP_GENERATOR_URL))
+        self.assertEqual(
+            calls[0][2]["proxies"],
+            {
+                "http": "http://127.0.0.1:7897",
+                "https": "http://127.0.0.1:7897",
+            },
+        )
+        self.assertEqual(
+            (
+                endpoint.host,
+                endpoint.port,
+                endpoint.scheme,
+                endpoint.username,
+                endpoint.password,
+            ),
+            (
+                "203.0.113.28",
+                10000,
+                "http",
+                "",
+                "",
+            ),
+        )
+        explicit = parse_proxy_source_response(
+            {
+                "data": [
+                    {
+                        "ip": "203.0.113.29",
+                        "port": 1080,
+                        "protocol": "socks5",
+                    }
+                ]
+            },
+            default_scheme="http",
+        )
+        self.assertEqual(explicit.scheme, "socks5")
+        for invalid_source in (
+            LINKUP_GENERATOR_URL.replace("proto=http", "proto=ftp"),
+            LINKUP_GENERATOR_URL.replace(
+                "proto=http",
+                "proto=http&proto=socks5",
+            ),
+        ):
+            with self.subTest(invalid_source=invalid_source.rsplit("proto=", 1)[-1]):
+                with self.assertRaises(ProxySourceError):
+                    LokiProxyFetcher(
+                        requester=lambda *_args, **_kwargs: self.fail(
+                            "invalid generator protocol must fail before network access"
+                        )
+                    ).fetch(
+                        invalid_source,
+                        "http://127.0.0.1:7897",
+                    )
+
     def test_fixed_authenticated_proxy_sources_bypass_generator_request(self):
         fetcher = LokiProxyFetcher(
             requester=lambda *_args, **_kwargs: self.fail(
@@ -270,7 +381,21 @@ class ProxyChainTests(unittest.TestCase):
     def test_curl_proxy_commands_are_normalized_without_the_probe_target(self):
         cases = (
             (
-                'curl -x proxy.example:3010 -U "region-JP:proxy-pass" mayips.com',
+                'curl -L -x global.rp.linkup.onl:10000 '
+                '-U "USER-example-zone-custom:proxy-pass" ipinfo.io',
+                "socks5://USER-example-zone-custom:proxy-pass@global.rp.linkup.onl:10000",
+            ),
+            (
+                'curl -L -x proxy.example:3010 -U "region-PH:proxy-pass" ipinfo.io',
+                "http://region-PH:proxy-pass@proxy.example:3010",
+            ),
+            (
+                'curl -L -x global.rp.linkup.onl.example:3010 '
+                '-U "region-PH:proxy-pass" ipinfo.io',
+                "http://region-PH:proxy-pass@global.rp.linkup.onl.example:3010",
+            ),
+            (
+                'curl --location -x proxy.example:3010 -U "region-JP:proxy-pass" mayips.com',
                 "http://region-JP:proxy-pass@proxy.example:3010",
             ),
             (

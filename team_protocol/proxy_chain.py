@@ -33,7 +33,14 @@ DEFAULT_CACHE_TTL = 45.0
 CHAIN_PROXY_MODE = "clash_chain"
 LEGACY_CHAIN_PROXY_MODE = "lokiproxy_generator"
 CHAIN_PROXY_MODES = frozenset({CHAIN_PROXY_MODE, LEGACY_CHAIN_PROXY_MODE})
-_GENERATOR_HOST = "gen.lokiproxy.com"
+_LEGACY_GENERATOR_HOST = "gen.lokiproxy.com"
+_LINKUP_FIXED_PROXY_HOST = "global.rp.linkup.onl"
+_GENERATOR_HOSTS = frozenset(
+    {
+        _LEGACY_GENERATOR_HOST,
+        "global.rpapi.linkup.onl",
+    }
+)
 _MAX_RESPONSE_BYTES = 256 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
 
@@ -192,6 +199,8 @@ def _proxy_source_from_curl(value: str) -> str | None:
             proxy_user = token.split("=", 1)[1]
             if not proxy_user:
                 raise ValueError("curl proxy command --proxy-user value is required")
+        elif token in {"-L", "--location"}:
+            pass
         elif token.startswith("-"):
             raise ValueError("curl proxy command contains an unsupported option")
         else:
@@ -204,10 +213,20 @@ def _proxy_source_from_curl(value: str) -> str | None:
         raise ValueError("curl proxy command must include exactly one probe target")
 
     candidate = str(proxy_value).strip()
-    if "://" not in candidate:
+    has_explicit_scheme = "://" in candidate
+    if not has_explicit_scheme:
         candidate = f"{default_scheme}://{candidate}"
     normalized = validate_proxy_url(candidate)
     parsed = urllib.parse.urlsplit(normalized)
+    if (
+        not has_explicit_scheme
+        and default_scheme == "http"
+        and str(parsed.hostname or "").casefold() == _LINKUP_FIXED_PROXY_HOST
+    ):
+        normalized = validate_proxy_url(
+            urllib.parse.urlunsplit(parsed._replace(scheme="socks5"))
+        )
+        parsed = urllib.parse.urlsplit(normalized)
     if proxy_user is None:
         return normalized
     if parsed.username is not None or parsed.password is not None:
@@ -241,32 +260,39 @@ def _safe_proxy_label(value: str) -> str:
     return f"{address.scheme}://{host}:{address.port}"
 
 
+def _is_generator_host(value: str) -> bool:
+    host = str(value or "").casefold()
+    return host in _GENERATOR_HOSTS or host.endswith(
+        "." + _LEGACY_GENERATOR_HOST
+    )
+
+
 def validate_generator_url(value: str) -> str:
-    """Validate and normalize a LokiProxy generator URL without resolving it."""
+    """Validate and normalize an allowlisted proxy generator URL."""
 
     text = str(value or "").strip()
     if not text:
-        raise ValueError("LokiProxy generator URL is required")
+        raise ValueError("proxy generator URL is required")
     if any(character.isspace() or ord(character) < 32 for character in text):
-        raise ValueError("LokiProxy generator URL contains invalid whitespace")
+        raise ValueError("proxy generator URL contains invalid whitespace")
     try:
         parsed = urllib.parse.urlsplit(text)
         port = parsed.port
     except ValueError:
-        raise ValueError("LokiProxy generator URL is invalid") from None
+        raise ValueError("proxy generator URL is invalid") from None
     host = str(parsed.hostname or "").casefold()
     if parsed.scheme.casefold() not in {"http", "https"}:
-        raise ValueError("LokiProxy generator URL must use HTTP or HTTPS")
-    if host != _GENERATOR_HOST and not host.endswith("." + _GENERATOR_HOST):
-        raise ValueError("LokiProxy generator host is not allowed")
+        raise ValueError("proxy generator URL must use HTTP or HTTPS")
+    if not _is_generator_host(host):
+        raise ValueError("proxy generator host is not allowed")
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("LokiProxy generator URL cannot contain credentials")
+        raise ValueError("proxy generator URL cannot contain credentials")
     if port is not None and not 1 <= port <= 65535:
-        raise ValueError("LokiProxy generator port is invalid")
+        raise ValueError("proxy generator port is invalid")
     if parsed.path.rstrip("/") != "/gen":
-        raise ValueError("LokiProxy generator URL must target /gen")
+        raise ValueError("proxy generator URL must target /gen")
     if parsed.fragment:
-        raise ValueError("LokiProxy generator URL cannot contain a fragment")
+        raise ValueError("proxy generator URL cannot contain a fragment")
     return urllib.parse.urlunsplit(parsed)
 
 
@@ -297,9 +323,7 @@ def validate_proxy_source(value: str) -> str:
         return normalized
     if scheme == "http":
         host = str(parsed.hostname or "").casefold()
-        if (host == _GENERATOR_HOST or host.endswith("." + _GENERATOR_HOST)) and (
-            parsed.path.rstrip("/") == "/gen"
-        ):
+        if _is_generator_host(host) and parsed.path.rstrip("/") == "/gen":
             return validate_generator_url(text)
         normalized = validate_proxy_url(text)
         _parse_proxy_address(normalized, label="proxy source")
@@ -410,7 +434,11 @@ def _ttl_seconds(payload: Mapping[str, Any], item: Mapping[str, Any]) -> float |
     return None
 
 
-def _endpoint_from_mapping(payload: Mapping[str, Any]) -> ProxyEndpoint:
+def _endpoint_from_mapping(
+    payload: Mapping[str, Any],
+    *,
+    default_scheme: str = "socks5",
+) -> ProxyEndpoint:
     item = _candidate_mapping(payload)
     if item is None:
         raise ValueError("proxy source response contains no endpoint")
@@ -424,7 +452,7 @@ def _endpoint_from_mapping(payload: Mapping[str, Any]) -> ProxyEndpoint:
         or item.get("protocol")
         or item.get("type")
         or item.get("proxyType")
-        or "socks5"
+        or default_scheme
     )
     return ProxyEndpoint(
         host=str(host or "").strip(),
@@ -436,7 +464,11 @@ def _endpoint_from_mapping(payload: Mapping[str, Any]) -> ProxyEndpoint:
     )
 
 
-def _endpoint_from_text(value: str) -> ProxyEndpoint:
+def _endpoint_from_text(
+    value: str,
+    *,
+    default_scheme: str = "socks5",
+) -> ProxyEndpoint:
     text = str(value or "").strip().strip("\"'")
     if not text:
         raise ValueError("proxy source response is empty")
@@ -469,13 +501,25 @@ def _endpoint_from_text(value: str) -> ProxyEndpoint:
         if not separator:
             raise ValueError("proxy source response endpoint is invalid")
     try:
-        return ProxyEndpoint(host=host, port=int(port_text))
+        return ProxyEndpoint(
+            host=host,
+            port=int(port_text),
+            scheme=default_scheme,
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("proxy source response endpoint is invalid") from exc
 
 
-def parse_proxy_source_response(payload: Any) -> ProxyEndpoint:
+def parse_proxy_source_response(
+    payload: Any,
+    *,
+    default_scheme: str = "socks5",
+) -> ProxyEndpoint:
     """Extract one SOCKS5/HTTP endpoint from a legacy generator response."""
+
+    normalized_default = _normalize_proxy_scheme(default_scheme)
+    if normalized_default == "https":
+        normalized_default = "http"
 
     if isinstance(payload, (bytes, bytearray)):
         try:
@@ -487,16 +531,22 @@ def parse_proxy_source_response(payload: Any) -> ProxyEndpoint:
         try:
             decoded = json.loads(text)
         except (TypeError, ValueError):
-            return _endpoint_from_text(text)
+            return _endpoint_from_text(text, default_scheme=normalized_default)
         if isinstance(decoded, str):
-            return _endpoint_from_text(decoded)
+            return _endpoint_from_text(decoded, default_scheme=normalized_default)
         payload = decoded
     if isinstance(payload, Mapping):
-        return _endpoint_from_mapping(payload)
+        return _endpoint_from_mapping(
+            payload,
+            default_scheme=normalized_default,
+        )
     if isinstance(payload, list):
         item = _first_mapping(payload)
         if item is not None:
-            return _endpoint_from_mapping(item)
+            return _endpoint_from_mapping(
+                item,
+                default_scheme=normalized_default,
+            )
     raise ValueError("proxy source response is not an endpoint object")
 
 
@@ -543,6 +593,20 @@ class ProxySourceResolver:
                 username=source_address.username,
                 password=source_address.password,
             )
+        query = urllib.parse.parse_qs(parsed_source.query, keep_blank_values=True)
+        protocols = query.get("proto", ())
+        if len(protocols) > 1:
+            raise ProxySourceError("proxy generator protocol query is ambiguous")
+        try:
+            default_scheme = (
+                _normalize_proxy_scheme(str(protocols[0]).strip())
+                if protocols
+                else "socks5"
+            )
+        except ValueError as exc:
+            raise ProxySourceError(
+                "proxy generator protocol query is invalid"
+            ) from exc
         request_kwargs = {
             "proxies": {"http": proxy, "https": proxy},
             "headers": {"Accept": "application/json, text/plain", "Cache-Control": "no-cache"},
@@ -599,7 +663,10 @@ class ProxySourceResolver:
                     payload = response.json()
                 except (TypeError, ValueError, AttributeError):
                     payload = str(getattr(response, "text", "") or "")
-            return parse_proxy_source_response(payload)
+            return parse_proxy_source_response(
+                payload,
+                default_scheme=default_scheme,
+            )
         except (TypeError, ValueError, UnicodeError, AttributeError) as exc:
             # Legacy generators may return a plain `host:port` line or JSON.
             # Both forms are parsed above without exposing

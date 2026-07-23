@@ -2104,3 +2104,116 @@ OTP 填写后短暂等待页面反馈
 - 2026-07-23：上线前在线备份 `backups/console-pre-hme-session-capture-20260723-215519.sqlite` 权限为 `0600`，源库与备份均 `quick_check=ok`。首次 PID `49513 -> 20276` 在 6 秒恢复，纠正部署 PID `20276 -> 47516` 在 5 秒恢复；两次迁移均 `ready`、schema v7、活动 queue/run 为 0，新增日志仅为既有 `sub2api_current_child_mapping_ambiguous`。
 - 2026-07-23：纠正部署后的唯一重试在约 35 秒内进入 `captured`；加密落库会话包含 18 个不重复 Cookie，其中 15 个为核心三项之外的上下文 Cookie。随后现有检测对 HME list、转发地址和 IMAP 全部通过，资源池恢复 `ready`，只读远端 Alias 数为 67；全程未调用 generate/reserve，最后恢复队列未暂停状态且活动 queue/run 仍为 0、源库 `quick_check=ok`。
 - 2026-07-23：提交前 `git fetch origin` 确认 `main` 与 `origin/main` 双向差异均为 0；差异格式和高置信秘密扫描通过，仅保留 6 个目标跟踪文件。用户原有 `.DS_Store` 未纳入提交，本节 3 个 GitHub 对照克隆已从临时目录移入废纸篓，可恢复且不再占用项目工作区。
+
+### 节点 AG：Linkup RPAPI 动态代理生成源兼容（进行中）
+
+#### AG.1 目标与性能指标
+
+用户提供的 `global.rpapi.linkup.onl:8089/gen` 动态 HTTP 代理生成链接能够在“子号默认链路”中完整粘贴并保存，同时保持现有 SSRF 边界和两跳代理结构：
+
+- 字面量查询参数 `split=\\r\\n` 必须原样保留，不能被当成控制字符、curl 命令或固定 HTTP 代理路径。
+- 只新增精确的受信生成源主机 `global.rpapi.linkup.onl`；不允许任意主机借 `/gen` 路径触发服务端 GET。
+- 现有 `gen.lokiproxy.com`、固定 HTTP/SOCKS URL、受限 curl 输入、统一 Clash 第一跳和加密存储语义保持不变。
+- 生成请求仍只允许 HTTP/HTTPS、无 URL userinfo、无 fragment、路径严格为 `/gen`，响应继续受 256 KiB 上限和既有端点解析门禁约束。
+- 最终链接固定为 `region=PH`、`asn=ASN17639`、`sessType=sticky`、`sessTime=5`、`sessAuto=1`；旧 `AF/rotating` 链接只作为已废弃复现输入，不进入配置。
+- 离线回归先证明“精确链接接受、近似恶意主机拒绝、请求 URL 原样传递、JSON `data[].ip/port` 缺失协议时继承查询 `proto=http`”；真实生成源最多做一次脱敏结构探测，不打印或写入返回的代理凭据。
+- 不修改组 2，不启动换班、注册、邀请、退出、PAT 或 Sub2API；上线仅在队列空闲时备份数据库并完成 60 秒内的有界重启。
+
+#### AG.2 GitHub 与现场证据
+
+- GitHub 未检索到 `rpapi.linkup.onl`、`sessType=sticky` 或该查询协议的公开实现，因此不推测供应商私有字段含义，只按用户提供的完整 URL 透传查询。
+- GitHub [`jhao104/proxy_pool`](https://github.com/jhao104/proxy_pool) HEAD `9cc0cad4c47e84e34aaec2eead099421960dcd07` 的扩展约定为每个代理源显式注册独立 fetcher，再把返回统一收敛为 `host:port`；本项目沿用相同的“显式源边界 + 共用端点解析器”，不改成任意 URL 抓取器。
+- 本地浏览器实测字段可以完整粘贴 141 个字符，末尾仍为字面量 `&split=\\r\\n`；点击保存后才显示 `proxy URL contains an unsupported path or query`，随后已取消且未持久化。
+- 离线直接调用 `validate_proxy_source()` 得到同一错误：当前仅把 `gen.lokiproxy.com/.../gen` 识别为生成源，新主机被误分类为固定 HTTP 代理，再由固定代理门禁拒绝 path/query。
+- 用户补充的权威返回示例为 JSON `{code, success, msg, request_ip, data:[{ip, port}]}`，端点本身不含协议；请求查询明确为 `proto=http`，因此解析器必须把请求协议作为响应缺省值，不能沿用历史 SOCKS5 默认。
+
+#### AG.3 动态控制结构与最小充分模型
+
+```text
+用户输入
+  -> 受限 curl / 固定 HTTP-SOCKS / 受信生成源分类器
+  -> global.rpapi.linkup.onl + 精确 /gen：保留完整查询
+  -> 统一 Clash 第一跳发起一次 GET
+  -> 有界响应解析为 HTTP/SOCKS 端点
+  -> 本地 SOCKS5 中继健康测量
+  -> 加密保存源 URL 与有效本地中继地址
+
+未知主机 / 非 /gen / userinfo / fragment / 控制字符 / 超大或无效响应
+  -> 保存前或刷新阶段结构化失败
+  -> 旧配置与 Team 状态不变
+```
+
+控制对象是某一 Team 子号默认链路随生成端点轮换而变化的网络状态；输入分类器和 `ProxySourceResolver` 是控制器，Clash 与本地 relay 是执行器，生成 HTTP 状态、响应结构和 relay health 是测量。供应商响应漂移、配额、白名单、网络时延和查询中的转义字符是扰动；稳定性优先于扩大兼容面。
+
+#### AG.4 实施节点
+
+- [x] 复现浏览器粘贴与后端保存错误，证明不是 password input、剪贴板或前端长度限制。
+- [x] 搜索 GitHub 精确协议并选取显式代理源适配作为安全边界参考。
+- [x] 先增加失败回归，覆盖 Linkup 精确生成 URL、字面量 CRLF 分隔参数、主机近似攻击和既有 Loki/fixed/curl 不回归；旧实现在主机白名单与固定 HTTP 分类处按预期失败。
+- [x] 对生成源分类做最小修改，只加入 Linkup 精确主机并复用现有 `/gen`、响应大小、脱敏错误与 Clash 第一跳逻辑。
+- [x] 让通用 JSON/纯文本响应解析器只在端点缺少显式协议时继承生成 URL 的 `proto`；补充用户最终 PH/sticky URL 与 JSON 返回示例回归。
+- [x] 运行 proxy-chain 聚焦、Web/Database 联动和全量测试，再执行 `compileall`、JavaScript 语法与 `git diff --check`；提交前补做差异秘密扫描。
+- [ ] 队列空闲时备份生产 SQLite 并校验源库/备份 `quick_check=ok`；重启后验证 HTTP、migration、队列原状态和新增错误日志。
+- [ ] 使用组 1 弹窗只验证完整粘贴与前端不再显示分类错误；不替用户覆盖现有代理配置。若做真实源结构探测，最多一次且不输出端点或凭据。
+- [ ] 提交并推送 GitHub `main`，保留用户原有 `.DS_Store` 不纳入提交。
+
+#### AG.5 验收场景
+
+1. 用户提供的完整 Linkup URL 经 `validate_proxy_source()` 后逐字符不变，包含 `region=PH`、`asn=ASN17639`、`proto=http`、`sessType=sticky`、`sessTime=5`、`sessAuto=1` 和字面量 `split=\\r\\n`。
+2. `global.rpapi.linkup.onl.evil.example`、userinfo、fragment、非 `/gen` 路径和真实控制字符继续在发起网络请求前拒绝。
+3. Resolver 通过统一 `http://127.0.0.1:7897` 请求生成源；用户示例 JSON 的 `data[].ip/port` 在缺失协议时按查询 `proto=http` 转换为 HTTP 端点，响应显式协议优先，正文和凭据不进入日志/API/DOM。
+4. 固定 HTTP/SOCKS 与受限 curl 测试结果不变，Linkup URL 不被当作固定 `host:port`。
+5. 部署后服务 60 秒内恢复，数据库正常，队列无活动任务；组 2 数据、Team 成员和 Sub2API 均无变化。
+
+#### AG.6 回滚、上线与安全边界
+
+- 代码回滚只需移除 Linkup 受信主机，不迁移数据库 schema；已保存的源密文仍可由上线前备份恢复。
+- 不允许用户配置任意生成 URL，避免本地服务访问环回、私网、云元数据或攻击者主机；仅精确允许已确认供应商域名。
+- 查询可能包含供应商凭据，完整 URL只进入现有加密 owner 配置，不进入日志、状态响应或提交内容；测试夹具只使用用户已公开给出的无密钥查询结构。
+- 真实供应商探测不保存返回端点、不触发 Team 工作流，失败时不循环重试；正式覆盖某一组的现有配置由用户明确选择。
+
+#### AG.7 实施记录
+
+- 2026-07-23：浏览器对组 1 编辑弹窗做未保存复现，141 字符旧样本可完整粘贴，点击保存才由后端以 `proxy URL contains an unsupported path or query` 拒绝；随后取消弹窗，未覆盖组 1 或组 2 配置。
+- 2026-07-23：新增精确 Linkup 主机分类与最终 PH/ASN17639/sticky 查询夹具；用户示例 JSON 端点无协议时从 `proto=http` 继承，非法或重复协议在联网前失败。生成 GET 的 `http/https` proxy 参数均固定为共享 Clash，动态端点仍由现有 relay 经同一 Clash 建连。
+- 2026-07-23：只做一次真实结构探测，严格经当前 Clash 出口到达 Linkup；供应商返回 IP 白名单拒绝。未重试、未切换直连、未打印响应正文/端点/凭据，也未写入任何 Team 配置。
+- 2026-07-23：proxy-chain 15 项、Proxy/Web/Database 联动 116 项通过；全量 370 项中 364 项通过、6 项 Windows DPAPI 按 macOS 平台跳过。Python `compileall`、JavaScript 语法和 `git diff --check` 通过。
+
+### 节点 AH：固定代理 curl `-L` 输入兼容（完成）
+
+#### AH.1 目标与性能指标
+
+让“子号默认链路”接受供应商提供的 `curl -L -x HOST:PORT -U "USER:PASS" TARGET` 文本，同时维持现有安全边界：
+
+- `-L` / `--location` 只作为可忽略的 curl 跟随跳转标记；工具不执行命令、不访问 TARGET，也不保存 TARGET。
+- 仍只提取唯一的 `-x` / `--proxy` 和唯一的 `-U` / `--proxy-user` 凭据；其他未知选项继续拒绝。
+- 现场闭环证明精确入口 `global.rp.linkup.onl` 的 HTTP 模式可访问 IP 查询但无法建立 OpenAI CONNECT，而同一入口按 SOCKS5 经 Clash 可在 3 秒内完成两个 OpenAI 域名 TLS；因此只对该精确主机把无显式 scheme 的 `-x` 解释为 SOCKS5，其他 `-x` 仍为 HTTP。
+- 解析结果仍进入固定代理路径，连接必须经过共享 Clash `http://127.0.0.1:7897`，不增加直连回退。
+- 用户提供的真实代理凭据不得进入源码、测试、计划、日志或 Git；回归只使用保留域名和假凭据。
+
+#### AH.2 参考与最小模型
+
+- GitHub [`curl/curl`](https://github.com/curl/curl) HEAD `8734b088834c74ae3d77193387dbe37ccda6d00d` 将 `-L/--location`、`-x/--proxy` 和 `-U/--proxy-user` 定义为彼此独立的标准参数。本项目只解析这一最小子集，不实现通用 shell/curl 执行器。
+
+```text
+curl 文本 -> shlex 分词 -> 忽略 -L/--location
+          -> 提取唯一 -x 与 -U
+          -> global.rp.linkup.onl：固定 SOCKS5；其他主机：固定 HTTP
+          -> 本地 Team relay -> Clash 第一跳 -> 固定代理 -> 目标站
+
+未知选项 / 多个代理 / 多个凭据 / 缺失 TARGET -> 保存前拒绝
+```
+
+#### AH.3 实施与验收
+
+- [x] 增加 `-L`、`--location` 和精确 Linkup 主机 SOCKS5 归一化回归，并保留普通 `-x` 为 HTTP、近似主机及未知选项拒绝测试。
+- [x] 对 `_proxy_source_from_curl()` 做最小修改：忽略两个 location 标记，并仅覆写精确 Linkup 固定入口的缺省 scheme。
+- [x] 运行 proxy-chain 聚焦回归、Python 编译和差异检查；确认新增差异无真实凭据。
+- [x] 队列空闲时重启 LaunchAgent，60 秒内恢复 HTTP，并验证迁移、数据库和队列原状态。
+
+验收条件：代表性 Linkup 假凭据输入被规范化为带认证的固定 `socks5://` 代理 URL，普通 `proxy.example` 的 `-x` 仍为 `http://`；目标地址不出现在结果中；未知 curl 参数仍失败；部署后服务 ready 且无活动运行。回滚只需移除精确主机覆写、两个允许标记及其测试，不涉及数据库迁移或配置重写。
+
+#### AH.4 实施记录
+
+- 2026-07-23：同一 Linkup 固定入口经 Clash 前置时，HTTP 模式对两个 OpenAI 域名均停在 TLS 前；强制 SOCKS5 后分别约 2.4 秒和 3.1 秒完成 TLS并获得站点响应，证明协议模式是首个失效环节。
+- 2026-07-23：精确主机覆写、普通/近似主机不回归和 `-L/--location` 共随 Proxy/Web 61 项回归通过；Python 编译、差异检查和真实凭据扫描通过。LaunchAgent PID `44150 -> 50700`，HTTP 在 6 秒内恢复，迁移 ready、数据库 `quick_check=ok`、队列恢复未暂停且活动运行 0。

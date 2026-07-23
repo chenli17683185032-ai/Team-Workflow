@@ -4,6 +4,8 @@
 
 ### 修复
 
+- 子号默认链路支持受限的 Linkup RPAPI `/gen` 动态源；完整 sticky 查询不再被误判为固定 HTTP 代理，JSON `data[].ip/port` 缺少协议时按请求 `proto=http` 解析。
+- 固定代理 curl 输入支持 `-L/--location`；精确的 `global.rp.linkup.onl` 裸 `-x` 入口按 SOCKS5 归一化，其他 curl `-x` 仍保持 HTTP。
 - iCloud HME 自动更新不再把“旧请求模板 + 3 个核心 Cookie”当作成功会话；登录后会自动打开 iCloud+ 的隐藏邮件地址面板，只保存真实 `GET /v2/hme/list` 请求中的完整 Cookie 与请求上下文，消除“检测通过但创建 Alias 被拒绝”的假健康状态。
 - 自动注册从“Playwright 页面内手工 `fetch` 私有注册端点”改为官方页面驱动：从 ChatGPT 登录入口进入 `/create-account`，依次填写可见的邮箱、密码、OTP 和资料表单，由页面自身拥有请求、Sentinel、Cookie 与重定向。
 - 已有 OpenAI 身份继续在官方 OTP 页面验证后直接完成 callback/session；新身份才进入密码和资料页，现有 Team 顺序仍为旧子号邀请、旧子号退出、新子号注册/登录。
@@ -11,6 +13,7 @@
 
 ### 稳定性与安全
 
+- Linkup 只允许精确供应商主机和 `/gen` 路径；userinfo、fragment、近似主机、真实控制字符和非法协议在联网前拒绝。生成请求与生成端点连接继续强制经过共享 Clash，不增加直连回退。
 - macOS iCloud 可见浏览器的 CDP 连接在同一 30 秒总预算内使用短握手重试，避免单次 WebSocket 启动抖动耗尽整个连接窗口。
 - 邮箱 OTP 只会在 URL/DOM 已确认进入官方 OTP 页后读取和填写；单框与六位分段控件均按可见语义识别，缺失或歧义时停止。
 - 页面跳转共享总时限；CAPTCHA/Cloudflare、手机验证、条款/年龄确认、未知页面和控件漂移均关闭浏览器并返回脱敏错误，不重放私有请求、不切换身份或代理规避上游控制。
@@ -23,7 +26,8 @@
 ### 验证
 
 - 官方注册首屏完成只读真实冒烟：项目 Playwright 从 ChatGPT 入口点击官方注册链接后到达 `auth.openai.com/create-account` 并识别唯一 email 表单；未填写邮箱、未触发 OTP 或创建账号。
-- BrowserRegisterFlow 23 项及 Registrar、Database、Workflow、Web 聚焦回归共 193 项通过；HME capture/client 21 项与 HME、Web、Database 聚焦回归 122 项通过；全量 368 项中 362 项通过，6 项 Windows DPAPI 按 macOS 平台跳过。
+- BrowserRegisterFlow 23 项及 Registrar、Database、Workflow、Web 聚焦回归共 193 项通过；HME capture/client 21 项与 HME、Web、Database 聚焦回归 122 项通过；proxy-chain 15 项及 Proxy、Web、Database 联动 116 项通过；全量 370 项中 364 项通过，6 项 Windows DPAPI 按 macOS 平台跳过。
+- Linkup 最终 PH/sticky URL 完成一次脱敏真实探测，请求严格经过共享 Clash并到达供应商；供应商明确拒绝当前 Clash 出口未加入 IP 白名单，因此未重试、未直连、未保存返回端点或改动任一 Team 配置。
 - Python compileall、JavaScript 语法、脱敏夹具 JSON、`git diff --check` 和新增差异高置信秘密扫描通过。部署前暂停队列并完成 SQLite 在线备份，源库、备份及重启后源库均 `quick_check=ok`；LaunchAgent 在 6 秒内恢复 HTTP `200`，活动 queue/run 为 0，未读取或测试真实组二。
 - iCloud 修复上线前备份权限为 `0600`，源库与备份均 `quick_check=ok`。首次重启 6 秒恢复后，只读冒烟发现 Playwright 事件泵竞态；修正回归后再以 5 秒完成纠正重启。最终自动捕获并加密保存 18 个完整 Cookie，现有 HME list 与 IMAP 检测通过、资源池回到 `ready`；未调用 generate/reserve，也未对组 2 执行成员或 Sub2API 写操作。
 
